@@ -1,0 +1,287 @@
+"use client";
+
+import { useParams } from "next/navigation";
+import { useEffect, useState } from "react";
+import { api, useApi } from "@/lib/api";
+import { fmtDate } from "@/lib/format";
+import { A, Badge, Card, ErrorBox, ExceptionBadge, Hash, Json, KV, Modal, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
+import { ExprTrace, SegmentRibbon, TreatmentList } from "@/components/Trace";
+
+export default function Dossier() {
+  const { lineage } = useParams<{ lineage: string }>();
+  const { data: d, error, reload } = useApi<any>(`/obligations/${lineage}`);
+  const [tab, setTab] = useState("Period assurance");
+  return (
+    <>
+      <PageHeader spec="WF-STA-01 Obligation Assurance Dossier" title={d?.definition.title ?? "Obligation"}
+        subtitle={d ? `${d.subject.display_name} · ${d.definition.key}` : undefined} />
+      <ErrorBox error={error} />
+      {d && (
+        <>
+          <Card className="mb-4">
+            <KV cols={4} items={[
+              ["Lifecycle", <Badge key="l" code={d.obligation.lifecycle} />], ["Valid", `${fmtDate(d.obligation.valid_from)} → ${d.obligation.valid_to ? fmtDate(d.obligation.valid_to) : "open"}`],
+              ["Owner", d.obligation.owner_actor_id], ["Schedule", <span key="s" className="mono">{d.definition.schedule_kind}</span>],
+              ["Determination", d.determination ? <span key="d"><Badge code={d.determination.outcome} /> <A href={`/applicability/${d.determination.evaluation_id}`}>trace</A></span> : "—"],
+              ["Adopted by", d.attestation ? `${d.attestation.actor_id} · ${fmtDate(d.attestation.signed_at)}` : "—"],
+              ["Authority basis", d.attestation?.authority_basis], ["Expression versions", d.expression_versions.length],
+            ]} />
+          </Card>
+          <Tabs tabs={["Period assurance", "Expression & controls", "Occurrences", "Exceptions & compensation", "Legal basis", "Revisions"]} value={tab} onChange={setTab} />
+          {tab === "Period assurance" && <Period d={d} lineage={lineage} reload={reload} />}
+          {tab === "Expression & controls" && <Controls d={d} />}
+          {tab === "Occurrences" && <Occurrences d={d} lineage={lineage} reload={reload} />}
+          {tab === "Exceptions & compensation" && <ExcComp d={d} lineage={lineage} reload={reload} />}
+          {tab === "Legal basis" && (
+            <Card title="Provisions">
+              <Table head={["Locator", "Duty bearer", "Modality", "Action", "Evidence expectation"]}>
+                {d.provisions.map((p: any) => (
+                  <tr key={p.provision_id}><td className="td mono text-xs">{p.locator}</td><td className="td text-sm">{p.duty_bearer}</td><td className="td mono text-xs">{p.modality}</td>
+                    <td className="td text-sm">{p.action}</td><td className="td text-xs">{p.evidence_expectation ?? "—"}</td></tr>
+                ))}
+              </Table>
+            </Card>
+          )}
+          {tab === "Revisions" && (
+            <Card title="Obligation instance revisions">
+              <Table head={["Record", "Lifecycle", "Valid", "Determination revision"]}>
+                {d.revisions.map((r: any) => (
+                  <tr key={r.revision_id}><td className="td mono text-xs">{r.record_from_seq} → {r.record_to_seq ?? "∞"}</td><td className="td"><Badge code={r.lifecycle} /></td>
+                    <td className="td text-xs">{fmtDate(r.valid_from)} → {r.valid_to ? fmtDate(r.valid_to) : "open"}</td><td className="td"><Hash value={r.determination_revision_id} n={8} /></td></tr>
+                ))}
+              </Table>
+            </Card>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+function Period({ d, lineage, reload }: { d: any; lineage: string; reload: () => void }) {
+  const [snapId, setSnapId] = useState<string | null>(d.snapshots[0]?.snapshot_id ?? null);
+  const snap = useApi<any>(snapId ? `/snapshots/${snapId}` : null);
+  const [seg, setSeg] = useState(0);
+  const [from, setFrom] = useState("2026-07-01");
+  const [to, setTo] = useState("2026-10-01");
+  const [cutoff, setCutoff] = useState("");
+  const a = useAction();
+  const rep = useAction();
+  const [preview, setPreview] = useState<any>(null);
+  useEffect(() => setSeg(0), [snapId]);
+  const view = preview ?? snap.data;
+  const s = view?.segments?.[seg];
+  const body = () => ({ period_from: new Date(from).toISOString(), period_to: new Date(to).toISOString(), record_cutoff_seq: cutoff ? Number(cutoff) : null });
+  return (
+    <div className="space-y-4">
+      <Card title="Assess a period" subtitle="Preview is not persisted. Freezing creates an immutable snapshot pinned to a record cutoff, reproducible later.">
+        <ErrorBox error={a.error} />
+        <div className="flex flex-wrap items-end gap-3">
+          <div><label className="label">Period from</label><input type="date" className="input" value={from} onChange={(e) => setFrom(e.target.value)} /></div>
+          <div><label className="label">Period to (exclusive)</label><input type="date" className="input" value={to} onChange={(e) => setTo(e.target.value)} /></div>
+          <div><label className="label">Record cutoff (blank = now)</label><input type="number" className="input w-36" value={cutoff} onChange={(e) => setCutoff(e.target.value)} /></div>
+          <button className="btn-ghost" disabled={a.busy} onClick={() => a.run(async () => { setPreview(await api(`/obligations/${lineage}/preview`, { method: "POST", json: body() })); setSeg(0); })}>Preview</button>
+          <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
+            const r = await api(`/obligations/${lineage}/snapshots`, { method: "POST", json: body() });
+            setPreview(null); await reload(); setSnapId(r.snapshot_id);
+          })}>Freeze snapshot</button>
+        </div>
+      </Card>
+
+      <Card title={preview ? "Preview (not persisted)" : "Snapshot"} actions={<>
+        {!preview && (
+          <select className="input py-1 text-xs" value={snapId ?? ""} onChange={(e) => { setSnapId(e.target.value); setPreview(null); }}>
+            {d.snapshots.map((x: any) => <option key={x.snapshot_id} value={x.snapshot_id}>{fmtDate(x.period_from)} → {fmtDate(x.period_to)} · {x.state} · {fmtDate(x.created_at, true)}</option>)}
+          </select>)}
+        {preview && <button className="btn-ghost" onClick={() => setPreview(null)}>Back to snapshots</button>}
+        {!preview && snapId && <button className="btn-ghost" disabled={rep.busy} onClick={() => rep.run(() => api(`/snapshots/${snapId}/reproduce`))}>Reproduce</button>}
+      </>}>
+        <ErrorBox error={snap.error || rep.error} />
+        {rep.result && <div className="mb-3"><Notice tone={rep.result.reproducible ? "good" : "warn"}>
+          Rebuilt from record cutoff #{rep.result.record_cutoff_seq}: {rep.result.reproduced_state} (original {rep.result.original_state}) · dependency digest {rep.result.dependency_digest_match ? "matches" : "DIFFERS"} → {rep.result.reproducible ? "reproducible" : "not reproducible"}.
+        </Notice></div>}
+        {!view && <p className="text-sm text-slate-500">No snapshot yet. Preview or freeze one above.</p>}
+        {view && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-sm">Whole-period state</span><Badge code={view.state} />
+              {view.reason_codes?.map((r: string) => <span key={r} className="mono text-[11px] text-amber-700">{r}</span>)}
+              <TreatmentList treatments={view.exception_treatments} />
+            </div>
+            <SegmentRibbon segments={view.segments} excluded={view.excluded_segments || []} period={view.period ?? [view.period_from, view.period_to]} onSelect={setSeg} selected={seg} />
+            {view.precedence_explanation && <p className="text-xs text-slate-600">{view.precedence_explanation}</p>}
+            <KV cols={4} items={[["Perspective", <Badge key="p" code={view.perspective} tone="info" />], ["Record cutoff", <span key="c" className="mono">#{view.record_cutoff_seq}</span>],
+              ["Dependency digest", <Hash key="d" value={view.dependency_digest} />], ["Snapshot hash", <Hash key="h" value={view.snapshot_hash} />],
+              ["Engine", <span key="e" className="mono text-xs">{view.rollup_engine_version}</span>], ["Segments", view.segments.length]]} />
+            <Table head={["Segment", "State", "Expression", "Reasons", "Exceptions", "Coalesced"]}>
+              {view.segments.map((x: any, i: number) => (
+                <tr key={i} onClick={() => setSeg(i)} className={`cursor-pointer ${seg === i ? "bg-brand-50" : "hover:bg-navy-50"}`}>
+                  <td className="td text-xs">{fmtDate(x.segment_range[0])} → {fmtDate(x.segment_range[1])}</td>
+                  <td className="td"><Badge code={x.assurance_state} /></td><td className="td"><Badge code={x.expression_result} /></td>
+                  <td className="td mono text-[11px]">{x.reason_codes.join(", ") || "—"}</td>
+                  <td className="td">{x.exception_treatments.map((t: any) => <ExceptionBadge key={t.exception_id} state={t.state} />)}</td>
+                  <td className="td text-xs">{x.coalesced_from ?? 1}</td>
+                </tr>
+              ))}
+            </Table>
+            {s && (
+              <div className="grid gap-4 xl:grid-cols-3">
+                <div className="xl:col-span-2 rounded-lg border border-navy-100 p-3">
+                  <div className="mb-2 text-sm font-semibold text-navy-800">Expression trace · {fmtDate(s.segment_range[0])} → {fmtDate(s.segment_range[1])}</div>
+                  <ul className="text-sm"><ExprTrace node={s.expression_trace} /></ul>
+                </div>
+                <div className="rounded-lg border border-navy-100 p-3">
+                  <div className="mb-2 text-sm font-semibold text-navy-800">Control evaluations</div>
+                  {s.leaf_evaluations.map((l: any) => (
+                    <div key={l.control_evaluation_id + l.control_key} className="mb-2 text-xs">
+                      <div className="flex items-center gap-2"><span className="mono">{l.control_key}</span><Badge code={l.control_state} /></div>
+                      <div className="text-slate-500">rule {l.precedence_rule} {l.reason_codes.join(", ")}</div>
+                    </div>
+                  ))}
+                  {s.exception_treatments.length > 0 && <Notice tone="warn">An approved exception is a governance treatment shown alongside the state. It never turns a gap into PROVEN.</Notice>}
+                </div>
+              </div>
+            )}
+            {view.dependency_manifest && <details><summary className="cursor-pointer text-xs text-navy-700">Dependency manifest</summary><Json value={view.dependency_manifest} /></details>}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function Controls({ d }: { d: any }) {
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      <Card title="Satisfaction expression versions">
+        {d.expression_versions.map((e: any) => (
+          <div key={e.expression_version_id} className="mb-3 rounded-lg border border-navy-100 p-3">
+            <div className="mb-1 flex items-center gap-2 text-sm"><b>v{e.version}</b><span className="text-xs text-slate-500">from {fmtDate(e.valid_from)}</span><Hash value={e.ast_hash} n={8} /></div>
+            {e.rationale && <p className="mb-2 text-xs text-slate-600">{e.rationale}</p>}
+            <Json value={e.ast} max={220} />
+          </div>
+        ))}
+      </Card>
+      <Card title="Referenced controls (shared implementations)">
+        <Table head={["Control", "Implementation", "Method"]}>
+          {d.controls.map((c: any) => (
+            <tr key={c.control_key}>
+              <td className="td"><div className="mono text-xs">{c.control_key}</div><div className="text-[11px] text-slate-500">{c.title}</div></td>
+              <td className="td">{c.implementation ? <A href={`/controls/${c.implementation.control_implementation_id}`}>open</A> : <Badge code="MISSING" />}</td>
+              <td className="td text-xs">{c.implementation?.method ?? "—"}</td>
+            </tr>
+          ))}
+        </Table>
+      </Card>
+    </div>
+  );
+}
+
+function Occurrences({ d, lineage, reload }: { d: any; lineage: string; reload: () => void }) {
+  const [wf, setWf] = useState("2027-01-01");
+  const [due, setDue] = useState("2027-09-30");
+  const [ful, setFul] = useState<any>(null);
+  const a = useAction();
+  return (
+    <Card title="Occurrences" subtitle="Recurring duties: each due occurrence must be fulfilled with evidence. A missed occurrence is never overwritten by later success.">
+      <ErrorBox error={a.error} />
+      <Table head={["Window", "Due", "Fulfilled", "Evidence", "Status", ""]} empty={!d.occurrences.length}>
+        {d.occurrences.map((o: any) => {
+          const late = o.fulfilled_at && new Date(o.fulfilled_at) > new Date(o.due_at);
+          const missed = !o.fulfilled_at && new Date(o.due_at) < new Date();
+          return (
+            <tr key={o.occurrence_id}>
+              <td className="td text-xs">{fmtDate(o.window_from)} →</td><td className="td text-xs">{fmtDate(o.due_at)}</td>
+              <td className="td text-xs">{fmtDate(o.fulfilled_at)}</td>
+              <td className="td">{(o.evidence_ids || []).map((e: string) => <div key={e}><A href={`/evidence/${e}`}>{e.slice(0, 8)}…</A></div>)}</td>
+              <td className="td">{o.fulfilled_at ? <Badge code={late ? "WARN" : "SATISFIED"} label={late ? "LATE" : "FULFILLED"} /> : missed ? <Badge code="FAILED" label="MISSED" /> : <Badge code="OPEN" />}</td>
+              <td className="td">{!o.fulfilled_at && <button className="btn-ghost" onClick={() => setFul(o)}>Record fulfilment</button>}</td>
+            </tr>
+          );
+        })}
+      </Table>
+      <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-navy-100 pt-4">
+        <div><label className="label">Window from</label><input type="date" className="input" value={wf} onChange={(e) => setWf(e.target.value)} /></div>
+        <div><label className="label">Due at</label><input type="date" className="input" value={due} onChange={(e) => setDue(e.target.value)} /></div>
+        <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
+          await api(`/obligations/${lineage}/occurrences`, { method: "POST", json: { window_from: new Date(wf).toISOString(), due_at: new Date(due).toISOString() } }); reload();
+        })}>Add occurrence</button>
+      </div>
+      {ful && <Fulfil occ={ful} onClose={() => setFul(null)} onDone={() => { setFul(null); reload(); }} />}
+    </Card>
+  );
+}
+
+function Fulfil({ occ, onClose, onDone }: { occ: any; onClose: () => void; onDone: () => void }) {
+  const { data: ev } = useApi<any[]>("/evidence");
+  const [at, setAt] = useState(new Date().toISOString().slice(0, 10));
+  const [sel, setSel] = useState<string[]>([]);
+  const a = useAction();
+  return (
+    <Modal open onClose={onClose} title={`Fulfil occurrence due ${fmtDate(occ.due_at)}`}>
+      <ErrorBox error={a.error} />
+      <label className="label">Fulfilled at</label><input type="date" className="input mb-3" value={at} onChange={(e) => setAt(e.target.value)} />
+      <label className="label">Evidence</label>
+      <div className="max-h-60 overflow-y-auto rounded border border-navy-100 p-2">
+        {ev?.map((e) => (
+          <label key={e.evidence_id} className="flex items-center gap-2 py-1 text-sm">
+            <input type="checkbox" checked={sel.includes(e.evidence_id)} onChange={(x) => setSel(x.target.checked ? [...sel, e.evidence_id] : sel.filter((y) => y !== e.evidence_id))} />
+            {e.title} <Badge code={e.condition} />
+          </label>
+        ))}
+      </div>
+      <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={!sel.length || a.busy} onClick={() => a.run(async () => {
+        await api(`/occurrences/${occ.occurrence_id}/fulfil`, { method: "POST", json: { fulfilled_at: new Date(at).toISOString(), evidence_ids: sel } }); onDone();
+      })}>Record</button></div>
+    </Modal>
+  );
+}
+
+function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () => void }) {
+  const [exc, setExc] = useState({ reason: "", valid_from: "2026-10-01", valid_to: "2026-12-31" });
+  const [comp, setComp] = useState({ primary_control_key: d.controls[0]?.control_key ?? "", compensating: "", rationale: "", valid_from: "2026-10-01" });
+  const a = useAction();
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      <Card title="Exceptions" subtitle="Time-bounded governance treatment, separate from assurance state.">
+        <ErrorBox error={a.error} />
+        <Table head={["Reason", "Validity", "State", "Requested / approved"]} empty={!d.exceptions.length}>
+          {d.exceptions.map((x: any) => (
+            <tr key={x.exception_id}><td className="td text-sm">{x.reason}</td><td className="td text-xs">{fmtDate(x.valid_from)} → {fmtDate(x.valid_to)}</td>
+              <td className="td"><ExceptionBadge state={x.state} /></td><td className="td text-xs">{x.requested_by} / {x.approved_by ?? "—"}</td></tr>
+          ))}
+        </Table>
+        <div className="mt-4 grid gap-2 border-t border-navy-100 pt-4 sm:grid-cols-2">
+          <div className="sm:col-span-2"><label className="label">Request exception — reason</label><input className="input" value={exc.reason} onChange={(e) => setExc({ ...exc, reason: e.target.value })} /></div>
+          <div><label className="label">From</label><input type="date" className="input" value={exc.valid_from} onChange={(e) => setExc({ ...exc, valid_from: e.target.value })} /></div>
+          <div><label className="label">To</label><input type="date" className="input" value={exc.valid_to} onChange={(e) => setExc({ ...exc, valid_to: e.target.value })} /></div>
+          <div className="sm:col-span-2"><button className="btn-primary" disabled={!exc.reason || a.busy} onClick={() => a.run(async () => {
+            await api("/exceptions", { method: "POST", json: { target_type: "OBLIGATION", target_id: lineage, reason: exc.reason, valid_from: new Date(exc.valid_from).toISOString(), valid_to: new Date(exc.valid_to).toISOString() } });
+            reload();
+          })}>Request exception</button> <A href="/governance">Approve in governance →</A></div>
+        </div>
+      </Card>
+      <Card title="Compensating controls" subtitle="Approval creates a new satisfaction-expression version with an explicit COMPENSATION branch — never a manual green flag.">
+        <Table head={["Primary", "Compensating", "Status", "Rationale"]} empty={!d.compensations.length}>
+          {d.compensations.map((c: any) => (
+            <tr key={c.compensation_id}><td className="td mono text-xs">{c.primary_control_key}</td>
+              <td className="td mono text-xs">{JSON.stringify(c.compensating_expression.control_key ?? c.compensating_expression.children?.map((x: any) => x.control_key))}</td>
+              <td className="td"><Badge code={c.status} /></td><td className="td text-xs">{c.equivalence_rationale}</td></tr>
+          ))}
+        </Table>
+        <div className="mt-4 grid gap-2 border-t border-navy-100 pt-4 sm:grid-cols-2">
+          <div><label className="label">Primary control</label><select className="input" value={comp.primary_control_key} onChange={(e) => setComp({ ...comp, primary_control_key: e.target.value })}>
+            {d.controls.map((c: any) => <option key={c.control_key}>{c.control_key}</option>)}</select></div>
+          <div><label className="label">Compensating keys (comma)</label><input className="input" value={comp.compensating} onChange={(e) => setComp({ ...comp, compensating: e.target.value })} /></div>
+          <div className="sm:col-span-2"><label className="label">Equivalence rationale (≥ 20 chars)</label><textarea className="input" rows={2} value={comp.rationale} onChange={(e) => setComp({ ...comp, rationale: e.target.value })} /></div>
+          <div><label className="label">Valid from</label><input type="date" className="input" value={comp.valid_from} onChange={(e) => setComp({ ...comp, valid_from: e.target.value })} /></div>
+          <div className="flex items-end"><button className="btn-primary" disabled={!comp.compensating || a.busy} onClick={() => a.run(async () => {
+            await api("/compensations", { method: "POST", json: { obligation_lineage_id: lineage, primary_control_key: comp.primary_control_key,
+              compensating_control_keys: comp.compensating.split(",").map((x) => x.trim()).filter(Boolean), equivalence_rationale: comp.rationale, valid_from: new Date(comp.valid_from).toISOString() } });
+            reload();
+          })}>Propose compensation</button></div>
+        </div>
+      </Card>
+    </div>
+  );
+}
