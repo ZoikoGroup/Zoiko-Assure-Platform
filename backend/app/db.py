@@ -91,14 +91,18 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 AdminSession = sessionmaker(bind=admin_engine, autoflush=False, expire_on_commit=False)
 
 
-def check_database() -> str:
-    """Run first at start-up: connect with both roles and confirm they reach the same PostgreSQL database.
-    Fails with a clear message that never contains a password. Returns a description for the start-up log."""
+def check_database(runtime: bool = True) -> str:
+    """Connect with both roles and confirm they reach the same PostgreSQL database. Fails with a clear message that
+    never contains a password. Returns a description for the start-up log.
+
+    Start-up calls it twice: first with ``runtime=False`` (owner role only, because on a fresh database the runtime
+    role does not exist until ``pg_bootstrap`` provisions it), then with both roles once bootstrap has run."""
     from sqlalchemy.engine import make_url
     if IS_SQLITE:
         return f"SQLite {make_url(DATABASE_URL).database} (isolated test run)"
     seen = {}
-    for name, eng, url in (("DATABASE_ADMIN_URL", admin_engine, ADMIN_DATABASE_URL), ("DATABASE_URL", engine, DATABASE_URL)):
+    roles = (("DATABASE_ADMIN_URL", admin_engine, ADMIN_DATABASE_URL), ("DATABASE_URL", engine, DATABASE_URL))
+    for name, eng, url in roles if runtime else roles[:1]:
         try:
             with eng.connect() as conn:
                 seen[name] = conn.execute(text("SELECT current_database(), inet_server_port(), current_setting('server_version')")).one()
@@ -106,6 +110,8 @@ def check_database() -> str:
             reason = str(getattr(e, "orig", None) or e).strip().splitlines()[0]
             raise RuntimeError(f"Cannot connect to PostgreSQL with {name} ({describe_url(url)}): {reason}. Is the "
                                "PostgreSQL service running, and do the role, password and database name match?") from None
+    if not runtime:
+        return f"owner role reachable at {describe_url(ADMIN_DATABASE_URL)}"
     if seen["DATABASE_URL"][:2] != seen["DATABASE_ADMIN_URL"][:2]:
         raise RuntimeError("DATABASE_URL and DATABASE_ADMIN_URL reach different databases "
                            f"({describe_url(DATABASE_URL)} vs {describe_url(ADMIN_DATABASE_URL)}); they must be the same one.")

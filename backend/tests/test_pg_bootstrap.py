@@ -64,6 +64,24 @@ def test_existing_runtime_role_with_unsafe_privilege_fails_closed(pg_admin):
         assert _attrs(c, role).rolcreaterole is False  # rolled back; the password was never touched
 
 
+def test_owner_check_before_bootstrap_does_not_need_the_runtime_role(pg_admin, monkeypatch):
+    """On a fresh database the runtime role only exists once bootstrap provisions it, so start-up's first check must
+    use the owner role alone (CI creates no runtime role; checking it first failed every run before any test ran)."""
+    from sqlalchemy import create_engine
+    from app import db
+    from app.db import DATABASE_URL
+    missing = make_url(DATABASE_URL).set(password=secrets.token_hex(16))  # PostgreSQL rejects it like an absent role
+    unusable = create_engine(missing, connect_args={"connect_timeout": 5})
+    monkeypatch.setattr(db, "engine", unusable)
+    try:
+        assert "owner role reachable" in db.check_database(runtime=False)
+        with pytest.raises(RuntimeError, match="with DATABASE_URL") as e:
+            db.check_database()
+        assert missing.password not in str(e.value)
+    finally:
+        unusable.dispose()
+
+
 def test_new_runtime_role_is_created_least_privilege(pg_admin):
     from app import pg_bootstrap
     probe = "za_bootstrap_probe_" + secrets.token_hex(4)

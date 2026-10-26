@@ -20,9 +20,11 @@ async def lifespan(_: FastAPI):
     from .seed import seed_if_empty
     from .auth import ensure_demo_credentials
     from .accounts import bootstrap_accounts
-    # Before anything else: reach the configured database with both roles, or stop with a clear reason.
+    # Before anything else: reach the configured database with the owner role, or stop with a clear reason. The runtime
+    # role is checked after bootstrap, which provisions it (on a fresh database it does not exist before then).
+    check_database(runtime=False)
+    bootstrap()  # owner role: runtime role, tables + row-level security (PostgreSQL)
     logging.getLogger("uvicorn.error").info("Database: %s", check_database())
-    bootstrap()  # owner role: tables + row-level security (PostgreSQL)
     if auth.DEMO_MODE:  # demo/dev only: synthetic Customer Zero fixture + demo sign-in; never on a normal start
         with AdminSession() as db:  # owner role: demo seed (not subject to RLS)
             seed_if_empty(db)
