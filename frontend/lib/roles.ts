@@ -1,0 +1,75 @@
+"use client";
+
+import { useCallback } from "react";
+import { personaOf, useAuth, type Me } from "./actor";
+
+/* Plain-English names for the backend role catalogue (backend/app/security.py ROLE_PERMISSIONS) and the permissions
+   they grant. Display only: the backend decides what every role may do. Codes stay visible beside the names so
+   people can match them to policies and audit records. */
+const ROLES: Record<string, { label: string; about: string }> = {
+  CCO: { label: "Chief Compliance Officer", about: "Adopts applicability determinations, approves exceptions, manages facts and builds audit packages." },
+  LEGAL_REVIEWER: { label: "Legal Reviewer", about: "Attests and challenges legal determinations and records legal dispositions." },
+  REGULATORY_ANALYST: { label: "Regulatory Analyst", about: "Maintains facts, runs applicability evaluations and raises challenges." },
+  CONTROL_OWNER: { label: "Control Owner", about: "Implements controls, submits evidence and test results, and works issues." },
+  INTERNAL_AUDIT: { label: "Internal Audit", about: "Reads everything, builds audit packages and verifies evidence and the ledger." },
+  AI_GOVERNANCE_LEAD: { label: "AI Governance Lead", about: "Registers AI assets and grants or revokes agent authority." },
+  PLATFORM_ADMIN: { label: "Organisation Platform Admin", about: "Configures this organisation's connectors and ledger checkpoints. This is not the Zoiko Super Admin." },
+  TENANT_OWNER: { label: "Organisation Admin", about: "Administers this organisation (for example its legal entities). Cannot attest, approve or change assurance states on its behalf." },
+  RISK_APPROVER: { label: "Risk Approver", about: "Approves exceptions, risk acceptances and compensating controls." },
+  EXTERNAL_AUDITOR: { label: "External Auditor", about: "Read-only access for an audit engagement, with verification of evidence and packages." },
+  CONTENT_ANALYST: { label: "Content Analyst (Zoiko)", about: "Ingests regulatory sources and drafts requirements and rules." },
+  ENCODING_ENGINEER: { label: "Encoding Engineer (Zoiko)", about: "Encodes rules and peer-reviews other authors' drafts." },
+  CONTENT_LEGAL_REVIEWER: { label: "Content Legal Reviewer (Zoiko)", about: "Legally verifies encoded requirements before release." },
+  CONTENT_RELEASE_MANAGER: { label: "Content Release Manager (Zoiko)", about: "Releases verified content to customer organisations." },
+  SUPER_ADMIN: { label: "Super Admin (Zoiko platform)", about: "Creates and administers customer organisations in the registry. Has no access to any organisation's regulatory data." },
+  SERVICE: { label: "Service account", about: "Automated integration acting under granted authority." },
+};
+
+const PERMISSIONS: Record<string, string> = {
+  read: "View this organisation's regulatory records",
+  attest: "Sign attestations and legal holds",
+  approve_exception: "Approve exceptions and risk acceptances",
+  approve_compensation: "Approve compensating controls",
+  request_evaluation: "Run applicability evaluations",
+  manage_facts: "Assert facts and register subjects",
+  challenge: "Challenge determinations",
+  legal_disposition: "Record legal dispositions",
+  package: "Build audit packages",
+  verify: "Verify evidence, packages and the ledger",
+  submit_evidence: "Submit evidence and test results",
+  manage_controls: "Implement and maintain controls",
+  manage_issues: "Move issues through remediation",
+  manage_ai: "Register AI assets and versions",
+  grant_authority: "Grant and revoke agent authority",
+  manage_connectors: "Configure and certify connectors",
+  manage_tenant: "Administer the organisation",
+  checkpoint: "Checkpoint the evidence ledger",
+  content_author: "Author regulatory content and rule drafts",
+  content_peer_review: "Peer-review rule drafts",
+  content_legal_review: "Legally verify regulatory content",
+  content_release: "Release content to organisations",
+  manage_organisations: "Create and administer customer organisations (registry only)",
+};
+
+export const roleLabel = (code: string) => ROLES[code]?.label ?? code;
+export const roleAbout = (code: string) => ROLES[code]?.about;
+export const permissionText = (code: string) => PERMISSIONS[code] ?? code;
+export const rolesText = (me: Pick<Me, "roles"> | null) => (me?.roles ?? []).map(roleLabel).join(", ");
+
+/** Where the signed-in person works. A customer organisation, or Zoiko's own staff, who belong to no organisation. */
+export function workContext(me: Me | null): { kind: "organisation" | "platform" | "content"; label: string; name: string; id?: string } {
+  const persona = personaOf(me);
+  if (persona === "tenant") return { kind: "organisation", label: "Organisation", name: me?.tenant_name ?? "", id: me?.tenant_id ?? undefined };
+  if (persona === "platform") return { kind: "platform", label: "Zoiko platform", name: "Platform administration" };
+  return { kind: "content", label: "Zoiko staff", name: "Content operations" };
+}
+
+/** Whether the signed-in person's roles grant a permission, and why an action is unavailable when they don't.
+ *  This only shapes the UI; the backend refuses the call either way. */
+export function useCan() {
+  const { me } = useAuth();
+  const can = useCallback((perm: string) => !!me?.permissions?.includes(perm), [me]);
+  const why = useCallback((perm: string) => (me?.permissions?.includes(perm) ? undefined
+    : `Not available to your role (${rolesText(me) || "none"}): needs “${permissionText(perm)}”`), [me]);
+  return { can, why };
+}

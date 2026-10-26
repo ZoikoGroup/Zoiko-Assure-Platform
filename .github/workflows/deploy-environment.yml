@@ -1,0 +1,205 @@
+# Deploys one CI-verified release to one GitHub Environment. Called by deploy.yml for `staging`, then `production`.
+# Documented in docs/ci-cd.md.
+#
+# Order: validate configuration -> verify release bundle -> build frontend for this environment -> apply approved
+# migrations -> deploy backend -> verify backend -> deploy frontend -> verify frontend and frontend->backend ->
+# record the result. Any failure stops the job before the next step, so a release is never exposed after a failed
+# migration or health check.
+#
+# Fails closed today: steps marked DEPLOYMENT TARGET REQUIRED and BLOCKED — VERSIONED MIGRATION SYSTEM REQUIRED exit 1
+# until a deployment target and a migration system exist. They do not create, alter, reset or seed any database.
+name: Deploy environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment to deploy to (staging or production)
+        required: true
+        type: string
+      sha:
+        description: CI-verified commit to deploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.ZA_FRONTEND_URL }}
+    env:
+      ZA_ENVIRONMENT: ${{ inputs.environment }}
+      RELEASE_SHA: ${{ inputs.sha }}
+      # Environment-scoped, non-secret configuration (Settings -> Environments -> <name> -> Variables). Secrets are
+      # never placed in job-level env; a step that needs one names it in its own `env`.
+      ZA_DEPLOY_TARGET: ${{ vars.ZA_DEPLOY_TARGET }}
+      ZA_FRONTEND_URL: ${{ vars.ZA_FRONTEND_URL }}
+      NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+      ZA_CORS: ${{ vars.ZA_CORS }}
+      ZA_CELL_ID: ${{ vars.ZA_CELL_ID }}
+      ZA_DEMO_MODE: ${{ vars.ZA_DEMO_MODE }}
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Validate deployment configuration
+        id: config
+        env:
+          # Presence only: the expressions evaluate to true/false and the secret values never enter this step.
+          HAS_DATABASE_URL: ${{ secrets.ZA_DATABASE_URL != '' }}
+          HAS_MIGRATION_DATABASE_URL: ${{ secrets.ZA_MIGRATION_DATABASE_URL != '' }}
+        run: |
+          problems=()
+          if [ -z "$ZA_DEPLOY_TARGET" ]; then
+            echo "::error title=DEPLOYMENT TARGET REQUIRED::No deployment target is defined for '$ZA_ENVIRONMENT'. Choose a hosting target, implement the deploy steps in .github/workflows/deploy-environment.yml and set the ZA_DEPLOY_TARGET environment variable (docs/ci-cd.md)."
+            problems+=("deployment target")
+          fi
+          if [ "$ZA_DEMO_MODE" != "0" ]; then
+            problems+=("ZA_DEMO_MODE must be set to 0 for $ZA_ENVIRONMENT (found '${ZA_DEMO_MODE:-unset}')")
+          fi
+          [[ "$ZA_FRONTEND_URL" =~ ^https://[^/]+$ ]] || problems+=("ZA_FRONTEND_URL must be an https:// origin without a path")
+          [[ "$NEXT_PUBLIC_API_URL" =~ ^https://[^/]+/api$ ]] || problems+=("NEXT_PUBLIC_API_URL must be an https:// API base ending in /api")
+          for v in ZA_FRONTEND_URL NEXT_PUBLIC_API_URL; do
+            if [[ "${!v}" =~ (localhost|127\.0\.0\.1|0\.0\.0\.0|:3100|:8100|:5173|:8000) ]]; then
+              problems+=("$v must not point at a local development address or port")
+            fi
+          done
+          [[ ",$ZA_CORS," == *",$ZA_FRONTEND_URL,"* ]] || problems+=("ZA_CORS must list ZA_FRONTEND_URL as an allowed origin")
+          [ -n "$ZA_CELL_ID" ] || problems+=("ZA_CELL_ID is required")
+          [ "$HAS_DATABASE_URL" = "true" ] || problems+=("secret ZA_DATABASE_URL (runtime role assure_app) is missing")
+          [ "$HAS_MIGRATION_DATABASE_URL" = "true" ] || problems+=("secret ZA_MIGRATION_DATABASE_URL (owner/migration role) is missing")
+          if ((${#problems[@]})); then
+            for p in "${problems[@]}"; do
+              [ "$p" = "deployment target" ] || echo "::error title=Deployment configuration ($ZA_ENVIRONMENT)::$p"
+            done
+            exit 1
+          fi
+          echo "Configuration for $ZA_ENVIRONMENT is complete (target: $ZA_DEPLOY_TARGET)."
+
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Fetch release bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ inputs.sha }}
+          path: ${{ runner.temp }}/release
+
+      - name: Verify release bundle
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          sha256sum --check SHA256SUMS
+          [ "$(jq -r .commit release.json)" = "$RELEASE_SHA" ] || { echo "::error::release bundle is for a different commit"; exit 1; }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false  # release builds never restore a cache
+
+      # NEXT_PUBLIC_API_URL is compiled into the client bundle, so each environment builds its own frontend from the
+      # same commit and lockfile. Only public NEXT_PUBLIC_* configuration is present in this step.
+      - name: Build frontend for ${{ inputs.environment }}
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc --noEmit
+          npm run build
+
+      - name: Apply approved database migrations
+        id: migrate
+        run: |
+          # BLOCKED: the backend has no versioned migration system. Its schema comes from create_all plus
+          # db/postgres_rls.sql, applied by app/pg_bootstrap.py at API start-up with the owner role. That is not a
+          # production migration system, and this pipeline will not create or alter a staging/production schema
+          # through it.
+          # When migrations exist (planned: Alembic, DAT-REQ-023/039), run only the reviewed migrations here, giving
+          # this step alone the owner/migration credential (the ZA_MIGRATION_DATABASE_URL environment secret, mapped
+          # in the step's own env), and never a reset, DROP, test seed or Customer Zero seed.
+          echo "::error title=BLOCKED — VERSIONED MIGRATION SYSTEM REQUIRED::No versioned, reviewed migrations exist for $ZA_ENVIRONMENT. Deployment stops before any schema change (docs/ci-cd.md)."
+          exit 1
+
+      - name: Deploy backend
+        id: deploy_backend
+        run: |
+          # Target-specific. Deploy the backend from backend-src.tar.gz + backend-requirements.lock.txt in the
+          # release bundle with: DATABASE_URL from secrets.ZA_DATABASE_URL (runtime role), ZA_CORS, ZA_CELL_ID,
+          # ZA_DEMO_MODE=0, persistent ZA_DATA_DIR storage, and without ZA_DEV_IDENTITY_HEADER. Deploy to an inactive
+          # slot / new revision and keep it out of traffic until the verification below passes.
+          echo "::error title=DEPLOYMENT TARGET REQUIRED::No backend deployment target is implemented (docs/ci-cd.md)."
+          exit 1
+
+      - name: Verify backend
+        id: verify_backend
+        run: >-
+          python3 .github/scripts/deploy_healthcheck.py --scope backend
+          --api-base "$NEXT_PUBLIC_API_URL"
+          --report "$RUNNER_TEMP/verify-backend.json"
+
+      - name: Deploy frontend
+        id: deploy_frontend
+        run: |
+          # Target-specific. Deploy frontend/.next built above (next start, port from the target) and switch traffic
+          # only after the verification below passes.
+          echo "::error title=DEPLOYMENT TARGET REQUIRED::No frontend deployment target is implemented (docs/ci-cd.md)."
+          exit 1
+
+      - name: Verify frontend and frontend -> backend
+        id: verify_frontend
+        run: >-
+          python3 .github/scripts/deploy_healthcheck.py --scope all
+          --api-base "$NEXT_PUBLIC_API_URL"
+          --frontend-url "$ZA_FRONTEND_URL"
+          --expect-api-base "$NEXT_PUBLIC_API_URL"
+          --report "$RUNNER_TEMP/verify-frontend.json"
+
+      - name: Record deployment result
+        if: ${{ always() }}
+        env:
+          CONFIG: ${{ steps.config.outcome }}
+          MIGRATE: ${{ steps.migrate.outcome }}
+          DEPLOY_BACKEND: ${{ steps.deploy_backend.outcome }}
+          VERIFY_BACKEND: ${{ steps.verify_backend.outcome }}
+          DEPLOY_FRONTEND: ${{ steps.deploy_frontend.outcome }}
+          VERIFY_FRONTEND: ${{ steps.verify_frontend.outcome }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/record"
+          cp "$RUNNER_TEMP"/verify-*.json "$RUNNER_TEMP/record/" 2> /dev/null || true
+          jq -n --arg env "$ZA_ENVIRONMENT" --arg sha "$RELEASE_SHA" --arg run "$GITHUB_RUN_ID" \
+                --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg status "$JOB_STATUS" \
+                --arg config "$CONFIG" --arg migrate "$MIGRATE" --arg deploy_backend "$DEPLOY_BACKEND" \
+                --arg verify_backend "$VERIFY_BACKEND" --arg deploy_frontend "$DEPLOY_FRONTEND" \
+                --arg verify_frontend "$VERIFY_FRONTEND" \
+                '{environment: $env, commit: $sha, deploy_run_id: $run, recorded_at: $at, result: $status,
+                  steps: {validate_configuration: $config, migrations: $migrate, deploy_backend: $deploy_backend,
+                          verify_backend: $verify_backend, deploy_frontend: $deploy_frontend,
+                          verify_frontend: $verify_frontend}}' > "$RUNNER_TEMP/record/deployment.json"
+          cat "$RUNNER_TEMP/record/deployment.json"
+          {
+            echo "### Deployment to $ZA_ENVIRONMENT: $JOB_STATUS"
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/record/deployment.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deployment-record-${{ inputs.environment }}-${{ inputs.sha }}
+          path: ${{ runner.temp }}/record/
+          retention-days: 90
+          if-no-files-found: warn

@@ -12,7 +12,7 @@ export default function Rules() {
   const [open, setOpen] = useState(false);
   return (
     <>
-      <PageHeader spec="ZA-RUL-001 §§10-17" title="Rule authoring workbench"
+      <PageHeader spec="ZA-RUL-001 §§10-17" title="Rule Authoring"
         subtitle="Typed rule ASTs and decision tables, static validation, golden vectors, shadow impact, separation-of-duties review and signed release."
         actions={<button className="btn-primary" onClick={() => setOpen(true)}>New draft</button>} />
       <ErrorBox error={drafts.error || versions.error} />

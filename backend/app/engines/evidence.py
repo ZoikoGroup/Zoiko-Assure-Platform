@@ -13,7 +13,6 @@ import os
 import struct
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -22,7 +21,7 @@ from sqlalchemy.orm import Session
 from ..db import CELL_ID, DATA_DIR
 from ..models import (EvidenceArtifact, EvidenceLedgerEvent, EvidencePackage, Issue, LedgerCheckpoint, LegalHold,
                       TenantLedgerHead, new_id, utcnow)
-from ..platform import canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
+from ..platform import canonical_json, emit, ensure_utc, next_record_seq, sha256_hex
 from . import keys
 
 OBJECT_DIR = DATA_DIR / "objects"

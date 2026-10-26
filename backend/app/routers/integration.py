@@ -11,7 +11,7 @@ from ..engines import ipe as ipe_engine
 from ..models import (ConnectorDefinition, ConnectorInstallation, ExtractionContractVersion, IPEAnomaly, IPEEvaluation,
                       IPEPolicyVersion, MappingContractVersion, PopulationManifest, SourceRun, TestDefinition)
 from ..platform import audit, emit, ensure_utc, to_dict
-from ..security import Ctx, get_ctx
+from ..security import DEV_HEADER, Ctx, get_ctx
 
 router = APIRouter()
 
@@ -68,7 +68,12 @@ class RunIn(BaseModel):
 
 @router.post("/ipe/source-runs")
 def execute_run(body: RunIn, ctx: Ctx = Depends(get_ctx)):
-    """Execute a connector extraction (payload = what the source returned) and evaluate IPE."""
+    """Execute a connector extraction (payload = what the source returned) and evaluate IPE.
+
+    DISABLED outside dev/test: a client-posted payload cannot prove system-direct provenance (audit F4, IPE-REQ-002/003).
+    The certified connector-worker path replaces it (backend build plan, Week 3)."""
+    if not DEV_HEADER:
+        raise HTTPException(403, "Client-posted source runs are disabled; use the certified connector path")
     ctx.require("submit_evidence")
     inst = ctx.scoped(ctx.db.get(ConnectorInstallation, body.installation_id), "installation")
     pol = ctx.db.get(IPEPolicyVersion, body.ipe_policy_version_id)

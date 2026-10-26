@@ -25,7 +25,7 @@ export default function Packages() {
   });
   return (
     <>
-      <PageHeader spec="ZA-EVD-001 §12 · WF-EVD-05/06" title="Audit packages"
+      <PageHeader spec="ZA-EVD-001 §12 · WF-EVD-05/06" title="Audit Package Builder"
         subtitle="Signed, self-describing zip packages with snapshots, evaluations, IPE statements, evidence, ledger proofs and a manifest. Anyone can verify them offline with the open verifier." />
       <ErrorBox error={error} />
       <div className="grid gap-4 xl:grid-cols-3">

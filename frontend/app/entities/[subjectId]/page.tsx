@@ -4,6 +4,8 @@ import { useParams } from "next/navigation";
 import { useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
+import { useActorNames } from "@/lib/people";
+import { useCan } from "@/lib/roles";
 import { A, Badge, Card, ErrorBox, Hash, KV, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
 import { AssertModal } from "@/components/AssertModal";
 
@@ -22,12 +24,14 @@ export default function SubjectPage() {
   const a = useAction();
   const p = prof.data;
   const reloadAll = () => { prof.reload(); hist.reload(); evals.reload(); };
+  const { can, why } = useCan();
+  const name = useActorNames();
 
   return (
     <>
-      <PageHeader spec="WF-APP-01 · ZA-TIM-001" title={p?.subject.display_name ?? "Subject"}
-        subtitle="Bitemporal fact profile: valid time (when true in the world) and record time (when Assure knew it) are separate axes."
-        actions={<button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => { const r = await api(`/applicability/evaluate-all?subject_id=${subjectId}`, { method: "POST" }); evals.reload(); return r; })}>Evaluate all obligations</button>} />
+      <PageHeader kicker="Subject · facts and applicability" spec="WF-APP-01 · ZA-TIM-001" title={p?.subject.display_name ?? "Subject"}
+        subtitle="The facts recorded about this subject, and which requirements they make apply. Valid time (when a fact was true) and record time (when Assure learned it) are kept separately."
+        actions={<button className="btn-primary" disabled={a.busy || !can("request_evaluation")} title={why("request_evaluation")} onClick={() => a.run(async () => { const r = await api(`/applicability/evaluate-all?subject_id=${subjectId}`, { method: "POST" }); evals.reload(); return r; })}>Evaluate all obligations</button>} />
       <ErrorBox error={prof.error || a.error} />
       {Array.isArray(a.result) && (
         <div className="mb-4"><Notice tone="good">Evaluated: {a.result.map((r: any) => `${r.obligation} → ${r.outcome ?? "error"}`).join(" · ")}</Notice></div>
@@ -75,7 +79,7 @@ export default function SubjectPage() {
                 <td className="td text-xs">{fmtDate(r.valid_from)} → {r.valid_to ? fmtDate(r.valid_to) : "open"}</td>
                 <td className="td mono text-[11px]">{r.provenance_class}</td>
                 <td className="td text-xs"><Badge code={r.change_kind} tone="info" />{r.change_reason && <div className="text-slate-500">{r.change_reason}</div>}</td>
-                <td className="td text-xs">{r.actor_id}</td>
+                <td className="td text-xs">{name(r.actor_id)}</td>
               </tr>
             ))}
           </Table>

@@ -4,6 +4,8 @@ import { useParams } from "next/navigation";
 import { useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
+import { useActorNames } from "@/lib/people";
+import { useCan } from "@/lib/roles";
 import { A, Badge, Card, ErrorBox, Hash, Json, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
 
 export default function ControlPage() {
@@ -12,10 +14,13 @@ export default function ControlPage() {
   const { data: d, error, reload } = useApi<any>(`/controls/${id}?days=${days}`);
   const [run, setRun] = useState<any>(null);
   const a = useAction();
+  const name = useActorNames();
+  const { can, why } = useCan();
   const ce = d?.evaluation_preview;
   return (
     <>
-      <PageHeader spec="WF-STA-02 Control Evaluation" title={d?.definition.title ?? "Control"} subtitle={d ? `${d.definition.key} · ${d.subject.display_name}` : undefined}
+      <PageHeader kicker="Control implementation" spec="WF-STA-02 Control Evaluation" title={d?.definition.title ?? "Control"}
+        subtitle={d ? `${d.definition.key} · scope ${d.subject.display_name}. Its tests and their evidence decide whether it operated in a window.` : undefined}
         actions={<>
           <select className="input py-1 text-xs" value={days} onChange={(e) => setDays(Number(e.target.value))}>{[7, 30, 90, 180].map((x) => <option key={x} value={x}>last {x} days</option>)}</select>
           <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
@@ -27,7 +32,7 @@ export default function ControlPage() {
       {d && (
         <div className="space-y-4">
           <Card>
-            <KV cols={4} items={[["Objective", d.definition.objective], ["Method", d.implementation.method], ["Owner", d.implementation.owner_actor_id], ["Category", d.definition.category],
+            <KV cols={4} items={[["Objective", d.definition.objective], ["Method", d.implementation.method], ["Owner", name(d.implementation.owner_actor_id)], ["Category", d.definition.category],
               ["Window state", <Badge key="s" code={ce.state} />], ["Precedence rule", <span key="p" className="mono text-xs">{ce.precedence_rule}</span>],
               ["Aggregation", <span key="a" className="mono text-xs">{ce.aggregation_mode}</span>], ["Automation", <span key="u" className="mono text-xs">{ce.automation_requirement}</span>]]} />
             {ce.reason_codes.length > 0 && <div className="mt-3 flex flex-wrap gap-1">{ce.reason_codes.map((r: string) => <Badge key={r} code="WARN" label={r} />)}</div>}
@@ -45,7 +50,7 @@ export default function ControlPage() {
                     <td className="td"><Badge code={t.status} /></td>
                     <td className="td mono text-[11px]">{t.reason_codes.join(", ") || "—"}</td>
                     <td className="td">{(t.evidence || []).map((e: any) => <div key={e.evidence_id ?? e}><A href={`/evidence/${e.evidence_id ?? e}`}>{String(e.evidence_id ?? e).slice(0, 8)}…</A> {e.condition && <Badge code={e.condition} />}</div>)}</td>
-                    <td className="td"><button className="btn-ghost" onClick={() => setRun(td)}>Record result</button></td>
+                    <td className="td"><button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setRun(td)}>Record result</button></td>
                   </tr>
                 );
               })}

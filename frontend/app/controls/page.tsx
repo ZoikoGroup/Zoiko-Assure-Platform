@@ -3,16 +3,20 @@
 import { useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
+import { useActorNames } from "@/lib/people";
+import { useCan } from "@/lib/roles";
 import { A, Badge, Card, ErrorBox, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
 
 export default function Controls() {
   const { data, error, reload } = useApi<any[]>("/controls");
   const [open, setOpen] = useState(false);
+  const name = useActorNames();
+  const { can, why } = useCan();
   return (
     <>
-      <PageHeader spec="ZA-STA-001 §§6-9 · WF-STA-02" title="Controls & tests"
-        subtitle="One shared implementation per control and scope, reused across every obligation and framework that references it."
-        actions={<button className="btn-primary" onClick={() => setOpen(true)}>Implement control</button>} />
+      <PageHeader spec="ZA-STA-001 §§6-9 · WF-STA-02" title="Controls & Tests"
+        subtitle="The controls that satisfy your obligations. Each is implemented once per scope and reused by every obligation that references it; its tests and their evidence show whether it operated."
+        actions={<button className="btn-primary" disabled={!can("manage_controls")} title={why("manage_controls")} onClick={() => setOpen(true)}>Implement control</button>} />
       <ErrorBox error={error} />
       <Notice>The state column is a 24-hour convenience view. Authoritative states are immutable ControlEvaluations pinned to windows and record cutoffs.</Notice>
       <Card className="mt-4">
@@ -22,7 +26,7 @@ export default function Controls() {
               <td className="td"><A href={`/controls/${c.control_implementation_id}`}>{c.definition.title}</A><div className="mono text-[11px] text-slate-500">{c.definition.key}</div></td>
               <td className="td text-sm">{c.subject}</td>
               <td className="td max-w-xs text-xs">{c.method}</td>
-              <td className="td text-xs">{c.owner_actor_id}</td>
+              <td className="td text-xs">{name(c.owner_actor_id)}</td>
               <td className="td text-xs">{fmtDate(c.valid_from)}</td>
               <td className="td"><Badge code={c.current_state.state} /></td>
               <td className="td mono text-[11px]">{c.current_state.reason_codes.join(", ") || "—"}</td>

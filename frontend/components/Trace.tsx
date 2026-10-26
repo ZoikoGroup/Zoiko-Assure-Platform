@@ -80,7 +80,8 @@ export function ExprTrace({ node, depth = 0 }: { node: any; depth?: number }) {
 
 /* Segment ribbon (WF-STA-05 / WF-TIM-04): proportional, labeled, with tabular fallback. */
 const SEG_CLS: Record<string, string> = {
-  PROVEN: "bg-emerald-500", NOT_PROVEN: "bg-amber-400", FAILING: "bg-red-500", REQUIRES_REVIEW: "bg-violet-500", EXCLUDED: "bg-slate-200",
+  PROVEN: "bg-emerald-100 text-emerald-900", NOT_PROVEN: "bg-amber-100 text-amber-900", FAILING: "bg-red-100 text-red-900",
+  REQUIRES_REVIEW: "bg-violet-100 text-violet-900", EXCLUDED: "bg-slate-100 text-slate-600",
 };
 export function SegmentRibbon({ segments, excluded = [], period, onSelect, selected }: { segments: any[]; excluded?: any[]; period: [string, string]; onSelect?: (i: number) => void; selected?: number }) {
   const start = new Date(period[0]).getTime();
@@ -91,16 +92,16 @@ export function SegmentRibbon({ segments, excluded = [], period, onSelect, selec
   ].sort((a, b) => new Date(a.segment_range[0]).getTime() - new Date(b.segment_range[0]).getTime());
   return (
     <div>
-      <div className="flex h-9 w-full overflow-hidden rounded-lg ring-1 ring-navy-100" role="list" aria-label="Assurance period segments">
+      <div className="flex h-7 w-full overflow-hidden rounded-md ring-1 ring-slate-200" role="list" aria-label="Assurance period segments">
         {all.map((s, i) => {
           const w = ((new Date(s.segment_range[1]).getTime() - new Date(s.segment_range[0]).getTime()) / (end - start)) * 100;
           return (
             <button key={i} role="listitem" disabled={s.idx < 0} onClick={() => onSelect?.(s.idx)}
               title={`${s.kind}: ${fmtDate(s.segment_range[0])} → ${fmtDate(s.segment_range[1])}`}
               style={{ width: `${w}%` }}
-              className={`relative h-full border-r border-white/70 text-[10px] font-semibold text-white ${SEG_CLS[s.kind]} ${selected === s.idx ? "ring-4 ring-inset ring-navy-900/60" : ""}`}>
+              className={`relative h-full border-r border-white text-[10px] font-medium mono ${SEG_CLS[s.kind]} ${selected === s.idx ? "ring-2 ring-inset ring-navy-700" : ""}`}>
               <span className="absolute inset-0 flex items-center justify-center truncate px-1">{w > 12 ? (s.kind === "EXCLUDED" ? "not applicable" : s.kind) : ""}</span>
-              {s.exception_treatments?.length > 0 && <span className="absolute right-1 top-0.5 text-[10px] text-white">⚠</span>}
+              {s.exception_treatments?.length > 0 && <span className="absolute right-1 top-0.5 text-[10px] text-brand-700" title="Exception treatment applies (state unchanged)">⚠</span>}
             </button>
           );
         })}

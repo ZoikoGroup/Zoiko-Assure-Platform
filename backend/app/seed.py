@@ -11,7 +11,6 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import codes
 from .db import CELL_ID
 from .engines import applicability as appl
 from .engines import assurance as asr

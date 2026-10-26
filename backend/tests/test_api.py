@@ -137,3 +137,22 @@ def test_change_password_revokes_other_sessions(client):
     assert ok.status_code == 200
     assert client.get("/api/auth/session", headers={"Authorization": f"Bearer {b}"}).status_code == 401
     assert client.get("/api/auth/session", headers={"Authorization": f"Bearer {a}"}).status_code == 200
+
+
+# ---------------------------------------------------------------- pre-development cleanup guards
+def test_clients_cannot_choose_provenance_or_cell_and_no_demo_password_is_exposed(client, monkeypatch):
+    fact = {"fact_key": "entity.established_in_eu", "value": True, "valid_from": "2025-01-01T00:00:00Z"}
+    # provenance is server-derived (APP-REQ-005, API-REQ-014)
+    assert client.post("/api/subjects/subj-entity-uk/facts", headers=H("actor-analyst"),
+                       json={**fact, "provenance_class": "P1_SYSTEM_DIRECT"}).status_code == 422
+    # system-sourced facts must not arrive through the human-facing endpoint
+    assert client.post("/api/subjects/subj-entity-uk/facts", headers=H("actor-svc"), json=fact).status_code == 403
+    # clients never select the authoritative cell (TEN-REQ-005, API-REQ-009)
+    assert client.post("/api/org/entities", headers=H("actor-admin"),
+                       json={"legal_name": "Probe Ltd", "country": "GB", "home_cell_id": "uk-south-cell-b"}).status_code == 422
+    assert "password" not in client.get("/api/auth/demo-accounts").json()
+    # client-posted source runs are disabled outside dev/test (audit F4)
+    from app.routers import integration
+    monkeypatch.setattr(integration, "DEV_HEADER", False)
+    assert client.post("/api/ipe/source-runs", headers=H("actor-owner"),
+                       json={"installation_id": "x", "ipe_policy_version_id": "y", "payload": {}}).status_code == 403

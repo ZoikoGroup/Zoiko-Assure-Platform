@@ -1,33 +1,38 @@
 "use client";
 
+import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, ExceptionBadge, Hash, Json, KV, Modal, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
+import { useActorNames } from "@/lib/people";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, ExceptionBadge, Hash, Json, KV, Modal, Notice, PageHeader, PeriodSelector, Table, Tabs, useAction } from "@/components/ui";
 import { ExprTrace, SegmentRibbon, TreatmentList } from "@/components/Trace";
 
 export default function Dossier() {
   const { lineage } = useParams<{ lineage: string }>();
   const { data: d, error, reload } = useApi<any>(`/obligations/${lineage}`);
-  const [tab, setTab] = useState("Period assurance");
+  const name = useActorNames();
+  const [tab, setTab] = useState("Overview");
   return (
     <>
-      <PageHeader spec="WF-STA-01 Obligation Assurance Dossier" title={d?.definition.title ?? "Obligation"}
-        subtitle={d ? `${d.subject.display_name} · ${d.definition.key}` : undefined} />
+      <PageHeader kicker="Obligation dossier" spec="WF-STA-01 Obligation Assurance Dossier" title={d?.definition.title ?? "Obligation"}
+        subtitle={d ? `For ${d.subject.display_name} · ${d.definition.key}` : undefined} />
       <ErrorBox error={error} />
       {d && (
         <>
           <Card className="mb-4">
             <KV cols={4} items={[
               ["Lifecycle", <Badge key="l" code={d.obligation.lifecycle} />], ["Valid", `${fmtDate(d.obligation.valid_from)} → ${d.obligation.valid_to ? fmtDate(d.obligation.valid_to) : "open"}`],
-              ["Owner", d.obligation.owner_actor_id], ["Schedule", <span key="s" className="mono">{d.definition.schedule_kind}</span>],
+              ["Owner", name(d.obligation.owner_actor_id)], ["Schedule", <span key="s" className="mono">{d.definition.schedule_kind}</span>],
               ["Determination", d.determination ? <span key="d"><Badge code={d.determination.outcome} /> <A href={`/applicability/${d.determination.evaluation_id}`}>trace</A></span> : "—"],
-              ["Adopted by", d.attestation ? `${d.attestation.actor_id} · ${fmtDate(d.attestation.signed_at)}` : "—"],
+              ["Adopted by", d.attestation ? `${name(d.attestation.actor_id)} · ${fmtDate(d.attestation.signed_at)}` : "—"],
               ["Authority basis", d.attestation?.authority_basis], ["Expression versions", d.expression_versions.length],
             ]} />
           </Card>
-          <Tabs tabs={["Period assurance", "Expression & controls", "Occurrences", "Exceptions & compensation", "Legal basis", "Revisions"]} value={tab} onChange={setTab} />
+          <Tabs tabs={["Overview", "Period assurance", "Expression & controls", "Occurrences", "Exceptions & compensation", "Legal basis", "Revisions"]} value={tab} onChange={setTab} />
+          {tab === "Overview" && <Overview d={d} name={name} go={setTab} />}
           {tab === "Period assurance" && <Period d={d} lineage={lineage} reload={reload} />}
           {tab === "Expression & controls" && <Controls d={d} />}
           {tab === "Occurrences" && <Occurrences d={d} lineage={lineage} reload={reload} />}
@@ -58,6 +63,67 @@ export default function Dossier() {
   );
 }
 
+/** The dossier in one view: from the legal requirement, through why it applies and who adopted it, to the controls,
+ *  evidence and the latest assurance state. Read-only; every value is this obligation's own backend record. */
+function Overview({ d, name, go }: { d: any; name: (id?: string | null) => string; go: (tab: string) => void }) {
+  const latest = d.snapshots[0];
+  const implemented = d.controls.filter((c: any) => c.implementation).length;
+  const missing = d.controls.length - implemented;
+  const now = new Date();
+  const fulfilled = d.occurrences.filter((o: any) => o.fulfilled_at).length;
+  const missed = d.occurrences.filter((o: any) => !o.fulfilled_at && new Date(o.due_at) < now).length;
+  const approved = d.exceptions.filter((x: any) => x.state === "APPROVED").length;
+  const openIssues = d.issues.filter((i: any) => !["CLOSED", "CANCELLED"].includes(i.state)).length;
+  const tab = (t: string) => <button type="button" className="text-xs text-navy-700 hover:underline" onClick={() => go(t)}>{t} →</button>;
+  const steps = [
+    { label: "Requirement", about: "What the law requires, and of whom.",
+      status: <>{d.provisions.length} provision(s){d.provisions[0] && <> · <span className="mono text-xs">{d.provisions[0].locator}</span> · {d.provisions[0].duty_bearer}</>}</>,
+      action: tab("Legal basis") },
+    { label: "Applicability", about: "Why it applies: the subject's facts evaluated against the encoded rule.",
+      status: d.determination ? <><Badge code={d.determination.outcome} /> for {d.subject.display_name}</> : "No determination recorded",
+      action: d.determination && <Link href={`/applicability/${d.determination.evaluation_id}`} className="text-xs text-navy-700 hover:underline">Evaluation trace →</Link> },
+    { label: "Obligation", about: "The duty your organisation accepted through a named attestation.",
+      status: <><Badge code={d.obligation.lifecycle} /> {d.attestation ? <>adopted by {name(d.attestation.actor_id)} on {fmtDate(d.attestation.signed_at)}</> : "not attested"}</>,
+      action: tab("Revisions") },
+    { label: "Controls", about: "The shared controls its satisfaction expression requires.",
+      status: <>{d.controls.length} required · {implemented} implemented{missing > 0 && <> · <Badge code="MISSING" label={`${missing} MISSING`} /></>}</>,
+      action: tab("Expression & controls") },
+    { label: "Evidence", about: "Each control's tests carry their own evidence (open a control); recurring duties also need evidence per occurrence.",
+      status: d.occurrences.length ? <>{d.occurrences.length} occurrence(s) · {fulfilled} fulfilled{missed > 0 && <> · <Badge code="MISSED" label={`${missed} MISSED`} /></>}</> : "No occurrences scheduled",
+      action: tab("Occurrences") },
+    { label: "Assurance", about: "Computed by the backend for a named period from everything above. Never edited by hand.",
+      status: latest ? <><Badge code={latest.state} /> {fmtDate(latest.period_from)} → {fmtDate(latest.period_to)} · <span className="mono text-[11px]">{latest.perspective}</span>
+        {latest.reason_codes?.length > 0 && <span className="mono text-[11px] text-amber-700"> · {latest.reason_codes.join(", ")}</span>}</> : <Badge code="NOT_EVALUATED" label="NOT ASSESSED" />,
+      action: tab("Period assurance") },
+  ];
+  return (
+    <div className="space-y-4">
+      <Card title="From requirement to assurance" subtitle="How this obligation's records connect. Each step depends on the one before it." bodyClassName="">
+        <ol className="divide-y divide-slate-100">
+          {steps.map((s, i) => (
+            <li key={s.label} className="grid gap-1 px-4 py-3 sm:grid-cols-[150px_minmax(0,1fr)_auto] sm:items-start sm:gap-4">
+              <div className="flex items-center gap-2 text-[13px] font-semibold text-slate-900">
+                <span aria-hidden className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-300 text-[10px] text-slate-500">{i + 1}</span>{s.label}
+              </div>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5 text-[13px] text-slate-800">{s.status}</div>
+                <p className="mt-0.5 text-xs text-slate-500">{s.about}</p>
+              </div>
+              <div className="sm:pt-0.5">{s.action}</div>
+            </li>
+          ))}
+        </ol>
+      </Card>
+      {(approved > 0 || openIssues > 0) && (
+        <Notice tone="warn">
+          {approved > 0 && <>{approved} approved exception(s) apply to this obligation. They are shown beside the assurance state and never change it. </>}
+          {openIssues > 0 && <>{openIssues} open issue(s) relate to it: see <A href="/governance">Exceptions &amp; Issues</A>.</>}
+        </Notice>
+      )}
+    </div>
+  );
+}
+
 function Period({ d, lineage, reload }: { d: any; lineage: string; reload: () => void }) {
   const [snapId, setSnapId] = useState<string | null>(d.snapshots[0]?.snapshot_id ?? null);
   const snap = useApi<any>(snapId ? `/snapshots/${snapId}` : null);
@@ -77,8 +143,7 @@ function Period({ d, lineage, reload }: { d: any; lineage: string; reload: () =>
       <Card title="Assess a period" subtitle="Preview is not persisted. Freezing creates an immutable snapshot pinned to a record cutoff, reproducible later.">
         <ErrorBox error={a.error} />
         <div className="flex flex-wrap items-end gap-3">
-          <div><label className="label">Period from</label><input type="date" className="input" value={from} onChange={(e) => setFrom(e.target.value)} /></div>
-          <div><label className="label">Period to (exclusive)</label><input type="date" className="input" value={to} onChange={(e) => setTo(e.target.value)} /></div>
+          <PeriodSelector from={from} to={to} onChange={(f, t) => { setFrom(f); setTo(t); }} />
           <div><label className="label">Record cutoff (blank = now)</label><input type="number" className="input w-36" value={cutoff} onChange={(e) => setCutoff(e.target.value)} /></div>
           <button className="btn-ghost" disabled={a.busy} onClick={() => a.run(async () => { setPreview(await api(`/obligations/${lineage}/preview`, { method: "POST", json: body() })); setSeg(0); })}>Preview</button>
           <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
@@ -182,6 +247,8 @@ function Occurrences({ d, lineage, reload }: { d: any; lineage: string; reload: 
   const [due, setDue] = useState("2027-09-30");
   const [ful, setFul] = useState<any>(null);
   const a = useAction();
+  const { can, why } = useCan();
+  const canAdd = can("manage_controls") || can("manage_facts");
   return (
     <Card title="Occurrences" subtitle="Recurring duties: each due occurrence must be fulfilled with evidence. A missed occurrence is never overwritten by later success.">
       <ErrorBox error={a.error} />
@@ -203,7 +270,7 @@ function Occurrences({ d, lineage, reload }: { d: any; lineage: string; reload: 
       <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-navy-100 pt-4">
         <div><label className="label">Window from</label><input type="date" className="input" value={wf} onChange={(e) => setWf(e.target.value)} /></div>
         <div><label className="label">Due at</label><input type="date" className="input" value={due} onChange={(e) => setDue(e.target.value)} /></div>
-        <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
+        <button className="btn-primary" disabled={a.busy || !canAdd} title={canAdd ? undefined : why("manage_controls")} onClick={() => a.run(async () => {
           await api(`/obligations/${lineage}/occurrences`, { method: "POST", json: { window_from: new Date(wf).toISOString(), due_at: new Date(due).toISOString() } }); reload();
         })}>Add occurrence</button>
       </div>
@@ -241,6 +308,7 @@ function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () =
   const [exc, setExc] = useState({ reason: "", valid_from: "2026-10-01", valid_to: "2026-12-31" });
   const [comp, setComp] = useState({ primary_control_key: d.controls[0]?.control_key ?? "", compensating: "", rationale: "", valid_from: "2026-10-01" });
   const a = useAction();
+  const name = useActorNames();
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <Card title="Exceptions" subtitle="Time-bounded governance treatment, separate from assurance state.">
@@ -248,7 +316,7 @@ function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () =
         <Table head={["Reason", "Validity", "State", "Requested / approved"]} empty={!d.exceptions.length}>
           {d.exceptions.map((x: any) => (
             <tr key={x.exception_id}><td className="td text-sm">{x.reason}</td><td className="td text-xs">{fmtDate(x.valid_from)} → {fmtDate(x.valid_to)}</td>
-              <td className="td"><ExceptionBadge state={x.state} /></td><td className="td text-xs">{x.requested_by} / {x.approved_by ?? "—"}</td></tr>
+              <td className="td"><ExceptionBadge state={x.state} /></td><td className="td text-xs">{name(x.requested_by)} / {x.approved_by ? name(x.approved_by) : "—"}</td></tr>
           ))}
         </Table>
         <div className="mt-4 grid gap-2 border-t border-navy-100 pt-4 sm:grid-cols-2">

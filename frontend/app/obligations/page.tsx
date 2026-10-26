@@ -8,8 +8,8 @@ export default function Obligations() {
   const { data, error } = useApi<any[]>("/obligations");
   return (
     <>
-      <PageHeader spec="ZA-STA-001 · WF-STA-01" title="Obligation dossiers"
-        subtitle="Adopted obligation instances with their latest period assurance snapshot. States are evidential (PROVEN / NOT_PROVEN / FAILING / REQUIRES_REVIEW), never ‘compliant’." />
+      <PageHeader spec="ZA-STA-001 · WF-STA-01" title="Obligation Dossiers"
+        subtitle="An obligation is a requirement your organisation has adopted for one subject after an applicability decision. Open a dossier to see why it applies, the controls and evidence behind it, and its period assurance state. States are evidential (PROVEN / NOT_PROVEN / FAILING / REQUIRES_REVIEW), never ‘compliant’." />
       <ErrorBox error={error} />
       <Card>
         <Table head={["Obligation", "Subject", "Lifecycle", "Valid", "Latest snapshot", "Period", "Exceptions"]} empty={data?.length === 0}>

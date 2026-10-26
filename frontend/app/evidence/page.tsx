@@ -3,23 +3,25 @@
 import { useState } from "react";
 import { API, ApiError, authHeaders, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, Hash, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
 
 export default function Evidence() {
   const { data, error, reload } = useApi<any[]>("/evidence");
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [cond, setCond] = useState("ALL");
+  const { can, why } = useCan();
   const rows = (data || []).filter((e) => (cond === "ALL" || e.condition === cond) && (!q || `${e.title} ${e.source_system ?? ""}`.toLowerCase().includes(q.toLowerCase())));
   return (
     <>
-      <PageHeader spec="ZA-EVD-001 · WF-EVD-01" title="Evidence vault"
-        subtitle="Encrypted, content-addressed evidence on a per-tenant hash-chained ledger. Lifecycle and admissibility are derived from append-only events."
-        actions={<button className="btn-primary" onClick={() => setOpen(true)}>Upload evidence</button>} />
+      <PageHeader spec="ZA-EVD-001 · WF-EVD-01" title="Evidence Records"
+        subtitle="The records that prove your controls operated: test outputs, connector extracts and uploads. Each is encrypted, content-addressed and chained on your organisation's own ledger; only CURRENT evidence can prove a control."
+        actions={<button className="btn-primary" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setOpen(true)}>Upload evidence</button>} />
       <ErrorBox error={error} />
       <Card actions={<>
         <input className="input w-56 py-1 text-xs" placeholder="Search title / source" value={q} onChange={(e) => setQ(e.target.value)} />
-        <select className="input py-1 text-xs" value={cond} onChange={(e) => setCond(e.target.value)}>{["ALL", "CURRENT", "STALE", "INVALID", "ERASED", "CONFLICT"].map((x) => <option key={x}>{x}</option>)}</select>
+        <select aria-label="Filter by condition" className="input w-36 py-1 text-xs" value={cond} onChange={(e) => setCond(e.target.value)}>{["ALL", "CURRENT", "STALE", "INVALID", "ERASED", "CONFLICT"].map((x) => <option key={x}>{x}</option>)}</select>
       </>} title={`${rows.length} artifact(s)`}>
         <Table head={["Title", "Origin / provenance", "Coverage", "Condition", "Lifecycle", "IPE", "Ledger", "Hold"]} empty={rows.length === 0}>
           {rows.map((e) => (

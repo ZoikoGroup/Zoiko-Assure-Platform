@@ -11,7 +11,7 @@ export default function Governance() {
   const [tab, setTab] = useState("Exceptions");
   return (
     <>
-      <PageHeader spec="ZA-STA-001 §§12-15" title="Exceptions, compensation, issues & risk"
+      <PageHeader spec="WF-STA-04 · ZA-STA-001 §§12-15" title="Exceptions & Issues"
         subtitle="Governance treatments are recorded beside assurance state and never rewrite it. Approval needs a distinct, authorised human." />
       <Tabs tabs={["Exceptions", "Compensations", "Issues", "Risk acceptances"]} value={tab} onChange={setTab} />
       {tab === "Exceptions" && <Exceptions />}

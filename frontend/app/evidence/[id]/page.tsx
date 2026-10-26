@@ -4,24 +4,29 @@ import { useParams } from "next/navigation";
 import { useState } from "react";
 import { api, download, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, Hash, Json, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { useActorNames } from "@/lib/people";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, Hash, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
 
 export default function EvidenceRecord() {
   const { id } = useParams<{ id: string }>();
   const { data: e, error, reload } = useApi<any>(`/evidence/${id}`);
   const a = useAction();
   const [act, setAct] = useState<string | null>(null);
+  const { can, why } = useCan();
+  const name = useActorNames();
   return (
     <>
-      <PageHeader spec="WF-EVD-01 Evidence Record & Chain Explorer" title={e?.title ?? "Evidence"} subtitle={e ? `${e.origin_class} · ${e.acquisition_method}` : undefined}
+      <PageHeader kicker="Evidence record" spec="WF-EVD-01 Evidence Record & Chain Explorer" title={e?.title ?? "Evidence"} subtitle={e ? `${e.origin_class} · ${e.acquisition_method}` : undefined}
         actions={e && <>
           <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => { const r = await api(`/evidence/${id}/verify`, { method: "POST" }); reload(); return r; })}>Verify integrity</button>
           {e.payload_available && <button className="btn-ghost" onClick={() => a.run(() => download(`/evidence/${id}/download`, `${e.title}`))}>Download</button>}
           <button className="btn-ghost" onClick={() => setAct("bind")}>Bind</button>
-          <button className="btn-ghost" onClick={() => setAct("supersede")}>Supersede</button>
-          <button className="btn-ghost" onClick={() => setAct("invalidate")}>Invalidate</button>
-          {e.legal_hold ? <button className="btn-ghost" onClick={() => setAct("release-hold")}>Release hold</button> : <button className="btn-ghost" onClick={() => setAct("hold")}>Legal hold</button>}
-          {e.payload_available && <button className="btn-danger" onClick={() => setAct("erase")}>Erase payload</button>}
+          <button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setAct("supersede")}>Supersede</button>
+          <button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setAct("invalidate")}>Invalidate</button>
+          {e.legal_hold ? <button className="btn-ghost" disabled={!can("attest")} title={why("attest")} onClick={() => setAct("release-hold")}>Release hold</button>
+            : <button className="btn-ghost" disabled={!can("attest")} title={why("attest")} onClick={() => setAct("hold")}>Legal hold</button>}
+          {e.payload_available && <button className="btn-danger" disabled={!can("attest")} title={why("attest")} onClick={() => setAct("erase")}>Erase payload</button>}
         </>} />
       <ErrorBox error={error || a.error} />
       {a.result?.checks && (
@@ -52,7 +57,7 @@ export default function EvidenceRecord() {
                 {e.history.map((h: any) => (
                   <tr key={h.event_id}>
                     <td className="td mono text-xs">#{h.ledger_seq}</td><td className="td"><Badge code={h.event_type} tone="info" /></td>
-                    <td className="td text-xs">{h.actor_id}</td><td className="td text-xs">{h.reason ?? "—"}</td>
+                    <td className="td text-xs">{name(h.actor_id)}</td><td className="td text-xs">{h.reason ?? "—"}</td>
                     <td className="td"><Hash value={h.event_hash} n={10} /></td><td className="td"><Hash value={h.previous_event_hash} n={10} /></td>
                     <td className="td text-xs">{fmtDate(h.recorded_at, true)}</td>
                   </tr>

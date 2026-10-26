@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, Json, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, Json, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
 
 const LEVELS = [["A0", "Observe"], ["A1", "Recommend"], ["A2", "Prepare"], ["A3", "Execute (reversible)"]];
 
@@ -14,7 +14,7 @@ export default function AI() {
   const [ver, setVer] = useState<any>(null);
   return (
     <>
-      <PageHeader spec="ZA-ARCH-001 §12 · FR-AI-001..006" title="AI & agent assets"
+      <PageHeader spec="WF-DOM-07 · ZA-ARCH-001 §12 · FR-AI-001..006" title="AI/Agent Asset Dossiers"
         subtitle="AI asset registry with AgBOM, the obligations that apply to each asset, scoped authority grants and a deterministic policy decision point. No model call sits on the decision path."
         actions={<button className="btn-primary" onClick={() => setReg(true)}>Register asset</button>} />
       <ErrorBox error={error} />
@@ -46,7 +46,7 @@ export default function AI() {
                     ))}
                   </Table>
                 </div>
-                <PDP asset={s} onDone={reload} />
+                <PolicyBundle asset={s} />
               </div>
               {s.receipts.length > 0 && (
                 <details className="mt-4"><summary className="cursor-pointer text-sm font-medium text-navy-700">Decision receipts ({s.receipts.length})</summary>
@@ -74,25 +74,13 @@ function RevokeBtn({ id, onDone }: { id: string; onDone: () => void }) {
   return <button className="btn-ghost text-xs" title={a.error ? String(a.error) : ""} disabled={a.busy} onClick={() => a.run(async () => { await api(`/ai/grants/${id}/revoke`, { method: "POST" }); onDone(); })}>Revoke</button>;
 }
 
-function PDP({ asset, onDone }: { asset: any; onDone: () => void }) {
-  const [req, setReq] = useState({ action_class: asset.grants[0]?.action_class ?? "invoice.approve", scope: asset.grants[0]?.scope ?? "", requested_authority: "A2" });
-  const a = useAction();
+function PolicyBundle({ asset }: { asset: any }) {
   const b = useAction();
   return (
     <div>
-      <div className="label">Policy decision point (test)</div>
-      <ErrorBox error={a.error || b.error} />
-      <div className="grid gap-2">
-        <input className="input py-1 text-xs" placeholder="action class" value={req.action_class} onChange={(e) => setReq({ ...req, action_class: e.target.value })} />
-        <input className="input py-1 text-xs" placeholder="scope" value={req.scope} onChange={(e) => setReq({ ...req, scope: e.target.value })} />
-        <select className="input py-1 text-xs" value={req.requested_authority} onChange={(e) => setReq({ ...req, requested_authority: e.target.value })}>{LEVELS.map(([l, n]) => <option key={l} value={l}>{l} · {n}</option>)}</select>
-        <div className="flex gap-2">
-          <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => { const r = await api("/ai/decisions", { method: "POST", json: { agent_subject_id: asset.subject_id, ...req } }); onDone(); return r; })}>Decide</button>
-          <button className="btn-ghost" disabled={b.busy} onClick={() => b.run(() => api(`/ai/policy-bundle/${asset.subject_id}`))}>Signed policy bundle</button>
-        </div>
-      </div>
-      {a.result && <div className="mt-2 rounded border border-navy-100 p-2 text-xs"><Badge code={a.result.decision} /> <span className="ml-1">{a.result.rationale}</span>
-        {a.result.obligation_refs?.length > 0 && <div className="mt-1 text-slate-500">Obligation context: {a.result.obligation_refs.length} adopted obligation(s)</div>}</div>}
+      <div className="label">Signed policy bundle</div>
+      <ErrorBox error={b.error} />
+      <button className="btn-ghost" disabled={b.busy} onClick={() => b.run(() => api(`/ai/policy-bundle/${asset.subject_id}`))}>Signed policy bundle</button>
       {b.result && <div className="mt-2"><p className="mb-1 text-[11px] text-slate-500">Valid for 15 minutes, so an Assure outage never becomes an uncontrolled fail-open.</p><Json value={b.result} max={200} /></div>}
     </div>
   );

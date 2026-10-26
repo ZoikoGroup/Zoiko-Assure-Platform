@@ -16,7 +16,7 @@ export default function History() {
   const odsForSubject = (ods || []).filter((o) => !f.subject_id || o.subject_type === subs?.find((s) => s.subject_id === f.subject_id)?.subject_type);
   return (
     <>
-      <PageHeader spec="ZA-TIM-001 §12 · WF-TIM-02" title="Historical reconstruction"
+      <PageHeader spec="ZA-TIM-001 §12 · WF-TIM-02" title="Historical Reconstruction"
         subtitle="Pin the valid time and compare two record cutoffs: what Assure knew then (AS_KNOWN_THEN) against what it knows now (RECONSTRUCTED_NOW). Differences are classified, not blended." />
       <Card title="Comparison coordinates">
         <ErrorBox error={a.error} />
