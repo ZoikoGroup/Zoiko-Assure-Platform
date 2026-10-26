@@ -10,7 +10,7 @@ export default function Ledger() {
   const c = useAction();
   return (
     <>
-      <PageHeader spec="ZA-EVD-001 §§8-10 · WF-EVD-03" title="Ledger & checkpoints"
+      <PageHeader spec="ZA-EVD-001 §§8-10 · WF-EVD-03" title="Ledger"
         subtitle="A per-tenant SHA-256 hash chain, anchored by cell-level Merkle checkpoints signed with Ed25519. RFC 3161 timestamping is reported honestly as pending when no TSA is configured."
         actions={<>
           <button className="btn-primary" disabled={v.busy} onClick={() => v.run(async () => { const r = await api("/ledger/verify", { method: "POST" }); reload(); return r; })}>Verify chain</button>

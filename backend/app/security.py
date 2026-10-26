@@ -16,7 +16,7 @@ from fastapi import Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from .db import get_db, set_system_scope, set_tenant_scope
-from .models import Actor
+from .models import Actor, AuthCredential
 
 # Role catalogue -> permitted actions (separation of duties; role names are not authority by themselves)
 ROLE_PERMISSIONS: dict[str, set[str]] = {
@@ -27,6 +27,9 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
     "INTERNAL_AUDIT": {"read", "package", "verify"},
     "AI_GOVERNANCE_LEAD": {"read", "manage_ai", "manage_facts", "request_evaluation", "grant_authority"},
     "PLATFORM_ADMIN": {"read", "manage_connectors", "manage_tenant", "checkpoint"},
+    # Organisation Admin = ZA-IAM-001 §08 role template TENANT_OWNER: organisation administration within its own tenant;
+    # no attest/approve rights, so it cannot bypass SoD or attest legal determinations.
+    "TENANT_OWNER": {"read", "manage_tenant"},
     "RISK_APPROVER": {"read", "approve_exception", "approve_compensation"},
     "EXTERNAL_AUDITOR": {"read", "verify"},
     # Zoiko content operations (tenant_id NULL): no standing customer-evidence access (INV-14)
@@ -34,6 +37,10 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
     "ENCODING_ENGINEER": {"content_author", "content_peer_review"},
     "CONTENT_LEGAL_REVIEWER": {"content_legal_review"},
     "CONTENT_RELEASE_MANAGER": {"content_release"},
+    # Zoiko platform Super Admin (tenant_id NULL): the customer-organisation registry only. No tenant-data permission,
+    # so evidence/facts/assurance stay out of reach (INV-14, IAM-REQ-030). Created only by the one-time .env bootstrap
+    # (app/accounts.py); no API grants it (WF-IAM-01: no "make super admin" button).
+    "SUPER_ADMIN": {"manage_organisations"},
     "SERVICE": {"read", "submit_evidence", "request_evaluation", "manage_facts", "checkpoint"},
 }
 
@@ -78,10 +85,10 @@ DEV_HEADER = os.environ.get("ZA_DEV_IDENTITY_HEADER", "0") == "1"
 
 def get_ctx(authorization: str | None = Header(default=None), x_actor_id: str | None = Header(default=None),
             db: Session = Depends(get_db)) -> Ctx:
-    from .auth import bearer, resolve_token
+    from .auth import bearer, resolve_token, tenant_active
     tok = bearer(authorization)
     if tok:
-        actor, _ = resolve_token(db, tok)
+        actor, _ = resolve_token(db, tok)  # also refuses sessions of a suspended organisation
     elif x_actor_id and DEV_HEADER:
         actor = db.get(Actor, x_actor_id)
         if actor is None:
@@ -89,6 +96,13 @@ def get_ctx(authorization: str | None = Header(default=None), x_actor_id: str | 
     else:
         raise HTTPException(401, "Sign in required")
     set_tenant_scope(db, actor.tenant_id)  # PostgreSQL RLS: this request sees only its tenant's rows
+    if not tenant_active(db, actor):
+        raise HTTPException(403, "This organisation is suspended; access is disabled.")
+    if tok:
+        cred = db.get(AuthCredential, actor.actor_id)
+        if cred is not None and cred.must_change:
+            raise HTTPException(403, {"error": "PASSWORD_CHANGE_REQUIRED",
+                                      "message": "Change your temporary password before continuing."})
     return Ctx(db=db, actor=actor)
 
 
@@ -96,8 +110,9 @@ def get_ctx(authorization: str | None = Header(default=None), x_actor_id: str | 
 def system_scope(db: Session, reason: str):
     """Documented cell-wide platform job (bypasses tenant RLS for the enclosed work only).
 
-    Allowed uses: rule-release impact re-evaluation, shadow impact (aggregate output only) and
-    cell ledger checkpoints. Never wrap request handlers that return tenant data to a caller.
+    Allowed uses: rule-release impact re-evaluation, shadow impact (aggregate output only),
+    cell ledger checkpoints, and the Super Admin organisation-registry read (org_tenant / org_legal_entity
+    metadata only, app/routers/platform.py). Never wrap request handlers that return tenant data to a caller.
     """
     set_system_scope(db, True)
     try:

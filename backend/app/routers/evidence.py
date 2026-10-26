@@ -5,6 +5,7 @@ import importlib.util
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -326,10 +327,31 @@ def verify_stored_package(package_id: str, ctx: Ctx = Depends(get_ctx)):
     return _load_verifier().verify((evd.PACKAGE_DIR / p.file_ref).read_bytes(), keys.public_key_pem().encode())
 
 
+MULTIPART_OVERHEAD = 64 * 1024  # boundaries and part headers around the uploaded file
+
+
+def verify_upload_body_limit() -> int:
+    """Request-body limit for verify-upload (app.limits.BodyLimit): the verifier's archive limit plus form overhead."""
+    return _load_verifier().limits()["archive"] + MULTIPART_OVERHEAD
+
+
 @router.post("/packages/verify-upload")
 async def verify_upload(file: UploadFile = File(...)):
-    """Same logic as the standalone open-source verifier; needs no login or tenant secret."""
-    return _load_verifier().verify(await file.read(), keys.public_key_pem().encode())
+    """Public on purpose: ZA-EVD-001 §18 lets auditors and regulators validate a package without logging into Assure.
+    It runs the same logic as the standalone verifier and touches no tenant data. The request body is capped while it
+    streams in (app.limits), the file is read here in bounded chunks, and the verifier bounds decompression."""
+    verifier = _load_verifier()
+    cap = verifier.limits()["archive"]
+    data = bytearray()
+    try:
+        while chunk := await file.read(64 * 1024):
+            data += chunk
+            if len(data) > cap:
+                raise HTTPException(413, f"Package exceeds the {cap} byte limit")
+    finally:
+        await file.close()
+    # Hashing and decompression are CPU-bound: run them off the event loop so one upload cannot stall the API.
+    return await run_in_threadpool(verifier.verify, bytes(data), keys.public_key_pem().encode())
 
 
 @router.get("/trust/public-key")

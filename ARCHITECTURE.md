@@ -1,5 +1,9 @@
 # Zoiko Assure: architecture guide
 
+> **Non-normative.** This is an onboarding guide, not a specification. The controlled ZA-* documents are authoritative;
+> where this guide differs from them, the ZA-* documents win. Current work is tracked in
+> [frontend/frontend-build-plan.md](frontend/frontend-build-plan.md) and [backend/backend-build-plan.md](backend/backend-build-plan.md).
+
 This guide is for engineers joining the project. Read it before your first change. It explains what the
 system does, how the code is organised, how a request travels through it, and which rules you must not break.
 Setup commands are in [README.md](README.md). The detailed behaviour is specified in the ZA-* engineering
@@ -32,7 +36,7 @@ can be traced back to its rule, facts, evidence and record cutoff.
                      │    human verification)   vectors, review)          │                         │
                      │                                                     ▼                         │
   Customer users ────┼─► Next.js UI ──HTTPS──► FastAPI ──► Applicability ─► Obligations ─► Assurance │
-  (CCO, GC, control  │   (port 3100)           (port 8100)  (facts + rules)  (adopted)     (periods)  │
+  (CCO, GC, control  │   (port 5173)           (port 8000)  (facts + rules)  (adopted)     (periods)  │
   owners, auditors)  │                              │                                        ▲       │
                      │                              ▼                                        │       │
   Customer systems ──┼─► Connectors / source runs ─► IPE checks ─► Evidence vault + ledger ──┘       │
@@ -53,11 +57,11 @@ can be traced back to its rule, facts, evidence and record cutoff.
 |---|---|---|
 | Frontend | Next.js 15 (App Router), React 19, TypeScript, Tailwind CSS v4, lucide-react icons | All pages are client components that call the API. Charts are hand-written SVG |
 | Backend | Python 3.12+ (dev uses 3.14), FastAPI, SQLAlchemy 2.0, Pydantic 2 | A **modular monolith**: one deployable, with strict internal module boundaries |
-| Database | PostgreSQL 17 in Docker (`zoiko-assure-pg`, port 5433), with **row-level security** | SQLite fallback when `backend/.env` is absent (tests use it by default) |
+| Database | PostgreSQL 17 on `127.0.0.1:5433` (local Windows service or Docker), with **row-level security** | The only runtime database: no SQLite fallback. Tests use a throwaway SQLite only when they opt in (`ZA_ALLOW_SQLITE`) |
 | Crypto | `cryptography`: AES-256-GCM envelope encryption, HKDF, HMAC-SHA256, Ed25519; stdlib scrypt | Dev keys live in `backend/var/keys/` (stand-in for a cloud KMS/HSM) |
-| Tests | pytest + FastAPI TestClient | 44 tests on PostgreSQL (39 + 5 RLS proofs), 39 on SQLite |
+| Tests | pytest + FastAPI TestClient | 58 tests on PostgreSQL (incl. RLS proofs and bootstrap tests); 50 on SQLite, where the 8 PostgreSQL-only tests skip |
 
-Ports: UI **3100**, API **8100**, Postgres **5433**. Other apps on this machine use 3000, 8000 and 5432.
+Ports: UI **5173**, API **8000**, Postgres **5433**.
 
 ---
 
@@ -71,7 +75,7 @@ zoiko-Assure/
 │   ├── .env                     DB connection strings (git-ignored; template: .env.example)
 │   ├── requirements.txt
 │   ├── app/
-│   │   ├── main.py              FastAPI app, start-up (bootstrap + seed), router registration, CORS
+│   │   ├── main.py              FastAPI app, start-up (bootstrap; demo seed only in demo mode), routers, CORS
 │   │   ├── db.py                engines (runtime + admin), sessions, .env loading, RLS scope stamping
 │   │   ├── pg_bootstrap.py      start-up: create runtime role, tables, apply db/postgres_rls.sql
 │   │   ├── models.py            ALL tables (63), grouped by bounded context (see §7)
@@ -79,7 +83,7 @@ zoiko-Assure/
 │   │   ├── platform.py          record sequence/watermark, canonical JSON + hashing, outbox emit, audit
 │   │   ├── security.py          roles → permissions, Ctx (request context), get_ctx, system_scope
 │   │   ├── auth.py              sign-in / sign-out / sessions / password change / demo accounts
-│   │   ├── seed.py              "Customer Zero" demo data (runs once, on an empty database)
+│   │   ├── seed.py              "Customer Zero" demo fixture (demo mode only, empty database)
 │   │   ├── engines/             PURE DOMAIN LOGIC (no HTTP)
 │   │   │   ├── rules.py         rule AST validation, decision-table compilation, 3-valued evaluator, golden vectors
 │   │   │   ├── facts.py         bitemporal fact store: assert / correct / resolve at (valid time, record seq)
@@ -157,8 +161,8 @@ Key points:
   valid 8 hours. Logout sets `revoked_at`, so the token dies immediately.
 - **Lockout:** 5 failures locks the account for 15 minutes. Errors never reveal whether an email exists.
 - Only `HUMAN` and `EXTERNAL_AUDITOR` actors can sign in. **Agents and services can never log in.**
-- `ZA_DEMO_MODE=1` (the default) gives seeded people the shared demo password and lists them on the login page.
-  Turn it off outside demos.
+- Demo mode is **off by default**. `ZA_DEMO_MODE=1` seeds the Customer Zero fixture into an empty database and, only if a
+  local `ZA_DEMO_PASSWORD` is set, gives seeded people that password. No password is built in or shown on the login page.
 - `ZA_DEV_IDENTITY_HEADER=1` re-enables the `X-Actor-Id` impersonation header. It's **off by default** and used only by tests.
 
 ### 6.2 Authorisation (`app/security.py`)
@@ -305,23 +309,25 @@ app/layout.tsx
 
 ## 12. Running, testing, debugging
 
-```bash
-docker start zoiko-assure-pg                                            # database (port 5433)
-cd backend  && .venv/Scripts/python -m uvicorn app.main:app --port 8100 --reload
-cd frontend && npm run dev                                              # http://localhost:3100
+```powershell
+& "C:\Program Files\PostgreSQL\17\bin\pg_isready.exe" -h 127.0.0.1 -p 5433       # database (port 5433) must be up first
+Set-Location backend;  .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+Set-Location frontend; npm run dev                                              # second terminal: http://localhost:5173
 ```
 
-Sign in as `actor-cco@zoiko.example` / `Assure@2026!` (all demo accounts are listed in the README).
+The backend logs `Database: PostgreSQL ... at 127.0.0.1:5433/assure` at start-up and refuses to start without a reachable
+PostgreSQL (see README §"Run locally").
 
 | Task | Command |
 |---|---|
-| Unit + API tests (SQLite, never touches your DB) | `cd backend && .venv/Scripts/python -m pytest -q` |
-| Same on PostgreSQL + RLS proofs | see README §"Tests on PostgreSQL" (uses a throwaway `assure_test` DB) |
+| Unit + API tests (throwaway SQLite, never touches your DB) | `cd backend && .venv/Scripts/python -m pytest -q` |
+| Same on PostgreSQL + RLS proofs | README §"Tests" (needs an empty `assure_test` DB) |
 | Frontend type-check / build | `cd frontend && npx tsc --noEmit && npm run build` |
-| SQL shell | `docker exec -it zoiko-assure-pg psql -U assure -d assure` |
-| API explorer | http://localhost:8100/docs |
+| SQL shell | `psql -h 127.0.0.1 -p 5433 -U assure -d assure` (prompts for the owner password) |
+| Back up the database | README §"Importing the old SQLite demo database" (`pg_dump` command) |
+| Import the old SQLite demo DB | `tools/migrate_sqlite_to_postgres.py` (dry run by default, `--apply` to commit) |
+| API explorer | http://localhost:8000/docs |
 | Event and audit trail | UI → Administration → Outbox events / Audit trail |
-| Reset demo data | README §"Database" (drop and recreate the `assure` DB, restart the API) |
 
 ---
 

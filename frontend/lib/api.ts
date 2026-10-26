@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useActor } from "./actor";
 
-export const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8100/api";
+export const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
 export class ApiError extends Error {
   status: number;
@@ -33,6 +33,14 @@ function unauthorized(status: number) {
   if (status === 401 && typeof window !== "undefined") window.dispatchEvent(new Event("za-unauthorized"));
 }
 
+type Raw = { ok: boolean; status: number; text: string };
+
+/* Identical plain GETs that are already in flight share one network request: React StrictMode mounts every page twice
+   in development, and the header and a page can ask for the same resource at the same moment. The key includes the
+   session token, so nothing is shared across identities, and an entry lives only until its request settles, so no
+   response is ever reused later (no caching, no stale data). Each caller still parses its own copy. */
+const inFlight = new Map<string, Promise<Raw>>();
+
 export async function api<T = any>(path: string, opts: RequestInit & { json?: unknown } = {}): Promise<T> {
   const headers: Record<string, string> = { ...authHeaders(), ...(opts.headers as Record<string, string>) };
   let body = opts.body;
@@ -40,8 +48,19 @@ export async function api<T = any>(path: string, opts: RequestInit & { json?: un
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(opts.json);
   }
-  const res = await fetch(`${API}${path}`, { ...opts, headers, body, cache: "no-store" });
-  const text = await res.text();
+  const plainGet = opts.method === undefined && opts.body === undefined && opts.json === undefined && opts.headers === undefined && !opts.signal;
+  const key = plainGet ? `${getToken() ?? ""} ${path}` : null;
+  let pending = key ? inFlight.get(key) : undefined;
+  if (!pending) {
+    pending = fetch(`${API}${path}`, { ...opts, headers, body, cache: "no-store" })
+      .then(async (res): Promise<Raw> => ({ ok: res.ok, status: res.status, text: await res.text() }));
+    if (key) {
+      inFlight.set(key, pending);
+      pending.finally(() => inFlight.delete(key)).catch(() => {});
+    }
+  }
+  const res = await pending;
+  const text = res.text;
   let data: any = null;
   try {
     data = text ? JSON.parse(text) : null;

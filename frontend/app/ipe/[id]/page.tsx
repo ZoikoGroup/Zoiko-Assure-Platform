@@ -46,15 +46,15 @@ export default function SourceRunPage() {
               <div className="flex flex-wrap items-center gap-3 text-center">
                 {[["Intended source population", eq.intended_source_population], ["−", null], ["Extracted unique", eq.extracted_unique_population], ["−", null],
                   ["Governed exclusions", eq.governed_exclusions], ["=", null], ["Unresolved gap", eq.unresolved_gap_population]].map(([l, v], i) =>
-                  v === null && typeof l === "string" && l.length === 1 ? <span key={i} className="text-2xl text-slate-400">{l}</span> : (
+                  v === null && typeof l === "string" && l.length === 1 ? <span key={i} className="text-lg text-slate-400">{l}</span> : (
                     <div key={i} className={`rounded-lg px-4 py-2 ring-1 ${l === "Unresolved gap" ? (v === 0 ? "bg-emerald-50 ring-emerald-200" : "bg-red-50 ring-red-200") : "bg-navy-50 ring-navy-100"}`}>
-                      <div className="text-2xl font-bold text-navy-800">{v ?? "?"}</div><div className="text-[11px] text-slate-600">{l}</div>
+                      <div className="text-lg font-semibold text-slate-900">{v ?? "?"}</div><div className="text-[11px] text-slate-600">{l}</div>
                     </div>
                   ))}
               </div>
               {pm && (
                 <div className="mt-4">
-                  <KV cols={4} items={[["Raw extracted", pm.extracted_raw_count], ["Duplicates", pm.duplicate_count], ["Rejected", pm.rejected_count], ["Terminal state", <Badge key="t" code={pm.terminal_state} />],
+                  <KV cols={4} items={[["Raw extracted", pm.extracted_raw_count], ["Duplicates", pm.duplicate_count], ["Rejected", pm.rejected_count], ["Terminal state", <TerminalState key="t" state={pm.terminal_state} />],
                     ["Population definition", pm.population_definition], ["Digest algorithm", <span key="da" className="mono text-xs">{pm.digest_algorithm}</span>]]} />
                 </div>
               )}
@@ -110,5 +110,19 @@ export default function SourceRunPage() {
         </div>
       )}
     </>
+  );
+}
+
+/* Population manifest terminal state: { terminal_reached, cursor_loop, last_cursor } (engines/ipe.py). */
+function TerminalState({ state }: { state: any }) {
+  if (!state || typeof state !== "object") return <Badge code={typeof state === "string" ? state : null} />;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {state.terminal_reached
+        ? <Badge tone="good" label="TERMINAL REACHED" />
+        : <Badge tone="bad" code="IPE_CURSOR_INCOMPLETE" label="TERMINAL NOT REACHED" />}
+      {state.cursor_loop ? <Badge tone="bad" label="CURSOR LOOP" /> : <Badge tone="neutral" label="NO CURSOR LOOP" />}
+      <span className="mono text-[11px] text-slate-500">last cursor {state.last_cursor ?? "—"}</span>
+    </div>
   );
 }

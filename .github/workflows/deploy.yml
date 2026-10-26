@@ -1,0 +1,129 @@
+# Zoiko Assure CD. Documented in docs/ci-cd.md.
+#
+#   push to main -> CI succeeds -> verify-ci -> build-release -> staging (deploy + verify)
+#                -> production (manual approval on the `production` environment) -> deploy + verify
+#
+# CURRENT STATE: fails closed. No deployment target is defined in this repository ("DEPLOYMENT TARGET REQUIRED") and
+# there is no versioned migration system yet ("BLOCKED — VERSIONED MIGRATION SYSTEM REQUIRED"), so the environment
+# jobs stop at their first deployment step and nothing is deployed. See .github/workflows/deploy-environment.yml.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One release line: never two deployments at once, and an in-flight deployment is never cancelled midway.
+  group: deploy-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify-ci:
+    name: verify-ci
+    # Release only a commit whose CI run succeeded for a push to main of this repository: never a pull request
+    # (including a fork branch that happens to be called main), a manual CI run, or any other branch.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.ci.outputs.sha }}
+      ci_run_id: ${{ steps.ci.outputs.ci_run_id }}
+    steps:
+      - name: Record the CI-verified commit
+        id: ci
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::unexpected commit id"; exit 1; }
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::unexpected CI run id"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "ci_run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release candidate"
+            echo "- commit: \`$SHA\`"
+            echo "- CI run: $RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-release:
+    name: build-release
+    needs: verify-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read  # download the dependency lock produced by the CI run being released
+    env:
+      SHA: ${{ needs.verify-ci.outputs.sha }}
+      CI_RUN_ID: ${{ needs.verify-ci.outputs.ci_run_id }}
+    steps:
+      - name: Check out the CI-verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify-ci.outputs.sha }}
+          persist-credentials: false
+
+      - name: Fetch the dependency set CI tested
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: backend-requirements-lock
+          run-id: ${{ needs.verify-ci.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/lock
+
+      - name: Assemble immutable release bundle
+        run: |
+          out="$RUNNER_TEMP/release"
+          mkdir -p "$out"
+          # git archive ships tracked files only, so .env files, backend/var/, databases, keys and local state can
+          # never enter the bundle (the CI security job also rejects them if they are ever committed).
+          git archive --format=tar.gz --output "$out/backend-src.tar.gz" "$SHA" backend
+          cp "$RUNNER_TEMP/lock/backend-requirements.lock.txt" "$out/"
+          (cd "$out" && sha256sum backend-src.tar.gz backend-requirements.lock.txt > SHA256SUMS)
+          jq -n --arg sha "$SHA" --arg ci "$CI_RUN_ID" \
+                --arg run "$GITHUB_RUN_ID" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '{commit: $sha, ci_run_id: $ci, deploy_run_id: $run, created_at: $at,
+                  frontend: "built per environment from this commit (NEXT_PUBLIC_API_URL is compiled in)"}' \
+                > "$out/release.json"
+          cat "$out/release.json" "$out/SHA256SUMS"
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ needs.verify-ci.outputs.sha }}
+          path: ${{ runner.temp }}/release/
+          retention-days: 30
+          if-no-files-found: error
+
+  staging:
+    name: staging
+    needs: [verify-ci, build-release]
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: staging
+      sha: ${{ needs.verify-ci.outputs.sha }}
+    # No `secrets: inherit`: the called job reads only the secrets of the environment it deploys to.
+
+  production:
+    name: production
+    # Runs only after staging deployed and verified. The `production` environment's required reviewers provide
+    # the manual approval before this job starts (configured in repository settings, see docs/ci-cd.md).
+    needs: [verify-ci, staging]
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: production
+      sha: ${{ needs.verify-ci.outputs.sha }}

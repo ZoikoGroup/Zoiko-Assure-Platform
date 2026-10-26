@@ -2,16 +2,31 @@
 
 import { useState } from "react";
 import { api, useApi } from "@/lib/api";
+import { useAuth } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, KV, Modal, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
 
 export default function Connectors() {
+  const [tab, setTab] = useState("Connector registry");
+  // The outbox holds tenant events; content/platform staff have no standing tenant access (INV-14).
+  const tenantUser = !!useAuth().me?.tenant_id;
+  return (
+    <>
+      <PageHeader spec="FR-CON-001..004 · INV-11 · WF-EVT-03" title="Connectors"
+        subtitle="Inbound source connectors and their certification, and the outbound event outbox. Customer-visible connector status is read only from the certification registry." />
+      {tenantUser && <Tabs tabs={["Connector registry", "Event outbox"]} value={tab} onChange={setTab} />}
+      {(tab === "Connector registry" || !tenantUser) && <Registry />}
+      {tab === "Event outbox" && tenantUser && <Outbox />}
+    </>
+  );
+}
+
+function Registry() {
   const { data, error, reload } = useApi<any[]>("/connectors");
   const [cert, setCert] = useState<any>(null);
   return (
     <>
-      <PageHeader spec="FR-CON-001..004 · INV-11" title="Connector registry"
-        subtitle="Customer-visible status is read only from the certification registry. Release availability, certification and runtime health are separate dimensions." />
+      <p className="mb-3 text-[13px] text-slate-500">Release availability, certification and runtime health are separate dimensions.</p>
       <ErrorBox error={error} />
       <div className="space-y-4">
         {data?.map((c) => (
@@ -70,5 +85,25 @@ function CertModal({ c, onClose, onDone }: { c: any; onClose: () => void; onDone
         await api(`/connectors/${c.connector_id}/certification`, { method: "POST", json: { certification: state, runtime_health: health, reason } }); onDone();
       })}>Record transition</button></div>
     </Modal>
+  );
+}
+
+function Outbox() {
+  const { data, error } = useApi<any[]>("/outbox?limit=150");
+  return (
+    <Card subtitle="Domain events are written in the same transaction as the state change (transactional outbox).">
+      <ErrorBox error={error} />
+      <Table head={["Seq", "Event", "Aggregate", "Schema / dictionary", "Payload", "Available"]}>
+        {data?.map((e) => (
+          <tr key={e.event_id} className="align-top">
+            <td className="td mono text-xs">#{e.record_seq}</td><td className="td mono text-xs font-semibold">{e.event_type}</td>
+            <td className="td text-xs">{e.aggregate_type}<div className="mono text-[10px] text-slate-500">{e.aggregate_id?.slice(0, 13)}</div></td>
+            <td className="td mono text-[10px]">{e.schema_version} / {e.dictionary_version}</td>
+            <td className="td max-w-md"><pre className="mono whitespace-pre-wrap break-all text-[10px] text-slate-600">{JSON.stringify(e.payload)}</pre></td>
+            <td className="td text-xs">{fmtDate(e.available_at, true)}</td>
+          </tr>
+        ))}
+      </Table>
+    </Card>
   );
 }

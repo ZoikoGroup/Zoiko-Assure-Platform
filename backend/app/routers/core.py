@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 from .. import codes
 from ..db import CELL_ID, get_db
 from ..models import (Actor, AuditEvent, Cell, LegalEntity, OutboxEvent, Subject, Tenant)
-from ..platform import current_watermark, emit, next_record_seq, to_dict
+from ..platform import current_watermark, emit, to_dict
 from ..security import Ctx, get_ctx
 
 router = APIRouter()
@@ -106,19 +106,20 @@ def create_subject(body: SubjectIn, ctx: Ctx = Depends(get_ctx)):
 
 
 class EntityIn(BaseModel):
+    # Clients never choose the authoritative cell (TEN-REQ-005, API-REQ-009): a home_cell_id field is rejected.
+    model_config = ConfigDict(extra="forbid")
     legal_name: str
     country: str
     registration_ref: str | None = None
-    home_cell_id: str = CELL_ID
 
 
 @router.post("/org/entities")
 def create_entity(body: EntityIn, ctx: Ctx = Depends(get_ctx)):
     ctx.require("manage_tenant")
-    if not ctx.db.get(Cell, body.home_cell_id):
-        raise HTTPException(422, "Unknown home cell")
+    if not ctx.db.get(Cell, CELL_ID):  # the server's own cell must be provisioned before entities are placed in it
+        raise HTTPException(409, "This cell is not provisioned")
     e = LegalEntity(tenant_id=ctx.tenant, legal_name=body.legal_name, country=body.country,
-                    registration_ref=body.registration_ref, home_cell_id=body.home_cell_id)
+                    registration_ref=body.registration_ref, home_cell_id=CELL_ID)
     ctx.db.add(e)
     ctx.db.flush()
     s = Subject(tenant_id=ctx.tenant, entity_id=e.entity_id, subject_type="LEGAL_ENTITY", display_name=body.legal_name)

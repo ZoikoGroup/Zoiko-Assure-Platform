@@ -12,7 +12,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .. import codes
-from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, ControlDefinition,
+from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation,
                       FactDefinition, FactRequest, Issue, ObligationDefinition, ObligationInstance, RuleVersion,
                       SatisfactionExpressionVersion, SetVersion, Subject, new_id)
 from ..platform import audit, digest, emit, ensure_utc, next_record_seq
@@ -367,7 +367,6 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
 
 def shadow_impact(db: Session, *, odef: ObligationDefinition, candidate_ast: dict, candidate_required: list) -> dict:
     """Shadow evaluation of a candidate rule; returns aggregate buckets only (APP-REQ-014)."""
-    from ..models import Tenant
     fact_defs = load_fact_defs(db)
     sets = load_sets(db)
     fdm = {fd.key: fd for fd in db.execute(select(FactDefinition)).scalars()}

@@ -1,0 +1,109 @@
+import type { LucideIcon } from "lucide-react";
+import type { Persona } from "@/lib/actor";
+import {
+  Archive, Bot, Braces, Building2, CalendarRange, ClipboardCheck, Database, FlaskConical, Flag, GitBranch, Globe2,
+  HelpCircle, History, Inbox, KeyRound, LayoutDashboard, Library, Link2, Lock, Package, PackageCheck, PlayCircle, Plug,
+  Scale, ShieldAlert, SlidersHorizontal, Users,
+} from "lucide-react";
+
+/** One navigation model for the sidebar, breadcrumbs and "Jump to" search.
+ *  `for`: who can use the screen (default: tenant users only). Zoiko content staff and the platform Super Admin have no
+ *  standing tenant-data access (INV-14, IAM-REQ-030), so tenant screens are not offered to them. The backend enforces
+ *  every permission and tenant boundary either way; this only avoids showing screens that would be refused. */
+export type NavItem = { href: string; label: string; icon: LucideIcon; for?: Persona[] };
+const ALL: Persona[] = ["tenant", "content", "platform"];
+const CONTENT: Persona[] = ["tenant", "content"];
+export type NavGroup = { group: string; items: NavItem[] };
+
+export const NAV: NavGroup[] = [
+  { group: "Overview", items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard, for: ALL }] },
+  { group: "Regulatory Content", items: [
+    { href: "/regulatory", label: "Regulatory Inbox", icon: Inbox, for: CONTENT },
+    { href: "/sources", label: "Sources & Provisions", icon: Library, for: CONTENT },
+    { href: "/rules", label: "Rule Authoring", icon: Braces, for: CONTENT },
+    { href: "/rules/workbench", label: "Rule Test Workbench", icon: FlaskConical, for: CONTENT },
+  ] },
+  { group: "Applicability", items: [
+    { href: "/entities", label: "Entities & Facts", icon: Building2 },
+    { href: "/applicability", label: "Applicability Review", icon: Scale },
+    { href: "/fact-requests", label: "Fact Requests", icon: HelpCircle },
+    { href: "/applicability/trace", label: "Applicability Trace", icon: GitBranch },
+  ] },
+  { group: "Assurance", items: [
+    { href: "/obligations", label: "Obligation Dossiers", icon: ClipboardCheck },
+    { href: "/controls", label: "Controls & Tests", icon: SlidersHorizontal },
+    { href: "/assurance", label: "Assurance Periods", icon: CalendarRange },
+    { href: "/governance", label: "Exceptions & Issues", icon: Flag },
+  ] },
+  { group: "Evidence", items: [
+    { href: "/evidence", label: "Evidence Records", icon: Archive },
+    { href: "/ipe", label: "IPE", icon: Database },
+    { href: "/ipe/runs", label: "Source Runs", icon: PlayCircle },
+  ] },
+  { group: "Audit & History", items: [
+    { href: "/packages", label: "Audit Package Builder", icon: Package },
+    { href: "/history", label: "Historical Reconstruction", icon: History },
+    { href: "/ledger", label: "Ledger", icon: Link2 },
+  ] },
+  { group: "AI & Agents", items: [{ href: "/ai", label: "AI/Agent Asset Dossiers", icon: Bot }] },
+  { group: "Integrations", items: [{ href: "/connectors", label: "Connectors", icon: Plug, for: CONTENT }] },
+  { group: "Administration & Trust", items: [
+    { href: "/admin/users", label: "Users & Roles", icon: Users, for: ALL },
+    { href: "/admin/identity", label: "Identity Integrations", icon: KeyRound, for: ALL },
+    { href: "/admin/cells", label: "Cells & Residency", icon: Globe2 },
+    { href: "/admin/releases", label: "Content Releases", icon: PackageCheck, for: CONTENT },
+    { href: "/admin/retention", label: "Retention & Legal Holds", icon: Lock },
+    { href: "/admin/access-log", label: "Privileged Access Log", icon: ShieldAlert },
+  ] },
+];
+
+const ITEMS = NAV.flatMap((g) => g.items.map((i) => ({ ...i, group: g.group })));
+
+/** Detail routes whose section is not their URL prefix (the source-run and evaluation-trace detail pages). */
+const DETAIL_PARENT: [RegExp, string][] = [
+  [/^\/applicability\/(?!trace$)[^/]+$/, "/applicability/trace"],
+  [/^\/ipe\/(?!runs$)[^/]+$/, "/ipe/runs"],
+];
+
+/** Screens reached from the account menu and "Jump to" rather than the sidebar. */
+const EXTRA = [{ href: "/admin/dictionary", label: "Controlled Dictionary", group: "Administration & Trust" }];
+
+/** A customer organisation's registry record is platform administration, not part of the Super Admin's own
+ *  dashboard: its breadcrumb reads "Platform administration › Organisations › <name>" (the list lives on "/"). */
+const PLATFORM_DETAIL = /^\/organisations\/[^/]+$/;
+
+export type RouteMeta = { group: string; item: { href: string; label: string }; isDetail: boolean };
+
+/** Where a path sits in the navigation: its group, its sidebar item, and whether it is a detail page below it. */
+export function routeMeta(path: string): RouteMeta | null {
+  const extra = EXTRA.find((e) => e.href === path);
+  if (extra) return { group: extra.group, item: extra, isDetail: false };
+  if (PLATFORM_DETAIL.test(path)) return { group: "Platform administration", item: { href: "/", label: "Organisations" }, isDetail: true };
+  const parent = DETAIL_PARENT.find(([re]) => re.test(path))?.[1];
+  const item = parent
+    ? ITEMS.find((i) => i.href === parent)
+    : ITEMS.filter((i) => i.href === path || (i.href !== "/" && path.startsWith(`${i.href}/`)))
+      .sort((a, b) => b.href.length - a.href.length)[0];
+  if (!item) return null;
+  return { group: item.group, item, isDetail: path !== item.href };
+}
+
+/** The navigation a signed-in persona can use. */
+export function navFor(persona: Persona): NavGroup[] {
+  return NAV.map((g) => ({ ...g, items: g.items.filter((i) => (i.for ?? ["tenant"]).includes(persona)) })).filter((g) => g.items.length > 0);
+}
+
+/** Whether a persona can use the screen at `path`. After sign-in, a `?next=` page is only followed when this holds, so
+ *  each account lands on a screen meant for it (otherwise its own dashboard at "/"). Navigation only: the backend
+ *  authorises every request regardless. */
+export function canOpen(persona: Persona, path: string): boolean {
+  if (PLATFORM_DETAIL.test(path)) return persona === "platform";
+  const meta = routeMeta(path);
+  if (!meta) return false;
+  return EXTRA.some((e) => e.href === meta.item.href) || navFor(persona).some((g) => g.items.some((i) => i.href === meta.item.href));
+}
+
+/** Everything "Jump to" can reach for this persona. */
+export function jumpTargets(persona: Persona) {
+  return [...navFor(persona).flatMap((g) => g.items.map(({ href, label }) => ({ href, label, group: g.group }))), ...EXTRA];
+}

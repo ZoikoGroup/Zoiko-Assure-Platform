@@ -4,7 +4,7 @@ import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { Badge, Card, ErrorBox, Hash, Json, KV, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
-import { RuleTrace } from "@/components/Trace";
+import { RuleSandbox, VectorReport } from "@/components/RuleTesting";
 
 export default function DraftPage() {
   const { id } = useParams<{ id: string }>();
@@ -41,8 +41,8 @@ export default function DraftPage() {
           <Tabs tabs={["Author", "Validation", "Golden vectors", "Sandbox", "Shadow impact", "Semantic diff"]} value={tab} onChange={setTab} />
           {tab === "Author" && <Editor d={d} onSaved={reload} />}
           {tab === "Validation" && <Validation rep={d.validation_report} />}
-          {tab === "Golden vectors" && <Vectors rep={d.vector_report} />}
-          {tab === "Sandbox" && <Sandbox id={id} />}
+          {tab === "Golden vectors" && <VectorReport rep={d.vector_report} />}
+          {tab === "Sandbox" && <RuleSandbox id={id} />}
           {tab === "Shadow impact" && (d.shadow_report ? <Card title="Shadow impact (aggregate only)"><Notice>{d.shadow_report.note}</Notice><div className="mt-3"><Json value={d.shadow_report} /></div></Card> : <Notice>No shadow run yet. Shadow requires an IN_REVIEW or VERIFIED candidate.</Notice>)}
           {tab === "Semantic diff" && <Diff draft={d} />}
         </>
@@ -130,46 +130,6 @@ function Validation({ rep }: { rep: any }) {
         </Table>
       </div>
     </Card>
-  );
-}
-
-function Vectors({ rep }: { rep: any }) {
-  if (!rep) return <Notice>Golden vectors not run yet.</Notice>;
-  return (
-    <Card title={`Golden vectors · ${rep.passed}/${rep.total} passed`} actions={<Badge code={rep.all_passed ? "PASS" : "FAIL"} />}>
-      {rep.missing_mandatory_classes?.length > 0 && <Notice tone="warn">Missing mandatory classes: {rep.missing_mandatory_classes.join(", ")}</Notice>}
-      <div className="mt-3">
-        <Table head={["Vector", "Expected", "Actual", "Result", "Trace mismatches"]}>
-          {rep.results.map((r: any) => (
-            <tr key={r.vector_id}>
-              <td className="td"><div className="mono text-xs">{r.vector_id}</div><div className="text-[11px] text-slate-500">{r.description}</div></td>
-              <td className="td"><Badge code={r.expected} /></td><td className="td"><Badge code={r.actual ?? r.error} /></td>
-              <td className="td"><Badge code={r.passed ? "PASS" : "FAIL"} /></td>
-              <td className="td text-xs">{r.message || r.trace_mismatches?.map((m: any) => `${m.node_id}: ${m.expected}≠${m.got}`).join("; ")}</td>
-            </tr>
-          ))}
-        </Table>
-      </div>
-    </Card>
-  );
-}
-
-function Sandbox({ id }: { id: string }) {
-  const [facts, setFacts] = useState('{\n  "entity.established_in_eu": true,\n  "ai.role": "DEPLOYER",\n  "ai.high_risk_basis": {"unknown": "MISSING"}\n}');
-  const [at, setAt] = useState("2027-12-02");
-  const a = useAction();
-  return (
-    <div className="grid gap-4 xl:grid-cols-2">
-      <Card title="Synthetic fixture" subtitle="Runs the exact draft artifact on synthetic facts only — no customer data access. Use {&quot;unknown&quot;: REASON} for unknown facts."
-        actions={<button className="btn-primary" disabled={a.busy} onClick={() => a.run(() => api(`/rules/drafts/${id}/sandbox`, { method: "POST", json: { facts: JSON.parse(facts), effective_at: at } }))}>Run</button>}>
-        <ErrorBox error={a.error} />
-        <label className="label">Effective at</label><input type="date" className="input mb-3" value={at} onChange={(e) => setAt(e.target.value)} />
-        <textarea className="input mono h-64 text-[11px]" value={facts} onChange={(e) => setFacts(e.target.value)} spellCheck={false} />
-      </Card>
-      <Card title="Result & trace" actions={a.result && <Badge code={a.result.outcome} />}>
-        {a.result ? <ul><RuleTrace node={a.result.trace} /></ul> : <p className="text-sm text-slate-500">Run the sandbox to see the trace.</p>}
-      </Card>
-    </div>
   );
 }
 

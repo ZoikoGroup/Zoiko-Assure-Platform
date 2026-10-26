@@ -16,6 +16,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -34,8 +35,10 @@ SESSION_HOURS = int(os.environ.get("ZA_SESSION_HOURS", "8"))
 MAX_FAILURES = 5
 LOCK_MINUTES = 15
 MIN_PASSWORD = 10
-DEMO_MODE = os.environ.get("ZA_DEMO_MODE", "1") == "1"
-DEMO_PASSWORD = os.environ.get("ZA_DEMO_PASSWORD", "Assure@2026!")
+# Demo/dev only and off by default. There is deliberately no built-in demo password: demo sign-in exists only when
+# ZA_DEMO_MODE=1 *and* a locally chosen ZA_DEMO_PASSWORD are both set.
+DEMO_MODE = os.environ.get("ZA_DEMO_MODE", "0") == "1"
+DEMO_PASSWORD = os.environ.get("ZA_DEMO_PASSWORD", "")
 
 _KEY_PATH = DATA_DIR / "keys" / "session.key"
 
@@ -64,6 +67,27 @@ def check_password(password: str, stored: str) -> bool:
 
 
 _DUMMY_HASH = hash_password(secrets.token_hex(8))  # equalises timing for unknown accounts
+
+
+def password_policy_ok(pw: str) -> bool:
+    return len(pw) >= MIN_PASSWORD and pw.lower() != pw and pw.upper() != pw and any(c.isdigit() for c in pw)
+
+
+def generate_password() -> str:
+    """A strong random password that satisfies the password policy (used for one-time temporary passwords)."""
+    while True:
+        pw = secrets.token_urlsafe(18)
+        if password_policy_ok(pw):
+            return pw
+
+
+def tenant_active(db: Session, actor: Actor) -> bool:
+    """Platform staff have no tenant; a tenant actor may act only while its organisation is ACTIVE.
+    Callers stamp the actor's tenant scope first (org_tenant is tenant-scoped under RLS)."""
+    if not actor.tenant_id:
+        return True
+    t = db.get(Tenant, actor.tenant_id)
+    return t is not None and t.status == "ACTIVE"
 
 
 # ---------------------------------------------------------------- tokens
@@ -100,6 +124,9 @@ def resolve_token(db: Session, token: str) -> tuple[Actor, AuthSession]:
     actor = db.get(Actor, sess.actor_id)
     if not actor:
         raise HTTPException(401, "Unknown actor")
+    set_tenant_scope(db, actor.tenant_id)
+    if not tenant_active(db, actor):
+        raise HTTPException(401, "Your organisation's access is suspended")
     return actor, sess
 
 
@@ -111,9 +138,12 @@ def bearer(authorization: str | None) -> str | None:
 
 # ---------------------------------------------------------------- demo credentials
 def ensure_demo_credentials(db: Session) -> None:
-    """Demo mode only: give each interactive seeded actor the shared demo password (must change on first use is
-    not forced so the demo stays usable; production disables ZA_DEMO_MODE and provisions via SCIM/IdP)."""
+    """Demo mode only: give each interactive seeded actor the locally configured demo password (must change on first
+    use is not forced so the demo stays usable; production disables ZA_DEMO_MODE and provisions via SCIM/IdP)."""
     if not DEMO_MODE:
+        return
+    if not DEMO_PASSWORD:
+        logging.getLogger(__name__).warning("ZA_DEMO_MODE=1 but ZA_DEMO_PASSWORD is not set: no demo credentials created")
         return
     for a in db.execute(select(Actor)).scalars():
         if a.actor_type in INTERACTIVE_TYPES and not db.get(AuthCredential, a.actor_id):
@@ -136,6 +166,8 @@ def _actor_view(db: Session, a: Actor) -> dict:
     t = db.get(Tenant, a.tenant_id) if a.tenant_id else None
     d["tenant_name"] = t.legal_name if t else "Zoiko content/platform operations"
     d["permissions"] = sorted({p for r in a.roles or [] for p in ROLE_PERMISSIONS.get(r, set())})
+    cred = db.get(AuthCredential, a.actor_id)
+    d["must_change_password"] = bool(cred and cred.must_change)
     return d
 
 
@@ -160,6 +192,11 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
         db.commit()
         raise generic
     cred.failed_attempts, cred.locked_until = 0, None
+    if not tenant_active(db, actor):
+        audit(db, action="auth.login_refused_suspended", object_type="Actor", object_id=actor.actor_id, actor=actor,
+              tenant_id=actor.tenant_id)
+        db.commit()
+        raise HTTPException(403, "Sign-in is disabled because this organisation is suspended")
     sess = AuthSession(actor_id=actor.actor_id, expires_at=now + timedelta(hours=SESSION_HOURS),
                        user_agent=(request.headers.get("user-agent") or "")[:300])
     db.add(sess)
@@ -211,8 +248,10 @@ def change_password(body: PasswordIn, authorization: str | None = Header(default
     if not cred or not check_password(body.current_password, cred.password_hash):
         raise HTTPException(403, "Current password is incorrect")
     pw = body.new_password
-    if len(pw) < MIN_PASSWORD or pw.lower() == pw or pw.upper() == pw or not any(c.isdigit() for c in pw):
+    if not password_policy_ok(pw):
         raise HTTPException(422, f"Use at least {MIN_PASSWORD} characters with upper- and lower-case letters and a digit")
+    if check_password(pw, cred.password_hash):
+        raise HTTPException(422, "Choose a new password that differs from the current one")
     cred.password_hash, cred.must_change, cred.updated_at = hash_password(pw), False, datetime.now(timezone.utc)
     # revoke every other session for this actor
     for s in db.execute(select(AuthSession).where(AuthSession.actor_id == actor.actor_id,
@@ -236,5 +275,4 @@ def demo_accounts(db: Session = Depends(get_db)):
             t = db.get(Tenant, a.tenant_id) if a.tenant_id else None
             out.append({"email": a.email, "display_name": a.display_name, "roles": a.roles, "actor_type": a.actor_type,
                         "tenant_name": t.legal_name if t else "Zoiko content operations"})
-    return {"password_hint": "Shared demo password is shown on the sign-in page only in demo mode.",
-            "password": DEMO_PASSWORD, "accounts": out}
+    return {"accounts": out}  # never return a password

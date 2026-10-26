@@ -7,3 +7,6 @@ python-multipart>=0.0.9
 pytest>=8
 httpx>=0.27
 psycopg[binary]>=3.2
+alembic
+pydantic-settings
+email-validator

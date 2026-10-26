@@ -4,11 +4,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import or_, select
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 
 from ..engines import applicability as appl
-from ..engines.facts import assert_fact, assertion_value, resolve_fact, visible_at
+from ..engines.facts import assert_fact, assertion_value, resolve_fact
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, DeterminationChallenge,
                       FactAssertion, FactConflict, FactDefinition, FactRequest, ObligationDefinition, RuleVersion, Subject)
 from ..platform import current_watermark, emit, ensure_utc, next_record_seq, to_dict
@@ -63,11 +63,12 @@ def fact_history(subject_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 class FactIn(BaseModel):
+    # Provenance is server-derived (APP-REQ-005, API-REQ-014): a client-supplied provenance_class is rejected.
+    model_config = ConfigDict(extra="forbid")
     fact_key: str
     value: object
     valid_from: datetime
     valid_to: datetime | None = None
-    provenance_class: str = "P3_CUSTOMER_ATTESTED"
     source_ref: str | None = None
     change_kind: str = "CREATE"
     reason: str | None = None
@@ -82,14 +83,16 @@ def assert_fact_ep(subject_id: str, body: FactIn, ctx: Ctx = Depends(get_ctx)):
         raise HTTPException(404, "FactDefinition not found")
     if fd.subject_type != s.subject_type:
         raise HTTPException(422, f"{fd.key} attaches to {fd.subject_type}")
-    if ctx.actor.actor_type == "AGENT" and body.provenance_class != "P5_INFERRED_AI":
-        raise HTTPException(403, "Agent-proposed facts must carry P5_INFERRED_AI provenance (non-binding)")
-    if body.provenance_class == "P3_CUSTOMER_ATTESTED":
-        ctx.require_human("Customer-attested fact")
+    if ctx.actor.actor_type == "AGENT":
+        provenance = "P5_INFERRED_AI"  # agent-proposed facts are never binding
+    elif ctx.actor.actor_type == "HUMAN":
+        provenance = "P3_CUSTOMER_ATTESTED"
         if fd.manual_attestation_policy == "DISALLOWED":
             raise HTTPException(422, f"{fd.key} does not allow manual attestation; use a certified source")
+    else:
+        raise HTTPException(403, "System-sourced facts must arrive through the certified connector path, not this endpoint")
     created = assert_fact(ctx.db, tenant_id=ctx.tenant, subject=s, fd=fd, value=body.value, valid_from=body.valid_from,
-                          valid_to=body.valid_to, provenance_class=body.provenance_class, source_ref=body.source_ref,
+                          valid_to=body.valid_to, provenance_class=provenance, source_ref=body.source_ref,
                           actor_id=ctx.actor.actor_id, change_kind=body.change_kind, reason=body.reason)
     reeval = appl.reevaluate_for_fact(ctx.db, tenant_id=ctx.tenant, holder=s, fd=fd, actor_id=ctx.actor.actor_id)
     ctx.db.commit()

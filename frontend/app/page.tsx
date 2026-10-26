@@ -1,220 +1,337 @@
 "use client";
 
+import { useMemo, useState } from "react";
+import { ArrowRight, Braces, Building2, FlaskConical, Inbox, Library } from "lucide-react";
 import Link from "next/link";
-import {
-  Activity, AlertTriangle, Archive, ArrowRight, Building2, CheckCircle2, ClipboardCheck, Clock, FileClock, Plug,
-} from "lucide-react";
 import { useApi } from "@/lib/api";
-import { useAuth } from "@/lib/actor";
+import { personaOf, useAuth, type Me } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, ErrorBox, Notice } from "@/components/ui";
-import { delay, useCountUp } from "@/lib/motion";
-import { BarChart, CHART, Donut, LineChart } from "@/components/charts";
+import { rolesText } from "@/lib/roles";
+import { SuperAdminDashboard } from "@/components/PlatformAdmin";
+import {
+  A, Badge, Card, EmptyState, EntitySelector, ErrorBox, LoadingSkeleton, MetricCard, Notice, PageHeader, Table, toneIcon,
+} from "@/components/ui";
 
-const MONTH = (m: string) => new Date(`${m}-01T00:00:00Z`).toLocaleDateString("en-GB", { month: "short", timeZone: "UTC" });
-const SPLIT: Record<string, string> = { PROVEN: "bg-navy-600", NOT_PROVEN: "bg-brand-400", FAILING: "bg-red-500", REQUIRES_REVIEW: "bg-violet-500" };
-
-function CountUp({ value, delayMs = 0 }: { value: number; delayMs?: number }) {
-  return <>{useCountUp(value, 1100, delayMs)}</>;
-}
-
-function StatCard({ label, value, icon: Icon, tone = "navy", foot, href, i = 0 }: { label: string; value: React.ReactNode; icon: React.ElementType; tone?: "navy" | "orange"; foot: React.ReactNode; href?: string; i?: number }) {
-  const tile = tone === "orange" ? "from-brand-400 to-brand-600 shadow-brand-600/30" : "from-navy-600 to-navy-900 shadow-navy-900/30";
-  const body = (
-    <div className="za-fade-up card group h-full p-4 transition duration-300 hover:-translate-y-1 hover:shadow-xl" style={delay(i * 110)}>
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="text-sm text-slate-brand">{label}</div>
-          <div className="mt-1 text-3xl font-bold tabular-nums tracking-tight text-navy-900">{typeof value === "number" ? <CountUp value={value} delayMs={i * 110 + 150} /> : value}</div>
-        </div>
-        <span className={`za-shine flex h-14 w-14 items-center justify-center rounded-xl bg-gradient-to-br text-white shadow-lg transition-transform duration-300 group-hover:rotate-6 group-hover:scale-110 ${tile}`} style={delay(1200 + i * 400)}>
-          <span className="za-pop inline-flex" style={delay(250 + i * 110)}><Icon size={22} /></span>
-        </span>
-      </div>
-      <div className="mt-4 border-t border-navy-50 pt-3 text-sm text-slate-600">{foot}</div>
-    </div>
-  );
-  return href ? <Link href={href} className="block">{body}</Link> : body;
-}
-
-function ChartCard({ title, subtitle, children, foot, i = 0 }: { title: string; subtitle: string; children: React.ReactNode; foot: string; i?: number }) {
-  return (
-    <section className="za-fade-up card flex flex-col p-5 transition duration-300 hover:shadow-xl" style={delay(400 + i * 130)}>
-      <h2 className="text-base font-bold text-navy-900">{title}</h2>
-      <p className="mb-4 text-sm text-slate-brand">{subtitle}</p>
-      <div className="flex-1">{children}</div>
-      <div className="mt-4 flex items-center gap-1.5 border-t border-navy-50 pt-3 text-xs text-slate-500"><Clock size={13} />{foot}</div>
-    </section>
-  );
-}
+/* Every number on this page comes from the backend (dashboard projection, obligations, controls, IPE, catalogue).
+   Nothing here derives applicability or assurance state in the browser, and nothing is a compliance score. */
+const STATES = ["PROVEN", "NOT_PROVEN", "FAILING", "REQUIRES_REVIEW"] as const;
+const BAR: Record<string, string> = { PROVEN: "bg-emerald-500", NOT_PROVEN: "bg-amber-400", FAILING: "bg-red-500", REQUIRES_REVIEW: "bg-violet-500", NO_SNAPSHOT: "bg-slate-300" };
 
 export default function Dashboard() {
   const { me } = useAuth();
-  const { data: d, error, loading } = useApi<any>(me?.tenant_id ? "/dashboard" : null);
+  const persona = personaOf(me);
+  const tenant = persona === "tenant";
+  const dash = useApi<any>(tenant ? "/dashboard" : null);
+  const obls = useApi<any[]>(tenant ? "/obligations" : null);
+  const sources = useApi<any[]>(tenant ? "/catalog/sources" : null);
+  const org = useApi<any>(tenant ? "/org/tenant" : null);
+  const controls = useApi<any[]>(tenant ? "/controls" : null);
+  const anomalies = useApi<any[]>(tenant ? "/ipe/anomalies" : null);
+  const [entity, setEntity] = useState("");
 
-  if (me && !me.tenant_id) {
-    return (
-      <div className="space-y-4">
-        <h1 className="text-2xl font-bold text-navy-900">Welcome, {me.display_name.replace(/\s*\(.*\)/, "")}</h1>
-        <Notice>Zoiko content-operations staff have no standing access to customer data (INV-14). Your workspace is regulatory content and rule authoring.</Notice>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <StatCard label="Regulatory inbox" value="Sources" icon={FileClock} foot={<span className="flex items-center gap-1">Ingest, extract and verify <ArrowRight size={14} /></span>} href="/regulatory" />
-          <StatCard label="Rule authoring" value="Drafts" icon={ClipboardCheck} tone="orange" foot={<span className="flex items-center gap-1">Validate, review and release <ArrowRight size={14} /></span>} href="/rules" />
-        </div>
-      </div>
-    );
-  }
+  // Two dashboards: the platform Super Admin's, and the Organisation Dashboard below. Content staff land on their workspace.
+  if (me && persona === "platform") return <SuperAdminDashboard />;
+  if (me && !tenant) return <ContentOpsHome name={me.display_name} />;
 
-  const t = d?.assurance_totals;
-  const denominator = d ? d.by_entity.reduce((a: number, e: any) => a + e.denominator, 0) : 0;
-  const uncertain = d ? d.by_entity.reduce((a: number, e: any) => a + e.uncertain_evaluations, 0) : 0;
-  const gaps = t ? t.NOT_PROVEN + t.FAILING + t.REQUIRES_REVIEW : 0;
-  const asOf = d ? `as of ${fmtDate(d.as_of.valid_at, true)} · seq ${d.as_of.record_seq}` : "";
+  const d = dash.data;
+  const scoped = d && entity ? d.by_entity.find((e: any) => e.entity_id === entity) : null;
+  const counts: Record<string, number> = scoped ? scoped.assurance_counts : d?.assurance_totals ?? {};
+  const denominator = d ? (scoped ? scoped.denominator : d.by_entity.reduce((a: number, e: any) => a + e.denominator, 0)) : 0;
+  const uncertain = d ? (scoped ? scoped.uncertain_evaluations : d.by_entity.reduce((a: number, e: any) => a + e.uncertain_evaluations, 0)) : 0;
+  const asOf = d ? `As of ${fmtDate(d.as_of.valid_at, true)} · record seq ${d.as_of.record_seq}` : "";
+  const scopeNote = entity ? "All entities (not available per entity)" : undefined;
 
   return (
     <>
-      <div className="za-fade-up mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-navy-900">Dashboard</h1>
-        <p className="mt-1 text-slate-brand">Evidential assurance across your legal entities, against named requirement versions and periods.</p>
-      </div>
-      <ErrorBox error={error} />
-      {loading && !d && <DashboardSkeleton />}
+      <PageHeader title="Organisation Dashboard"
+        subtitle="What needs attention, and the evidential assurance position of your organisation against named requirement versions and periods." />
+      <OrgSummary me={me} org={org.data} />
+      <ErrorBox error={dash.error} />
+      {dash.loading && !d && <div className="card"><LoadingSkeleton rows={6} /></div>}
       {d && (
-        <div className="space-y-6">
-          <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
-            <StatCard i={0} label="Adopted obligations" value={denominator} icon={ClipboardCheck} href="/obligations"
-              foot={uncertain ? <><b className="text-brand-600">{uncertain}</b> uncertain applicability, reported separately</> : "No uncertain applicability"} />
-            <StatCard i={1} label="Proven (latest period)" value={t.PROVEN} icon={CheckCircle2} tone="orange" href="/obligations"
-              foot={<><b className="text-navy-700">{t.PROVEN}</b> of {denominator} adopted · {t.NO_SNAPSHOT} not yet assessed</>} />
-            <StatCard i={2} label="Gaps & failures" value={gaps} icon={AlertTriangle} href="/governance"
-              foot={<><b className="text-brand-600">{t.FAILING}</b> failing · {t.NOT_PROVEN} not proven · {d.open_issues.total} open issue(s)</>} />
-            <StatCard i={3} label="Current evidence" value={d.evidence_conditions.CURRENT ?? 0} icon={Archive} tone="orange" href="/evidence"
-              foot={<><b className="text-brand-600">{d.evidence_conditions.STALE ?? 0}</b> stale · ledger head #{d.ledger.head_seq}</>} />
+        <div className="space-y-4">
+          <NeedsAttention d={d} controls={controls.data} anomalies={anomalies.data} />
+
+          <div className="flex flex-wrap items-end justify-between gap-3 pt-2">
+            <div className="min-w-0">
+              <h2 className="text-sm font-semibold text-slate-900">Assurance position</h2>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Latest period snapshot per adopted obligation, {scoped ? <>for <b className="font-medium text-slate-700">{scoped.legal_name}</b></> : "across all legal entities"}. Evidential states, not a compliance score.
+              </p>
+            </div>
+            <EntitySelector entities={d.by_entity} value={entity} onChange={setEntity} className="w-full sm:w-60" />
+          </div>
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+            <MetricCard label="Adopted obligations" value={denominator} href="/obligations" tone="info"
+              hint={<>{counts.NO_SNAPSHOT ?? 0} not yet assessed{uncertain ? <> · {uncertain} UNCERTAIN applicability reported separately</> : null}</>} />
+            <MetricCard label="Proven" value={counts.PROVEN ?? 0} code="PROVEN" href="/assurance" hint={`of ${denominator} · latest snapshot`} />
+            <MetricCard label="Not proven" value={counts.NOT_PROVEN ?? 0} code="NOT_PROVEN" href="/assurance" hint={`of ${denominator} · latest snapshot`} />
+            <MetricCard label="Failing" value={counts.FAILING ?? 0} code="FAILING" href="/assurance" hint={`of ${denominator} · latest snapshot`} />
+            <MetricCard label="Requires review" value={counts.REQUIRES_REVIEW ?? 0} code="REQUIRES_REVIEW" href="/assurance" hint={`of ${denominator} · latest snapshot`} />
+            <MetricCard label="Current evidence" value={d.evidence_conditions.CURRENT ?? 0} code="CURRENT" href="/evidence"
+              hint={entity ? scopeNote : `${d.evidence_conditions.STALE ?? 0} stale · ledger head #${d.ledger.head_seq}`} />
           </div>
 
-          <div className="grid gap-5 lg:grid-cols-3">
-            <ChartCard i={0} title="Evidence coverage" subtitle="Artifacts by coverage-start month" foot={asOf}>
-              <BarChart label="Evidence artifacts by coverage month" data={d.evidence_by_coverage_month.map((x: any) => ({ x: MONTH(x.month), y: x.count }))} />
-            </ChartCard>
-            <ChartCard i={1} title="Control test results" subtitle="Recorded test runs per month (inputs, not control state)" foot={asOf}>
-              <LineChart label="Control test runs by month" labels={d.test_runs_by_month.map((x: any) => MONTH(x.month))}
-                series={[{ name: "Pass", color: CHART.NAVY, values: d.test_runs_by_month.map((x: any) => x.PASS) },
-                  { name: "Fail / error", color: CHART.ORANGE, values: d.test_runs_by_month.map((x: any) => x.FAIL) }]} />
-            </ChartCard>
-            <ChartCard i={2} title="Applicability" subtitle="Latest evaluation per subject and obligation" foot={`${d.determinations.PROPOSED} proposed · ${d.determinations.ADOPTED} adopted`}>
-              <Donut label="Applicability outcomes"
-                parts={[{ name: "Applies", value: d.applicability_outcomes.APPLIES, color: CHART.NAVY },
-                  { name: "Does not apply", value: d.applicability_outcomes.DOES_NOT_APPLY, color: "#aecadc" },
-                  { name: "Uncertain", value: d.applicability_outcomes.UNCERTAIN, color: CHART.ORANGE }]}
-                center={<><span className="text-2xl font-bold text-navy-900">{Object.values(d.applicability_outcomes as Record<string, number>).reduce((a, b) => a + b, 0)}</span><span className="text-[10px] uppercase tracking-wide text-slate-500">evaluations</span></>} />
-            </ChartCard>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <AssuranceByState className="xl:col-span-2" counts={counts} denominator={denominator} rows={obls.data} error={obls.error} entity={entity} asOf={asOf} />
+            <ApplicabilitySummary d={d} scopeNote={scopeNote} />
           </div>
 
-          <div className="grid gap-5 xl:grid-cols-3">
-            <section className="za-fade-up card p-5 xl:col-span-2" style={delay(800)}>
-              <div className="mb-4 flex items-start justify-between">
-                <div>
-                  <h2 className="text-base font-bold text-navy-900">Obligations</h2>
-                  <p className="text-sm text-slate-brand"><b className="text-navy-700">{d.obligations.length}</b> instances · bars show how the latest assessed period splits by state</p>
-                </div>
-                <A href="/obligations">View all</A>
-              </div>
-              <div className="scroll-thin overflow-x-auto">
-                <table className="min-w-full">
-                  <thead><tr><th className="th">Obligation</th><th className="th">Subject</th><th className="th">State</th><th className="th w-[30%]">Period split</th></tr></thead>
-                  <tbody className="divide-y divide-navy-50">
-                    {d.obligations.map((o: any, oi: number) => (
-                      <tr key={o.lineage_id} className="za-slide-in transition-colors hover:bg-navy-50/50" style={delay(950 + oi * 110)}>
-                        <td className="td"><Link href={`/obligations/${o.lineage_id}`} className="font-semibold text-navy-900 hover:text-brand-600">{o.title}</Link><div className="mono text-[11px] text-slate-500">{o.key}</div></td>
-                        <td className="td text-sm text-slate-700">{o.subject}</td>
-                        <td className="td">{o.state ? <Badge code={o.state} /> : <span className="text-xs text-slate-400">Not assessed</span>}</td>
-                        <td className="td">
-                          {o.period_split_pct ? (
-                            <>
-                              <div className="flex h-2 overflow-hidden rounded-full bg-navy-50">
-                                <div className="za-grow-x flex h-full w-full" style={delay(1100 + oi * 110)}>
-                                  {Object.entries(o.period_split_pct as Record<string, number>).map(([k, v]) => <div key={k} className={SPLIT[k]} style={{ width: `${v}%` }} title={`${k} ${v}%`} />)}
-                                </div>
-                              </div>
-                              <div className="mt-1 text-[11px] text-slate-500">
-                                {Object.entries(o.period_split_pct as Record<string, number>).map(([k, v]) => `${k.replace("_", " ").toLowerCase()} ${Math.round(v)}%`).join(" · ")} · {fmtDate(o.period[0])} → {fmtDate(o.period[1])}
-                              </div>
-                            </>
-                          ) : <span className="text-xs text-slate-400">—</span>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-
-            <section className="za-fade-up card p-5" style={delay(900)}>
-              <h2 className="text-base font-bold text-navy-900">Recent activity</h2>
-              <p className="mb-4 text-sm text-slate-brand">Latest domain events (transactional outbox)</p>
-              <ol className="relative space-y-4 border-l-2 border-navy-50 pl-5">
-                {d.recent_events.map((e: any, ei: number) => (
-                  <li key={e.record_seq + e.event_type} className="za-slide-in relative" style={delay(1050 + ei * 90)}>
-                    <span className={`absolute -left-[27px] top-0.5 flex h-4 w-4 items-center justify-center rounded-full ring-4 ring-white ${ei === 0 ? "za-pulse" : ""} ${e.event_type.includes("gap") || e.event_type.includes("fail") ? "bg-brand-500" : "bg-navy-600"}`} />
-                    <div className="mono text-[12px] font-semibold text-navy-900">{e.event_type}</div>
-                    <div className="text-[11px] text-slate-500">{e.aggregate_type} · seq {e.record_seq} · {fmtDate(e.at, true)}</div>
-                  </li>
-                ))}
-              </ol>
-              <Link href="/admin" className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-navy-700 hover:text-brand-600">Full event log <ArrowRight size={14} /></Link>
-            </section>
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+            <EvidenceFreshness d={d} scopeNote={scopeNote} />
+            <RecentChanges rows={sources.data} error={sources.error} />
+            <RecordChain d={d} sources={sources.data} controls={controls.data} />
           </div>
 
-          <div className="grid gap-5 lg:grid-cols-2">
-            <section className="za-fade-up card p-5" style={delay(1100)}>
-              <div className="mb-3 flex items-center gap-2"><Building2 size={18} className="text-brand-500" /><h2 className="text-base font-bold text-navy-900">By legal entity</h2></div>
-              <ul className="divide-y divide-navy-50">
-                {d.by_entity.map((e: any, bi: number) => (
-                  <li key={e.entity_id} className="za-slide-in flex items-center justify-between gap-3 py-3" style={delay(1200 + bi * 100)}>
-                    <div><div className="font-semibold text-navy-900">{e.legal_name}</div><div className="mono text-[11px] text-slate-500">{e.country} · {e.home_cell_id}</div></div>
-                    <div className="flex flex-wrap justify-end gap-1.5 text-xs">
-                      {e.denominator ? Object.entries(e.assurance_counts as Record<string, number>).filter(([, v]) => v).map(([k, v]) => <Badge key={k} code={k === "NO_SNAPSHOT" ? "NOT_EVALUATED" : k} label={`${v} ${k.replace("_", " ")}`} />) : <span className="text-slate-400">No adopted obligations</span>}
-                      {e.uncertain_evaluations > 0 && <Badge code="UNCERTAIN" label={`${e.uncertain_evaluations} UNCERTAIN`} />}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </section>
-            <section className="za-fade-up card p-5" style={delay(1200)}>
-              <div className="mb-3 flex items-center gap-2"><Plug size={18} className="text-brand-500" /><h2 className="text-base font-bold text-navy-900">Connectors</h2><span className="ml-auto text-xs text-slate-500">from the certification registry</span></div>
-              <ul className="divide-y divide-navy-50">
-                {d.connectors.map((c: any, ci: number) => (
-                  <li key={c.name} className="za-slide-in flex items-center justify-between gap-3 py-3" style={delay(1300 + ci * 90)}>
-                    <span className="flex items-center gap-2 font-medium text-navy-900"><Activity size={15} className="text-slate-400" />{c.name}</span>
-                    <span className="flex gap-1.5"><Badge code={c.certification} /><Badge code={c.runtime_health} /></span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          </div>
-          <p className="text-center text-xs text-slate-500">{d.language_note}</p>
+          <p className="text-[11px] text-slate-500">{d.denominator_rule} {d.language_note}</p>
         </div>
       )}
     </>
   );
 }
 
-function DashboardSkeleton() {
-  const bar = "za-skeleton rounded-lg";
+function AssuranceByState({ counts, denominator, rows, error, entity, asOf, className = "" }:
+  { counts: Record<string, number>; denominator: number; rows: any[] | null; error: unknown; entity: string; asOf: string; className?: string }) {
+  const list = useMemo(() => (rows ?? []).filter((o) => o.lifecycle === "ADOPTED" && (!entity || o.entity_id === entity)), [rows, entity]);
+  const segments = [...STATES, "NO_SNAPSHOT"].map((k) => ({ k, n: counts[k] ?? 0 })).filter((s) => s.n > 0);
   return (
-    <div className="space-y-6" aria-busy="true" aria-label="Loading dashboard">
-      <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
-        {[0, 1, 2, 3].map((i) => (
-          <div key={i} className="card p-4">
-            <div className="flex justify-between"><div className="space-y-2"><div className={`${bar} h-3 w-28`} /><div className={`${bar} h-8 w-16`} /></div><div className={`${bar} h-14 w-14 rounded-xl`} /></div>
-            <div className={`${bar} mt-5 h-3 w-full`} />
-          </div>
+    <Card className={className} title="Assurance by state" subtitle="Latest period snapshot per adopted obligation. States are computed by the backend roll-up and never edited here."
+      actions={<A href="/assurance">View all</A>} bodyClassName="" footer={asOf}>
+      <div className="space-y-2 px-4 pt-4">
+        {denominator > 0 ? (
+          <>
+            <div className="flex h-2 overflow-hidden rounded-full bg-slate-100" aria-hidden>
+              {segments.map((s) => <div key={s.k} className={BAR[s.k]} style={{ width: `${(s.n / denominator) * 100}%` }} />)}
+            </div>
+            <ul className="flex flex-wrap gap-x-4 gap-y-1.5 pb-1" aria-label="Assurance state counts">
+              {[...STATES].map((k) => <li key={k} className="flex items-center gap-1.5"><Badge code={k} /><span className="text-[13px] tabular-nums text-slate-700">{counts[k] ?? 0}</span></li>)}
+              <li className="flex items-center gap-1.5"><Badge code="NOT_EVALUATED" label="NOT ASSESSED" /><span className="text-[13px] tabular-nums text-slate-700">{counts.NO_SNAPSHOT ?? 0}</span></li>
+            </ul>
+          </>
+        ) : <p className="text-[13px] text-slate-500">No adopted obligations in scope.</p>}
+      </div>
+      <ErrorBox error={error} />
+      <div className="mt-2">
+        <Table head={["Obligation", "Subject", "State", "Period · perspective", "Exceptions"]} empty={!!rows && list.length === 0}>
+          {list.map((o) => {
+            const s = o.latest_snapshot;
+            return (
+              <tr key={o.lineage_id}>
+                <td className="td"><Link href={`/obligations/${o.lineage_id}`} className="font-medium text-slate-900 hover:text-navy-700">{o.definition.title}</Link><div className="mono text-[11px] text-slate-500">{o.definition.key}</div></td>
+                <td className="td text-slate-600">{o.subject.display_name}</td>
+                <td className="td">{s ? <Badge code={s.state} /> : <span className="text-xs text-slate-500">Not assessed</span>}</td>
+                <td className="td text-xs text-slate-600">{s ? <><span className="whitespace-nowrap">{fmtDate(s.period_from)} → {fmtDate(s.period_to)}</span><div className="mono text-[10px] text-slate-500">{s.perspective}</div></> : "—"}</td>
+                <td className="td">{o.open_exceptions ? <Badge tone="exception" label={`${o.open_exceptions} APPROVED`} title="Approved exception(s): shown beside the state, never changing it" /> : <span className="text-xs text-slate-400">None</span>}</td>
+              </tr>
+            );
+          })}
+        </Table>
+        {!rows && !error && <LoadingSkeleton rows={3} />}
+      </div>
+    </Card>
+  );
+}
+
+function ApplicabilitySummary({ d, scopeNote }: { d: any; scopeNote?: string }) {
+  const out = d.applicability_outcomes as Record<string, number>;
+  const total = (out.APPLIES ?? 0) + (out.DOES_NOT_APPLY ?? 0) + (out.UNCERTAIN ?? 0);
+  return (
+    <Card title="Applicability summary" subtitle="Latest evaluation per subject and obligation" actions={<A href="/applicability">Review</A>} footer={scopeNote}>
+      <ul className="space-y-2.5">
+        {["APPLIES", "DOES_NOT_APPLY", "UNCERTAIN"].map((k) => (
+          <li key={k}>
+            <div className="flex items-center justify-between gap-2"><Badge code={k} /><span className="text-[13px] font-medium tabular-nums text-slate-900">{out[k] ?? 0}</span></div>
+            <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-slate-100" aria-hidden>
+              <div className="h-full bg-navy-400" style={{ width: total ? `${((out[k] ?? 0) / total) * 100}%` : "0%" }} />
+            </div>
+          </li>
+        ))}
+      </ul>
+      <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 border-t border-slate-100 pt-3 text-[13px]">
+        {[["Proposed", d.determinations.PROPOSED], ["In review", d.determinations.IN_REVIEW], ["Adopted", d.determinations.ADOPTED], ["Needs review", d.determinations.needs_review]].map(([k, v]) => (
+          <div key={k as string} className="flex justify-between"><dt className="text-slate-500">{k}</dt><dd className="font-medium tabular-nums text-slate-900">{v ?? 0}</dd></div>
+        ))}
+      </dl>
+      <p className="mt-3 text-[11px] text-slate-500">An APPLIES evaluation is not an adoption; adoption needs a named human attestation.</p>
+    </Card>
+  );
+}
+
+function EvidenceFreshness({ d, scopeNote }: { d: any; scopeNote?: string }) {
+  const conds = Object.entries(d.evidence_conditions as Record<string, number>).sort((a, b) => b[1] - a[1]);
+  return (
+    <Card title="Evidence freshness" subtitle="Evidence condition across artifacts" actions={<A href="/evidence">Evidence</A>}
+      footer={scopeNote ?? `Ledger head #${d.ledger.head_seq} · last checkpoint #${d.ledger.last_checkpointed_seq}`}>
+      {conds.length === 0 ? <EmptyState title="No evidence captured yet" compact /> : (
+        <ul className="divide-y divide-slate-100">
+          {conds.map(([k, v]) => <li key={k} className="flex items-center justify-between py-1.5"><Badge code={k} /><span className="text-[13px] font-medium tabular-nums text-slate-900">{v}</span></li>)}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function RecentChanges({ rows, error }: { rows: any[] | null; error: unknown }) {
+  const recent = useMemo(() => [...(rows ?? [])].sort((a, b) => String(b.fetched_at).localeCompare(String(a.fetched_at))).slice(0, 5), [rows]);
+  return (
+    <Card title="Recent regulatory changes" subtitle="Latest ingested authoritative sources" actions={<A href="/regulatory">Sources</A>}>
+      <ErrorBox error={error} />
+      {!rows && !error ? <LoadingSkeleton rows={3} className="p-0" /> : recent.length === 0 ? <EmptyState title="No sources ingested" compact /> : (
+        <ul className="divide-y divide-slate-100">
+          {recent.map((s) => (
+            <li key={s.source_id} className="py-2">
+              <div className="flex items-start justify-between gap-2">
+                <span className="text-[13px] font-medium leading-5 text-slate-900">{s.title}</span>
+                <Badge code={s.lifecycle} />
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-500">{s.authority} · {s.jurisdiction} · effective {fmtDate(s.effective_date)}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+/** Which organisation this workspace is for, kept apart from who is signed in. */
+function OrgSummary({ me, org }: { me: Me | null; org: any }) {
+  const entities: any[] = org?.entities ?? [];
+  const cells = [...new Set(entities.map((e) => e.home_cell_id))];
+  return (
+    <section aria-label="Organisation" className="card mb-4 flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex min-w-0 items-start gap-3">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-navy-50 text-navy-700"><Building2 size={18} aria-hidden /></span>
+        <div className="min-w-0">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Organisation</div>
+          <div className="text-[15px] font-semibold leading-6 text-slate-900">{org?.tenant.legal_name ?? me?.tenant_name}</div>
+          {org && (
+            <div className="text-xs text-slate-500">
+              {entities.length} legal {entities.length === 1 ? "entity" : "entities"}: {entities.map((e) => `${e.legal_name} (${e.country})`).join(", ")}
+              {cells.length > 0 && <> · data held in <span className="mono">{cells.join(", ")}</span></>}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="min-w-0 border-t border-slate-100 pt-3 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Signed in as</div>
+        <div className="text-[13px] font-medium text-slate-900">{me?.display_name.replace(/\s*\(.*\)/, "")}</div>
+        <div className="text-xs text-slate-500">{rolesText(me)} · <A href="/admin/users">Your access</A></div>
+      </div>
+    </section>
+  );
+}
+
+type Attention = { key: string; n: number; code: string; label: string; why: string; href: string; next: string };
+
+/** Work that blocks or qualifies assurance, most severe first. Organisation-wide; only non-zero items are listed. */
+function NeedsAttention({ d, controls, anomalies }: { d: any; controls: any[] | null; anomalies: any[] | null }) {
+  const t = d.assurance_totals as Record<string, number>;
+  const sev = d.open_issues.by_severity as Record<string, number>;
+  const ev = d.evidence_conditions as Record<string, number>;
+  const notCurrent = Object.entries(ev).filter(([k, v]) => v > 0 && k !== "CURRENT" && k !== "ERASED");  // erasure is a governed act, not a gap
+  const ctlOff = (controls ?? []).filter((c) => c.current_state.state !== "OPERATING");
+  const ctlByState = Object.entries(ctlOff.reduce((m: Record<string, number>, c) => ({ ...m, [c.current_state.state]: (m[c.current_state.state] ?? 0) + 1 }), {}));
+  const openIpe = (anomalies ?? []).filter((a) => !a.disposition_code).length;
+  const uncertain = d.by_entity.reduce((a: number, e: any) => a + e.uncertain_evaluations, 0);
+  const list = (pairs: [string, number][]) => pairs.map(([k, v]) => `${v} ${k}`).join(" · ");
+  const items: Attention[] = [
+    { key: "failing", n: t.FAILING ?? 0, code: "FAILING", label: "Obligations FAILING", why: "A control or required occurrence failed in the latest period snapshot.", href: "/assurance", next: "Assurance Periods" },
+    { key: "review", n: t.REQUIRES_REVIEW ?? 0, code: "REQUIRES_REVIEW", label: "Obligations REQUIRES_REVIEW", why: "Conflicting or unresolved inputs need a human decision.", href: "/assurance", next: "Assurance Periods" },
+    { key: "notproven", n: t.NOT_PROVEN ?? 0, code: "NOT_PROVEN", label: "Obligations NOT_PROVEN", why: "Evidence is missing, stale or IPE-unverified for part of the period.", href: "/assurance", next: "Assurance Periods" },
+    { key: "unassessed", n: t.NO_SNAPSHOT ?? 0, code: "NOT_EVALUATED", label: "Adopted obligations not yet assessed", why: "No period snapshot has been frozen. Open the dossier and assess a period.", href: "/obligations", next: "Obligation Dossiers" },
+    { key: "adopt", n: (d.determinations.PROPOSED ?? 0) + (d.determinations.IN_REVIEW ?? 0), code: "PROPOSED", label: "Applicability determinations awaiting adoption", why: "An APPLIES result becomes an obligation only after a named person attests it.", href: "/applicability", next: "Applicability Review" },
+    { key: "rereview", n: d.determinations.needs_review ?? 0, code: "REQUIRES_REVIEW", label: "Adopted determinations flagged for re-review", why: "A newer evaluation disagrees with the adopted outcome.", href: "/applicability", next: "Applicability Review" },
+    { key: "uncertain", n: uncertain, code: "UNCERTAIN", label: "UNCERTAIN applicability evaluations", why: "Missing facts prevent a decision. Reported separately, never excluded.", href: "/applicability", next: "Applicability Review" },
+    { key: "facts", n: d.open_fact_requests, code: "OPEN", label: "Open fact requests", why: "Facts requested from their owners to resolve UNCERTAIN outcomes.", href: "/fact-requests", next: "Fact Requests" },
+    { key: "controls", n: ctlOff.length, code: ctlOff.some((c) => c.current_state.state === "FAILING") ? "FAILING" : "NOT_EVALUATED", label: "Controls not OPERATING", why: `${list(ctlByState as [string, number][])} (24-hour convenience view; open a control for its recorded evaluations).`, href: "/controls", next: "Controls & Tests" },
+    { key: "evidence", n: notCurrent.reduce((a, [, v]) => a + v, 0), code: ev.INVALID ? "INVALID" : "STALE", label: "Evidence not CURRENT", why: `${list(notCurrent)}. Stale or invalid evidence cannot prove a control.`, href: "/evidence", next: "Evidence Records" },
+    { key: "ipe", n: openIpe, code: "IPE_INCONCLUSIVE", label: "IPE anomalies awaiting disposition", why: "A population behind a test is not yet proven complete and accurate.", href: "/ipe", next: "IPE" },
+    { key: "issues", n: d.open_issues.total, code: (sev.CRITICAL || sev.HIGH) ? "FAIL" : "OPEN", label: "Open issues", why: list(Object.entries(sev).filter(([, v]) => v).map(([k, v]) => [k.toLowerCase(), v])), href: "/governance", next: "Exceptions & Issues" },
+  ];
+  const open = items.filter((i) => i.n > 0);
+  return (
+    <Card title="Needs attention" subtitle="Work that blocks or qualifies assurance, across all legal entities, most severe first." bodyClassName=""
+      footer="Built from the latest recorded data. An empty list is not a statement of compliance.">
+      {open.length === 0 ? <p className="px-4 py-4 text-[13px] text-slate-600">Nothing is flagged in the latest recorded data.</p> : (
+        <ul className="grid divide-y divide-slate-100 lg:grid-cols-2 lg:divide-y-0">
+          {open.map((i) => {
+            const { Icon, iconCls } = toneIcon(i.code);
+            return (
+              <li key={i.key} className="lg:border-b lg:border-slate-100 lg:odd:border-r">
+                <Link href={i.href} className="group flex items-start gap-3 px-4 py-2.5 hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400">
+                  <Icon size={16} aria-hidden className={`mt-0.5 shrink-0 ${iconCls}`} />
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-baseline gap-2">
+                      <span className="text-[15px] font-semibold tabular-nums text-slate-900">{i.n}</span>
+                      <span className="text-[13px] font-medium text-slate-900 group-hover:text-navy-700">{i.label}</span>
+                    </span>
+                    <span className="mt-0.5 block text-xs text-slate-500">{i.why}</span>
+                  </span>
+                  <span className="hidden shrink-0 items-center gap-1 pt-0.5 text-xs text-navy-700 sm:flex">{i.next}<ArrowRight size={13} aria-hidden /></span>
+                </Link>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+/** How the records on this platform connect, with this organisation's own counts at each step. */
+function RecordChain({ d, sources, controls }: { d: any; sources: any[] | null; controls: any[] | null }) {
+  const t = d.assurance_totals as Record<string, number>;
+  const adopted = Object.values(t).reduce((a, v) => a + v, 0);
+  const out = d.applicability_outcomes as Record<string, number>;
+  const evidence = Object.values(d.evidence_conditions as Record<string, number>).reduce((a, v) => a + v, 0);
+  const n = (v: number | undefined) => (v === undefined ? "…" : v);
+  const steps = [
+    { label: "Requirements", value: `${n(sources?.length)} regulatory source(s)`, about: "Encoded from authoritative regulatory text.", href: "/sources" },
+    { label: "Applicability", value: `${out.APPLIES ?? 0} APPLIES · ${out.UNCERTAIN ?? 0} UNCERTAIN`, about: "Decides whether each requirement applies to each subject.", href: "/applicability" },
+    { label: "Obligations", value: `${adopted} adopted`, about: "Determinations a named person has attested.", href: "/obligations" },
+    { label: "Controls", value: `${n(controls?.length)} implemented`, about: "Shared controls that satisfy obligations.", href: "/controls" },
+    { label: "Evidence", value: `${evidence} artifact(s)`, about: "Test results and records proving controls operated, IPE-checked where required.", href: "/evidence" },
+    { label: "Assurance", value: `${adopted - (t.NO_SNAPSHOT ?? 0)} of ${adopted} assessed`, about: "Period states computed from everything above.", href: "/assurance" },
+  ];
+  return (
+    <Card title="How your records connect" subtitle="Each step builds on the one before it">
+      <ol className="space-y-0">
+        {steps.map((s, i) => (
+          <li key={s.label} className="relative flex gap-3 pb-3 last:pb-0">
+            {i < steps.length - 1 && <span aria-hidden className="absolute left-[9px] top-5 h-[calc(100%-12px)] w-px bg-slate-200" />}
+            <span aria-hidden className="mt-0.5 flex h-[19px] w-[19px] shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white text-[10px] font-semibold text-slate-500">{i + 1}</span>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <Link href={s.href} className="text-[13px] font-medium text-slate-900 hover:text-navy-700">{s.label}</Link>
+                <span className="text-xs tabular-nums text-slate-600">{s.value}</span>
+              </div>
+              <p className="text-[11px] leading-4 text-slate-500">{s.about}</p>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </Card>
+  );
+}
+
+function ContentOpsHome({ name }: { name: string }) {
+  return (
+    <>
+      <PageHeader kicker="Zoiko content operations" title={`Welcome, ${name.replace(/\s*\(.*\)/, "")}`}
+        subtitle="Your workspace is the shared regulatory content and rules that customer organisations receive. You are not a member of any customer organisation." />
+      <Notice>Zoiko content-operations staff have no standing access to customer data (INV-14).</Notice>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        {[{ href: "/regulatory", label: "Regulatory Inbox", hint: "Ingest sources and propose extractions", icon: Inbox },
+          { href: "/sources", label: "Sources & Provisions", hint: "Encode and verify requirements", icon: Library },
+          { href: "/rules", label: "Rule Authoring", hint: "Validate, review and release", icon: Braces },
+          { href: "/rules/workbench", label: "Rule Test Workbench", hint: "Golden vectors and synthetic fixtures", icon: FlaskConical }].map(({ href, label, hint, icon: Icon }) => (
+          <Link key={href} href={href} className="card flex items-center gap-3 p-4 transition-colors hover:border-navy-300">
+            <Icon size={18} aria-hidden className="text-navy-600" />
+            <span><span className="block text-[13px] font-medium text-slate-900">{label}</span><span className="block text-xs text-slate-500">{hint}</span></span>
+            <ArrowRight size={14} aria-hidden className="ml-auto text-slate-400" />
+          </Link>
         ))}
       </div>
-      <div className="grid gap-5 lg:grid-cols-3">
-        {[0, 1, 2].map((i) => <div key={i} className="card p-5"><div className={`${bar} h-4 w-40`} /><div className={`${bar} mt-2 h-3 w-56`} /><div className={`${bar} mt-6 h-40 w-full`} /></div>)}
-      </div>
-      <div className="card p-5"><div className={`${bar} h-4 w-32`} />{[0, 1, 2].map((i) => <div key={i} className={`${bar} mt-4 h-10 w-full`} />)}</div>
-    </div>
+    </>
   );
 }

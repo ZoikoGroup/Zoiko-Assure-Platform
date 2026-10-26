@@ -12,7 +12,7 @@ export default function FactRequests() {
   const [msg, setMsg] = useState<string | null>(null);
   return (
     <>
-      <PageHeader spec="ZA-APP-001 §9 · WF-APP-04" title="Fact requests"
+      <PageHeader spec="ZA-APP-001 §9 · WF-APP-04" title="Fact Requests"
         subtitle="UNCERTAIN evaluations raise owned, due-dated requests for the material facts that are missing, stale, conflicting or of insufficient provenance." />
       <ErrorBox error={error} />
       {msg && <div className="mb-4"><Notice tone="good">{msg}</Notice></div>}
