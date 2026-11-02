@@ -34,12 +34,14 @@ export default function ApplicabilityTrace() {
           <option value="">All outcomes</option>{OUTCOMES.map((o) => <option key={o}>{o}</option>)}
         </select>
       </>}>
-        <Table head={["Subject", "Obligation", "Outcome", "Effective at", "Cutoff", "Rule", "Trigger", "Missing facts"]} empty={evals.data !== null && rows.length === 0}>
+        <Table head={["Subject", "Obligation", "Outcome", "Current determination", "Effective at", "Cutoff", "Rule", "Trigger", "Missing facts"]} empty={evals.data !== null && rows.length === 0}>
           {rows.map((e) => (
             <tr key={e.evaluation_id}>
               <td className="td">{e.subject.display_name}</td>
               <td className="td"><A href={`/applicability/${e.evaluation_id}`}>{e.obligation_definition.key}</A></td>
               <td className="td"><Badge code={e.outcome} /></td>
+              <td className="td">{e.current_determination ? <><Badge code={e.current_determination.state} />
+                {e.current_determination.evaluation_id !== e.evaluation_id && <div className="text-[11px] text-slate-500">based on another evaluation</div>}</> : "—"}</td>
               <td className="td text-xs">{fmtDate(e.effective_at, true)}</td>
               <td className="td mono text-xs">#{e.record_cutoff_seq}</td>
               <td className="td mono text-xs">v{e.rule_version.version}</td>

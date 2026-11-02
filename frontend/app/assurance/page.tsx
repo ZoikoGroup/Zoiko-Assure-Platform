@@ -29,19 +29,19 @@ export default function Assurance() {
     { key: "subject", header: "Subject", sortValue: (o) => o.subject.display_name, render: (o) => <span className="text-slate-600">{o.subject.display_name}</span> },
     { key: "state", header: "State", sortValue: (o) => o.latest_snapshot?.state ?? "~",
       render: (o) => o.latest_snapshot ? <Badge code={o.latest_snapshot.state} /> : <Badge code="NOT_EVALUATED" label="NOT ASSESSED" /> },
-    { key: "period", header: "Period", sortValue: (o) => o.latest_snapshot?.period_from ?? "",
+    { key: "period", header: "Period (end exclusive)", sortValue: (o) => o.latest_snapshot?.period_from ?? "",
       render: (o) => o.latest_snapshot ? <span className="whitespace-nowrap text-xs text-slate-600">{fmtDate(o.latest_snapshot.period_from)} → {fmtDate(o.latest_snapshot.period_to)}</span> : "—" },
     { key: "perspective", header: "Perspective", render: (o) => <span className="mono text-[11px] text-slate-600">{o.latest_snapshot?.perspective ?? "—"}</span> },
-    { key: "cutoff", header: "Record cutoff", render: (o) => <span className="mono text-[11px] text-slate-600">{o.latest_snapshot?.record_cutoff_seq != null ? `seq ${o.latest_snapshot.record_cutoff_seq}` : o.latest_snapshot ? "current" : "—"}</span> },
+    { key: "cutoff", header: "Record cutoff", render: (o) => <span className="mono text-[11px] text-slate-600">{o.latest_snapshot?.record_cutoff_seq != null ? `#${o.latest_snapshot.record_cutoff_seq}` : o.latest_snapshot ? "Not recorded" : "—"}</span> },
     { key: "exc", header: "Exceptions", sortValue: (o) => o.open_exceptions ?? 0,
-      render: (o) => o.open_exceptions ? <Badge tone="exception" label={`${o.open_exceptions} APPROVED`} title="Shown beside the state; never changes it" /> : <span className="text-xs text-slate-400">None</span> },
-    { key: "snap", header: "Snapshot", render: (o) => o.latest_snapshot ? <span className="text-xs text-slate-500">{fmtDate(o.latest_snapshot.created_at, true)}</span> : "—" },
+      render: (o) => o.open_exceptions ? <Badge tone="exception" label={`${o.open_exceptions} APPROVED`} title="Shown beside the state; never changes it" /> : <span className="text-xs text-slate-500">None</span> },
+    { key: "snap", header: "Snapshot frozen", render: (o) => o.latest_snapshot ? <span className="text-xs text-slate-500">{fmtDate(o.latest_snapshot.created_at, true)}</span> : "—" },
   ];
 
   return (
     <>
       <PageHeader spec="WF-STA-05 · WF-TIM-04 · ZA-STA-001" title="Assurance Periods"
-        subtitle="Latest period assurance snapshot for each adopted obligation. States are computed by the backend roll-up over frozen inputs; they cannot be edited here."
+        subtitle="The most recently frozen period assurance snapshot for each adopted obligation. Periods and record cutoffs can differ between rows. States are computed by the backend roll-up over frozen inputs; they cannot be edited here."
         actions={<>
           <EntitySelector entities={org.data?.entities ?? []} value={entity} onChange={setEntity} className="w-56" />
           <Select aria-label="Filter by state" options={STATE_FILTER} value={state} onChange={(e) => setState(e.target.value)} className="w-44" />

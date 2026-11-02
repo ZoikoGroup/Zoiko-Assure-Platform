@@ -1,61 +1,65 @@
 "use client";
 
-import { useState } from "react";
-import { API, ApiError, api, download, useApi } from "@/lib/api";
+import { useId, useState } from "react";
+import { API, api, download, responseError, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { Badge, Card, ErrorBox, Hash, Json, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { Badge, Card, ErrorBox, Hash, Json, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 export default function Packages() {
   const { data, error, reload } = useApi<any[]>("/packages");
   const { data: org } = useApi<any>("/org/tenant");
   const { data: obls } = useApi<any[]>("/obligations");
   const { data: pk } = useApi<any>("/trust/public-key");
-  const [f, setF] = useState({ entity_id: "", period_from: "2026-07-01", period_to: "2026-10-01", include_payloads: true });
+  const [f, setF] = useState({ entity_id: "", period_from: "", period_to: "", include_payloads: true });
   const [sel, setSel] = useState<string[]>([]);
   const a = useAction();
   const vr = useAction();
+  const { can, why } = useCan();
+  const fid = useId();
   const [file, setFile] = useState<File | null>(null);
   const entObls = (obls || []).filter((o) => o.entity_id === f.entity_id && o.latest_snapshot);
   const verifyUpload = () => vr.run(async () => {
     const fd = new FormData(); fd.append("file", file!);
     const res = await fetch(`${API}/packages/verify-upload`, { method: "POST", body: fd });
-    const body = await res.json();
-    if (!res.ok) throw new ApiError(res.status, body?.detail ?? body);
-    return body;
+    if (!res.ok) throw await responseError(res);
+    return res.json();
   });
   return (
     <>
       <PageHeader spec="ZA-EVD-001 §12 · WF-EVD-05/06" title="Audit Package Builder"
         subtitle="Signed, self-describing zip packages with snapshots, evaluations, IPE statements, evidence, ledger proofs and a manifest. Anyone can verify them offline with the open verifier." />
+      <PermissionNote perms={["package"]} />
       <ErrorBox error={error} />
       <div className="grid gap-4 xl:grid-cols-3">
         <Card className="xl:col-span-2" title="Build package">
           <ErrorBox error={a.error} />
           <div className="grid gap-3 sm:grid-cols-3">
-            <div><label className="label">Legal entity</label><select className="input" value={f.entity_id} onChange={(e) => { setF({ ...f, entity_id: e.target.value }); setSel([]); }}>
+            <div><label className="label" htmlFor={`${fid}-entity`}>Legal entity (required)</label><select id={`${fid}-entity`} required className="input" value={f.entity_id} onChange={(e) => { setF({ ...f, entity_id: e.target.value }); setSel([]); }}>
               <option value="">Select…</option>{org?.entities.map((e: any) => <option key={e.entity_id} value={e.entity_id}>{e.legal_name}</option>)}</select></div>
-            <div><label className="label">Period from</label><input type="date" className="input" value={f.period_from} onChange={(e) => setF({ ...f, period_from: e.target.value })} /></div>
-            <div><label className="label">Period to</label><input type="date" className="input" value={f.period_to} onChange={(e) => setF({ ...f, period_to: e.target.value })} /></div>
+            <div><label className="label" htmlFor={`${fid}-from`}>Period from (required)</label><input id={`${fid}-from`} type="date" required className="input" value={f.period_from} onChange={(e) => setF({ ...f, period_from: e.target.value })} /></div>
+            <div><label className="label" htmlFor={`${fid}-to`}>Period to (required)</label><input id={`${fid}-to`} type="date" required className="input" value={f.period_to} onChange={(e) => setF({ ...f, period_to: e.target.value })} /></div>
           </div>
-          <div className="mt-3"><label className="label">Obligations (latest frozen snapshot is included)</label>
+          <fieldset className="mt-3"><legend className="label">Obligations (required; each one&apos;s most recently frozen snapshot is included, whatever period it covers)</legend>
             {f.entity_id && !entObls.length && <p className="text-xs text-slate-500">No obligations with snapshots for this entity.</p>}
             {entObls.map((o) => (
               <label key={o.lineage_id} className="flex items-center gap-2 py-1 text-sm">
                 <input type="checkbox" checked={sel.includes(o.lineage_id)} onChange={(e) => setSel(e.target.checked ? [...sel, o.lineage_id] : sel.filter((x) => x !== o.lineage_id))} />
                 {o.definition.title} <Badge code={o.latest_snapshot.state} />
+                <span className="text-xs text-slate-500">{fmtDate(o.latest_snapshot.period_from)} → {fmtDate(o.latest_snapshot.period_to)} · <span className="mono">{o.latest_snapshot.perspective}</span> · cutoff #{o.latest_snapshot.record_cutoff_seq}</span>
               </label>
             ))}
-          </div>
+          </fieldset>
           <label className="mt-2 flex items-center gap-2 text-sm"><input type="checkbox" checked={f.include_payloads} onChange={(e) => setF({ ...f, include_payloads: e.target.checked })} />Include decrypted evidence payloads</label>
-          <div className="mt-4"><button className="btn-primary" disabled={!f.entity_id || !sel.length || a.busy} onClick={() => a.run(async () => {
+          <div className="mt-4"><button className="btn-primary" disabled={!can("package") || !f.entity_id || !f.period_from || !f.period_to || !sel.length || a.busy} title={why("package")} onClick={() => a.run(async () => {
             await api("/packages", { method: "POST", json: { ...f, period_from: new Date(f.period_from).toISOString(), period_to: new Date(f.period_to).toISOString(), obligation_lineage_ids: sel } }); reload();
           })}>{a.busy ? "Building & signing…" : "Build signed package"}</button></div>
         </Card>
         <Card title="Independent verification" subtitle="Upload any package. It is checked with the same logic as the standalone verifier (backend/verifier/verify_package.py), with no login or tenant secret.">
           <ErrorBox error={vr.error} />
-          <input type="file" accept=".zip" className="input" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+          <input type="file" accept=".zip" aria-label="Package file to verify (.zip)" className="input" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
           <button className="btn-primary mt-2" disabled={!file || vr.busy} onClick={verifyUpload}>Verify upload</button>
-          {pk && <details className="mt-3"><summary className="cursor-pointer text-xs text-navy-700">Trust anchor: {pk.signer_key_id}</summary><pre className="mono mt-1 whitespace-pre-wrap break-all text-[10px]">{pk.public_key_pem}</pre></details>}
+          {pk && <details className="mt-3"><summary className="cursor-pointer text-xs text-navy-700">Trust anchor: {pk.signer_key_id}</summary><pre className="mono mt-1 whitespace-pre-wrap break-all text-[11px]">{pk.public_key_pem}</pre></details>}
         </Card>
       </div>
       {vr.result && <div className="mt-4"><VerifyReport r={vr.result} /></div>}
@@ -90,7 +94,7 @@ function PackageRow({ p }: { p: any }) {
 function VerifyReport({ r }: { r: any }) {
   const steps: any[] = r.steps || [];
   return (
-    <Card title="Verification report" actions={<Badge code={r.result ?? (r.ok ? "VERIFIED" : "FAILED")} />}>
+    <Card title="Verification report" actions={r.result ? <Badge code={r.result} /> : <span className="text-xs text-slate-500">No result returned</span>}>
       {r.warnings?.length > 0 && <Notice tone="warn">{r.warnings.join(" · ")}</Notice>}
       {r.reason_codes?.length > 0 && <p className="my-2 mono text-xs text-red-700">{r.reason_codes.join(", ")}</p>}
       {steps.length ? (

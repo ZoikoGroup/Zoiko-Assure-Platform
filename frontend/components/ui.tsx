@@ -5,15 +5,17 @@ import { createContext, useCallback, useContext, useEffect, useId, useMemo, useR
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, RefObject, SelectHTMLAttributes } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
-  AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Building2, CheckCircle2, ChevronRight, CircleDashed, Flag, Inbox, Info, Loader2,
+  AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Building2, CheckCircle2, ChevronRight, CircleDashed, Flag, HelpCircle, Inbox, Info, Loader2,
   MinusCircle, Search, ShieldAlert, X, XCircle,
 } from "lucide-react";
-import { errText } from "@/lib/api";
+import { useAuth } from "@/lib/actor";
+import { ApiError, errText } from "@/lib/api";
 import { short } from "@/lib/format";
+import { permissionText, rolesText } from "@/lib/roles";
 
 /* ================================================================ controlled status
    State semantics are conveyed by icon + text + colour — never colour alone (ZA-GLS-001 §11). */
-type Tone = "good" | "warn" | "bad" | "review" | "neutral" | "info" | "exception";
+type Tone = "good" | "warn" | "bad" | "review" | "neutral" | "info" | "exception" | "unknown";
 const TONE: Record<Tone, { cls: string; icon: LucideIcon; iconCls: string }> = {
   good: { cls: "bg-emerald-50 text-emerald-800 ring-emerald-200", icon: CheckCircle2, iconCls: "text-emerald-600" },
   warn: { cls: "bg-amber-50 text-amber-800 ring-amber-200", icon: CircleDashed, iconCls: "text-amber-600" },
@@ -22,18 +24,27 @@ const TONE: Record<Tone, { cls: string; icon: LucideIcon; iconCls: string }> = {
   neutral: { cls: "bg-slate-100 text-slate-700 ring-slate-200", icon: MinusCircle, iconCls: "text-slate-500" },
   info: { cls: "bg-navy-50 text-navy-800 ring-navy-200", icon: Info, iconCls: "text-navy-600" },
   exception: { cls: "bg-brand-50 text-brand-800 ring-brand-200", icon: ShieldAlert, iconCls: "text-brand-600" },
+  // A code this interface has no meaning for (ZA-GLS-001 GLS-REQ-015): neutral, dashed and marked, never mapped to a known state.
+  unknown: { cls: "bg-white text-slate-700 ring-transparent outline-1 outline-dashed outline-slate-400 -outline-offset-1", icon: HelpCircle, iconCls: "text-slate-500" },
 };
 
-const GOOD = ["PROVEN", "OPERATING", "APPLIES", "VERIFIED", "IPE_VERIFIED", "CURRENT", "PASS", "ADOPTED", "CERTIFIED", "SATISFIED",
-  "TRUE", "PERMIT", "SUCCESS", "HEALTHY", "RESOLVED", "CLOSED", "ACTIVE", "ATTESTED", "PUBLISHED", "GENERAL_AVAILABILITY", "ENCODED", "OK", "PASSED", "KNOWN", "APPROVED"];
+const GOOD = ["PROVEN", "OPERATING", "VERIFIED", "IPE_VERIFIED", "CURRENT", "PASS", "ADOPTED", "CERTIFIED", "SATISFIED",
+  "PERMIT", "SUCCESS", "HEALTHY", "RESOLVED", "CLOSED", "ACTIVE", "ATTESTED", "PUBLISHED", "GENERAL_AVAILABILITY", "ENCODED", "OK", "PASSED", "KNOWN", "APPROVED"];
 const WARN = ["NOT_PROVEN", "NOT_EVALUATED", "UNCERTAIN", "INCONCLUSIVE", "IPE_INCONCLUSIVE", "STALE", "UNKNOWN", "DEGRADED", "PARTIAL",
   "PENDING_APPROVAL", "OPEN", "MISSING", "UNVERIFIED", "TSA_PENDING", "PRIVATE_BETA", "MONITORING_ONLY", "PENDING_VERIFICATION",
   "VALIDATION_FAILED", "UNASSESSED", "PENDING_REVIEW", "PAYLOAD_NOT_AVAILABLE", "UNAVAILABLE", "DRAFT", "PROPOSED", "AI_EXTRACTED", "TRIAGED", "IN_REMEDIATION", "IN_PROGRESS", "PASS_WITH_WARNINGS", "WARN", "NEVER_RUN"];
-const BAD = ["FAILING", "FAIL", "FAILED", "IPE_FAILED", "INVALID", "REJECTED", "DENY", "UNSATISFIED", "FALSE", "ERROR", "REVOKED",
+const BAD = ["FAILING", "FAIL", "FAILED", "IPE_FAILED", "INVALID", "REJECTED", "DENY", "UNSATISFIED", "ERROR", "REVOKED",
   "SUSPENDED", "INTEGRITY_FAILED", "CRITICAL", "INVALIDATED", "MISSED"];
 const REVIEW = ["REQUIRES_REVIEW", "CONFLICTING", "IN_REVIEW", "CONFLICT", "REVIEW", "REVIEW_REQUIRED", "SOURCE_CONFLICT"];
 const NEUTRAL = ["DOES_NOT_APPLY", "NOT_REQUIRED", "IPE_NOT_REQUIRED", "SUPERSEDED", "ERASED", "NOT_BINDING",
-  "WITHDRAWN", "EXPIRED", "CANCELLED", "RETIRED", "DISABLED", "PLANNED", "NOT_COVERED", "DEPRECATED", "RESTRICTED"];
+  "WITHDRAWN", "EXPIRED", "CANCELLED", "RETIRED", "DISABLED", "PLANNED", "NOT_COVERED", "DEPRECATED", "RESTRICTED",
+  "FALSE"];  // a predicate evaluating false is logic, not a failure
+/* Recognised codes with no success/failure meaning. An applicability outcome is not a health result (it is shown beside
+   the determination state, which carries the workflow colour), nor is a trace predicate evaluating true. The rest are
+   backend codes that render with informational styling: content lifecycle steps, test SKIPPED, rule RELEASE_READY,
+   package SIGNED, source-run RECONCILING, change class CORRECTION, rights classes and semantic origins. */
+const INFO = ["APPLIES", "TRUE", "DISCOVERED", "INGESTED", "CLASSIFIED", "SKIPPED", "RELEASE_READY", "SIGNED", "RECONCILING", "CORRECTION",
+  "OFFICIAL_REUSE_PERMITTED", "REFERENCE_ONLY", "AI_PROPOSED", "ZOIKO_ENCODED", "CUSTOMER_ATTESTED"];
 
 export function toneOf(code?: string | null): Tone {
   if (!code) return "neutral";
@@ -42,7 +53,8 @@ export function toneOf(code?: string | null): Tone {
   if (BAD.includes(code)) return "bad";
   if (REVIEW.includes(code)) return "review";
   if (NEUTRAL.includes(code)) return "neutral";
-  return "info";
+  if (INFO.includes(code)) return "info";
+  return "unknown";
 }
 
 export function toneIcon(code?: string | null, tone?: Tone) {
@@ -51,12 +63,16 @@ export function toneIcon(code?: string | null, tone?: Tone) {
 }
 
 export function StatusPill({ code, tone, label, title }: { code?: string | null; tone?: Tone; label?: string; title?: string }) {
-  const t = TONE[tone ?? toneOf(code)];
+  const resolved = tone ?? toneOf(code);
+  const t = TONE[resolved];
   const Icon = t.icon;
+  const unknown = resolved === "unknown";
   return (
-    <span title={title ?? code ?? ""} className={`inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ring-inset ${t.cls}`}>
+    <span title={title ?? (unknown ? `Unrecognised code “${code}”: shown as received, because this version of the interface has no meaning for it.` : code ?? "")}
+      className={`inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ring-inset ${t.cls}`}>
       <Icon size={12} aria-hidden className="shrink-0" />
       <span className="mono tracking-tight">{label ?? code ?? "—"}</span>
+      {unknown && <span className="sr-only"> (unrecognised code)</span>}
     </span>
   );
 }
@@ -65,6 +81,23 @@ export const Badge = StatusPill;
 
 export function ExceptionBadge({ state, until }: { state: string; until?: string }) {
   return <StatusPill tone="exception" label={`EXCEPTION ${state}${until ? " · until " + until.slice(0, 10) : ""}`} />;
+}
+
+/* Content coverage mode (ZA-GLS-001 coverage_mode; meanings from the backend dictionary). Binding applicability needs
+   both the obligation definition and its rule version to be ENCODED, so monitoring-only content must stay visible
+   (GLS-REQ-018). Shown exactly as recorded: a missing value says so and is never defaulted or inferred. */
+const COVERAGE_MEANING: Record<string, string> = {
+  ENCODED: "Provision-level content and applicability logic maintained.",
+  MONITORING_ONLY: "Change monitoring only; must not produce binding applicability.",
+  NOT_COVERED: "No supported coverage commitment.",
+  RETIRED: "Previously supported coverage no longer maintained.",
+};
+
+export function CoverageBadge({ mode, showMeaning = false }: { mode?: string | null; showMeaning?: boolean }) {
+  if (!mode) return <span className="text-xs text-slate-500">Not provided</span>;
+  const meaning = COVERAGE_MEANING[mode];
+  const badge = <StatusPill code={mode} title={meaning ? `Coverage mode ${mode}: ${meaning}` : undefined} />;
+  return showMeaning && meaning ? <span className="inline-flex flex-col items-start gap-0.5">{badge}<span className="text-[11px] text-slate-500">{meaning}</span></span> : badge;
 }
 
 /* ================================================================ buttons & form controls */
@@ -120,9 +153,31 @@ export function Field({ label, htmlFor, hint, children, className = "" }: { labe
     <div className={className}>
       <label className="label" htmlFor={htmlFor}>{label}</label>
       {children}
-      {hint && <p className="mt-1 text-[11px] text-slate-500">{hint}</p>}
+      {hint && <p id={htmlFor ? `${htmlFor}-hint` : undefined} className="mt-1 text-[11px] text-slate-500">{hint}</p>}
     </div>
   );
+}
+
+/** Reason for a governed action. A required reason must contain text: after a submit attempt with only blanks the field
+ *  is marked invalid and linked to the message. Callers trim the value before sending it and never substitute a default. */
+export function ReasonField({ id, label, required, value, onChange, showError, inputRef, rows = 2, className = "" }: {
+  id: string; label: string; required: boolean; value: string; onChange: (v: string) => void; showError: boolean;
+  inputRef?: RefObject<HTMLTextAreaElement | null>; rows?: number; className?: string;
+}) {
+  return (
+    <div className={className}>
+      <label className="label" htmlFor={id}>{label}</label>
+      <textarea ref={inputRef} id={id} className="input" rows={rows} value={value} onChange={(e) => onChange(e.target.value)}
+        required={required} aria-invalid={showError} aria-describedby={showError ? `${id}-error` : undefined} />
+      {showError && <p id={`${id}-error`} className="mt-1.5 text-[12px] leading-5 text-red-700">Enter a reason. Blank or whitespace-only text is not accepted.</p>}
+    </div>
+  );
+}
+
+/** Field-level validation message in the ReasonField style. The control points at it with
+ *  aria-describedby={`${id}-error`} and sets aria-invalid while a message is shown; nothing renders without one. */
+export function FieldError({ id, message }: { id: string; message?: string | false | null }) {
+  return message ? <p id={`${id}-error`} className="mt-1.5 text-[12px] leading-5 text-red-700">{message}</p> : null;
 }
 
 /** Legal-entity filter. "" means all entities in the tenant. */
@@ -142,16 +197,17 @@ export function EntitySelector({ entities, value, onChange, allLabel = "All lega
 }
 
 /** Half-open period [from, to): the end date is exclusive, matching the assurance period model. */
-export function PeriodSelector({ from, to, onChange, fromLabel = "Period from", toLabel = "Period to (exclusive)" }:
-  { from: string; to: string; onChange: (from: string, to: string) => void; fromLabel?: string; toLabel?: string }) {
+export function PeriodSelector({ from, to, onChange, fromLabel = "Period from", toLabel = "Period to (exclusive)", required = false }:
+  { from: string; to: string; onChange: (from: string, to: string) => void; fromLabel?: string; toLabel?: string; required?: boolean }) {
   const id = useId();
   const invalid = !!from && !!to && to <= from;
+  const req = required ? " (required)" : "";
   return (
     <fieldset className="contents">
       <legend className="sr-only">Assurance period</legend>
-      <Field label={fromLabel} htmlFor={`${id}-from`}><input id={`${id}-from`} type="date" className="input" value={from} onChange={(e) => onChange(e.target.value, to)} /></Field>
-      <Field label={toLabel} htmlFor={`${id}-to`} hint={invalid ? <span className="text-red-700">The end must be after the start.</span> : undefined}>
-        <input id={`${id}-to`} type="date" className="input" value={to} aria-invalid={invalid} onChange={(e) => onChange(from, e.target.value)} />
+      <Field label={fromLabel + req} htmlFor={`${id}-from`}><input id={`${id}-from`} type="date" required={required} className="input" value={from} onChange={(e) => onChange(e.target.value, to)} /></Field>
+      <Field label={toLabel + req} htmlFor={`${id}-to`} hint={invalid ? <span className="text-red-700">The end must be after the start.</span> : undefined}>
+        <input id={`${id}-to`} type="date" required={required} className="input" value={to} aria-invalid={invalid} aria-describedby={invalid ? `${id}-to-hint` : undefined} onChange={(e) => onChange(from, e.target.value)} />
       </Field>
     </fieldset>
   );
@@ -249,7 +305,7 @@ export function PageHeader({ title, subtitle, actions, spec, kicker }: { title: 
           {kicker && <div data-za="page-context" className="mb-1 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">{kicker}</div>}
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-xl font-semibold tracking-tight text-slate-900">{title}</h1>
-            {spec && <span title="Governing specification" className="mono rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500">{spec}</span>}
+            {spec && <span title="Governing specification" className="mono rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] text-slate-500">{spec}</span>}
           </div>
           {subtitle && <p className="mt-1 max-w-3xl text-[13px] leading-5 text-slate-500">{subtitle}</p>}
         </div>
@@ -259,21 +315,32 @@ export function PageHeader({ title, subtitle, actions, spec, kicker }: { title: 
   );
 }
 
-export function Tabs({ tabs, value, onChange }: { tabs: string[]; value: string; onChange: (t: string) => void }) {
+/* Tabs and their panel share an `id` (from useId) so the selected tab points at the panel and the panel is labelled by
+   the tab. Only the selected tab's panel is rendered, so only that tab carries aria-controls. */
+const tabId = (id: string, t: string) => `${id}-tab-${t.replace(/[^A-Za-z0-9]+/g, "-")}`;
+
+export function Tabs({ id, tabs, value, onChange }: { id?: string; tabs: string[]; value: string; onChange: (t: string) => void }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const move = (i: number) => { const n = (i + tabs.length) % tabs.length; onChange(tabs[n]); refs.current[n]?.focus(); };
+  const keys: Record<string, (i: number) => void> = { ArrowRight: (i) => move(i + 1), ArrowLeft: (i) => move(i - 1), Home: () => move(0), End: () => move(tabs.length - 1) };
   return (
     <div role="tablist" className="mb-4 flex flex-wrap gap-4 border-b border-slate-200">
       {tabs.map((t, i) => (
         <button key={t} ref={(el) => { refs.current[i] = el; }} role="tab" type="button" aria-selected={value === t} tabIndex={value === t ? 0 : -1}
+          id={id ? tabId(id, t) : undefined} aria-controls={id && value === t ? `${id}-panel` : undefined}
           onClick={() => onChange(t)}
-          onKeyDown={(e) => { if (e.key === "ArrowRight") { e.preventDefault(); move(i + 1); } if (e.key === "ArrowLeft") { e.preventDefault(); move(i - 1); } }}
+          onKeyDown={(e) => { const k = keys[e.key]; if (k) { e.preventDefault(); k(i); } }}
           className={`-mb-px border-b-2 pb-2 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 ${value === t ? "border-navy-700 text-navy-800" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
           {t}
         </button>
       ))}
     </div>
   );
+}
+
+/** The selected tab's content. Focusable so keyboard users can move from the tab list straight into the panel. */
+export function TabPanel({ id, value, children }: { id: string; value: string; children: ReactNode }) {
+  return <div role="tabpanel" id={`${id}-panel`} aria-labelledby={tabId(id, value)} tabIndex={0}>{children}</div>;
 }
 
 /* ================================================================ tables */
@@ -370,13 +437,40 @@ export function ErrorState({ error, title = "Something went wrong" }: { error: u
   return (
     <div role="alert" className="mb-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[13px] text-red-800">
       <AlertCircle size={15} aria-hidden className="mt-0.5 shrink-0 text-red-600" />
-      <div><span className="sr-only">{title}: </span>{errText(error)}</div>
+      <div>
+        <span className="sr-only">{title}: </span>{errText(error)}
+        {error instanceof ApiError && error.reference && (
+          <div className="mt-0.5 text-[12px]">{error.reference.label}: <span className="mono select-all break-all">{error.reference.value}</span></div>
+        )}
+      </div>
     </div>
   );
 }
 /** Back-compatible name used across pages. */
 export function ErrorBox({ error }: { error: unknown }) {
   return <ErrorState error={error} />;
+}
+
+/** Polite live region for the result of an action (WCAG 4.1.3). It stays mounted, so a result rendered into it later is
+ *  announced once. Static explanatory notices stay outside it so they are not re-announced; errors use ErrorState's alert. */
+export function LiveRegion({ children }: { children?: ReactNode }) {
+  return <div role="status">{children}</div>;
+}
+
+/** Visible reason for buttons disabled by role, so it does not rely on a `title` tooltip that keyboard and touch users
+ *  cannot open. Each entry is a permission, or a list of which any one is enough. Display only; the backend decides. */
+export function PermissionNote({ perms, className = "mb-4" }: { perms: (string | string[])[]; className?: string }) {
+  const { me } = useAuth();
+  const missing = perms.map((p) => (Array.isArray(p) ? p : [p])).filter((any) => !any.some((p) => me?.permissions?.includes(p)));
+  if (!me || !missing.length) return null;
+  return (
+    <div className={className}>
+      <Notice>
+        Your role ({rolesText(me) || "none"}) does not include the permissions below, so the actions on this page that need them are disabled:
+        <ul className="mt-1 list-disc pl-5">{missing.map((any) => <li key={any.join("|")}>{any.map(permissionText).join(" or ")}</li>)}</ul>
+      </Notice>
+    </div>
+  );
 }
 
 export function Notice({ children, tone = "info" }: { children: ReactNode; tone?: "info" | "warn" | "good" }) {
@@ -391,14 +485,33 @@ export function Notice({ children, tone = "info" }: { children: ReactNode; tone?
 }
 
 /* ================================================================ small display helpers */
+/** Abbreviated digest or identifier. The toggle reports its expanded state; the full value can then be copied, with the
+ *  outcome announced through a status message. Used for IDs as well as digests, so its name stays neutral. */
 export function Hash({ value, n = 12 }: { value?: string | null; n?: number }) {
   const [full, setFull] = useState(false);
+  const [copied, setCopied] = useState<"" | "ok" | "fail">("");
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(""), 4000);
+    return () => clearTimeout(t);
+  }, [copied]);
   if (!value) return <span>—</span>;
+  const shown = full ? value : short(value, n);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(value); setCopied("ok"); } catch { setCopied("fail"); }
+  };
   return (
-    <button type="button" onClick={() => setFull(!full)} title="Show full digest (a digest alone does not prove completeness or legal truth)"
-      className="mono rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-700 hover:bg-slate-200">
-      {full ? value : short(value, n)}
-    </button>
+    <>
+      <button type="button" onClick={() => setFull(!full)} aria-expanded={full} aria-label={`${full ? "Full value" : "Abbreviated value"} ${shown}`}
+        title="Show full digest (a digest alone does not prove completeness or legal truth)"
+        className="mono rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-700 hover:bg-slate-200">
+        {shown}
+      </button>
+      {full && <>
+        <button type="button" onClick={copy} aria-label="Copy full value" className="ml-1 rounded px-1 text-[11px] font-medium text-navy-700 hover:underline">Copy</button>
+        <span role="status" className="ml-1 text-[11px] text-slate-500">{copied === "ok" ? "Copied" : copied === "fail" ? "Copy failed. Select the value and copy it manually." : ""}</span>
+      </>}
+    </>
   );
 }
 
@@ -410,12 +523,23 @@ export function A({ href, children }: { href: string; children: ReactNode }) {
   return <Link href={href} className="font-medium text-navy-700 underline-offset-2 hover:text-navy-900 hover:underline">{children}</Link>;
 }
 
+/** Shown on hover or focus (WCAG 1.4.13): Escape dismisses it without moving focus or the pointer, and the gap to the
+ *  bubble is padding, so the pointer can move onto it without it closing. It never takes focus. */
 export function Tooltip({ content, children, side = "top" }: { content: ReactNode; children: ReactNode; side?: "top" | "right" | "bottom" }) {
-  const pos = side === "right" ? "left-full top-1/2 ml-2 -translate-y-1/2" : side === "bottom" ? "left-1/2 top-full mt-1.5 -translate-x-1/2" : "bottom-full left-1/2 mb-1.5 -translate-x-1/2";
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+  const pos = side === "right" ? "left-full top-1/2 pl-2 -translate-y-1/2" : side === "bottom" ? "left-1/2 top-full pt-1.5 -translate-x-1/2" : "bottom-full left-1/2 pb-1.5 -translate-x-1/2";
   return (
-    <span className="group/tt relative inline-flex">
+    <span className="relative inline-flex" onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)} onFocus={() => setOpen(true)} onBlur={() => setOpen(false)}>
       {children}
-      <span role="tooltip" className={`pointer-events-none absolute z-50 hidden whitespace-nowrap rounded bg-slate-900 px-2 py-1 text-[11px] font-medium text-white shadow group-hover/tt:block group-focus-within/tt:block ${pos}`}>{content}</span>
+      <span role="tooltip" className={`absolute z-50 ${open ? "block" : "hidden"} ${pos}`}>
+        <span className="block whitespace-nowrap rounded bg-slate-900 px-2 py-1 text-[11px] font-medium text-white shadow">{content}</span>
+      </span>
     </span>
   );
 }
@@ -433,7 +557,9 @@ function useDialog(open: boolean, onClose: () => void, panel: RefObject<HTMLDivE
     const token = {};
     openDialogs.push(token);
     const prev = document.activeElement as HTMLElement | null;
-    const first = panel.current?.querySelector<HTMLElement>(FOCUSABLE);
+    // Start in the content, not on the header's Close button: the first field of a form, or the first button of a
+    // confirmation, which is always Cancel, the least destructive choice. Content with nothing focusable focuses the panel.
+    const first = panel.current?.querySelector("[data-dialog-body]")?.querySelector<HTMLElement>(FOCUSABLE);
     (first ?? panel.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (openDialogs[openDialogs.length - 1] !== token) return;
@@ -469,7 +595,7 @@ export function Modal({ open, onClose, title, children, size = "md" }: { open: b
           <h3 id={titleId} className="text-sm font-semibold text-slate-900">{title}</h3>
           <IconButton label="Close" icon={X} onClick={onClose} />
         </header>
-        <div className="p-4">{children}</div>
+        <div className="p-4" data-dialog-body>{children}</div>
       </div>
     </div>
   );
@@ -489,9 +615,38 @@ export function Drawer({ open, onClose, title, children, side = "right", width =
           <h3 id={titleId} className="text-sm font-semibold text-slate-900">{title}</h3>
           <IconButton label="Close" icon={X} onClick={onClose} />
         </header>
-        <div className="scroll-thin flex-1 overflow-y-auto p-4">{children}</div>
+        <div className="scroll-thin flex-1 overflow-y-auto p-4" data-dialog-body>{children}</div>
       </div>
     </div>
+  );
+}
+
+/** Confirmation step for a consequential action. Cancel, Escape, the close button and the backdrop send nothing. While
+ *  the request runs, both buttons are disabled and the dialog stays open; an API error is shown in place for a retry. */
+export function ConfirmDialog({ title, children, confirm, busyLabel = "Submitting…", danger = false, onConfirm, onClose }: {
+  title: string; children: ReactNode; confirm: string; busyLabel?: string; danger?: boolean;
+  onConfirm: () => Promise<unknown>; onClose: () => void;
+}) {
+  const a = useAction();
+  const busy = useRef(false);  // blocks a second confirm in the same tick, before `a.busy` disables the button
+  const close = () => { if (!busy.current) onClose(); };
+  const submit = () => {
+    if (busy.current) return;
+    busy.current = true;
+    a.run(async () => {
+      try { await onConfirm(); } finally { busy.current = false; }
+      onClose();
+    });
+  };
+  return (
+    <Modal open onClose={close} title={title} size="sm">
+      <div className="space-y-2 text-[13px] text-slate-700">{children}</div>
+      {!!a.error && <div className="mt-3"><ErrorBox error={a.error} /></div>}
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" className="btn-ghost" disabled={a.busy} onClick={close}>Cancel</button>
+        <button type="button" className={danger ? "btn-danger" : "btn-primary"} disabled={a.busy} aria-busy={a.busy} onClick={submit}>{a.busy ? busyLabel : confirm}</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -500,20 +655,24 @@ export function Dropdown({ button, label, children, align = "right", buttonClass
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const btn = useRef<HTMLButtonElement>(null);
+  const panelId = useId();
   const close = useCallback(() => { setOpen(false); btn.current?.focus(); }, []);
+  // Disclosure pattern: the panel holds ordinary links and buttons reached with Tab, so no menu role or arrow keys.
+  // Escape closes and returns focus to the button; tabbing out or clicking outside closes it too.
   useEffect(() => {
     if (!open) return;
-    const onDown = (e: MouseEvent) => { if (root.current && !root.current.contains(e.target as Node)) setOpen(false); };
+    const outside = (e: Event) => { if (root.current && !root.current.contains(e.target as Node)) setOpen(false); };
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close(); };
-    document.addEventListener("mousedown", onDown);
+    document.addEventListener("mousedown", outside);
+    document.addEventListener("focusin", outside);
     document.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+    return () => { document.removeEventListener("mousedown", outside); document.removeEventListener("focusin", outside); document.removeEventListener("keydown", onKey); };
   }, [open, close]);
   return (
     <div ref={root} className="relative">
-      <button ref={btn} type="button" aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)} className={buttonClassName}>{button}</button>
+      <button ref={btn} type="button" aria-label={label} aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen(!open)} className={buttonClassName}>{button}</button>
       {open && (
-        <div role="menu" className={`absolute z-40 mt-1.5 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg ${align === "right" ? "right-0" : "left-0"} ${menuClassName}`}>
+        <div id={panelId} className={`absolute z-40 mt-1.5 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg ${align === "right" ? "right-0" : "left-0"} ${menuClassName}`}>
           {typeof children === "function" ? children(close) : children}
         </div>
       )}
@@ -522,9 +681,9 @@ export function Dropdown({ button, label, children, align = "right", buttonClass
 }
 
 export function DropdownItem({ icon: Icon, children, onClick, href, danger }: { icon?: LucideIcon; children: ReactNode; onClick?: () => void; href?: string; danger?: boolean }) {
-  const cls = `flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] focus-visible:bg-slate-50 focus-visible:outline-none ${danger ? "text-red-700 hover:bg-red-50" : "text-slate-700 hover:bg-slate-50"}`;
+  const cls = `flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400 ${danger ? "text-red-700 hover:bg-red-50" : "text-slate-700 hover:bg-slate-50"}`;
   const inner = <>{Icon && <Icon size={15} aria-hidden className={danger ? "" : "text-slate-400"} />}{children}</>;
-  return href ? <Link role="menuitem" href={href} onClick={onClick} className={cls}>{inner}</Link> : <button role="menuitem" type="button" onClick={onClick} className={cls}>{inner}</button>;
+  return href ? <Link href={href} onClick={onClick} className={cls}>{inner}</Link> : <button type="button" onClick={onClick} className={cls}>{inner}</button>;
 }
 
 /* ================================================================ toasts */
@@ -545,7 +704,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           const c = t.tone === "good" ? "border-emerald-200" : t.tone === "warn" ? "border-amber-200" : t.tone === "bad" ? "border-red-200" : "border-slate-200";
           const Icon = t.tone === "good" ? CheckCircle2 : t.tone === "bad" ? XCircle : t.tone === "warn" ? AlertCircle : Info;
           return (
-            <div key={t.id} role="status" className={`flex items-start gap-2 rounded-md border bg-white px-3 py-2.5 text-[13px] text-slate-800 shadow-lg ${c}`}>
+            <div key={t.id} className={`flex items-start gap-2 rounded-md border bg-white px-3 py-2.5 text-[13px] text-slate-800 shadow-lg ${c}`}>
               <Icon size={15} aria-hidden className="mt-0.5 shrink-0 text-slate-500" />{t.text}
             </div>
           );

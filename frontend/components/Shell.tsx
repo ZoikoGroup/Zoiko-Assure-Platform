@@ -32,7 +32,15 @@ function Frame({ children }: { children: React.ReactNode }) {
   const { me, ready } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
+  const { title } = usePageTitle();
 
+  // Each screen gets its own document title (WCAG 2.4.2): the page heading, with its section for detail records, or the
+  // navigation label until the heading is set. The root metadata title stays the fallback.
+  useEffect(() => {
+    const meta = routeMeta(path);
+    const page = path === "/login" ? "Sign in" : title ? (meta?.isDetail ? `${title} · ${meta.item.label}` : title) : meta?.item.label;
+    document.title = page ? `${page} · Zoiko Assure` : "Zoiko Assure";
+  }, [path, title]);
   useEffect(() => { try { setCollapsed(localStorage.getItem("za-nav-collapsed") === "1"); } catch {} }, []);
   const toggle = () => { const v = !collapsed; setCollapsed(v); try { localStorage.setItem("za-nav-collapsed", v ? "1" : "0"); } catch {} };
   useEffect(() => setMobile(false), [path]);
@@ -88,7 +96,7 @@ function WorkContext() {
     <span data-za="org-context" title={title} className="flex min-w-0 items-center gap-2 rounded-md border border-slate-200 px-2.5 py-1">
       <Icon size={14} aria-hidden className="shrink-0 text-slate-400" />
       <span className="min-w-0 leading-tight">
-        <span className="block text-[9px] font-semibold uppercase tracking-[0.08em] text-slate-400">{c.label}</span>
+        <span className="block text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{c.label}</span>
         <span className="block truncate text-[12px] font-medium text-slate-800">{c.name}</span>
       </span>
     </span>
@@ -104,7 +112,7 @@ function NavIcon({ icon: Icon, active }: { icon: LucideIcon; active: boolean }) 
       <Loader2 size={16} aria-hidden className="text-navy-600 motion-safe:animate-spin" />
       <span className="sr-only">Loading</span>
     </>
-  ) : <Icon size={16} aria-hidden className={active ? "text-navy-700" : "text-slate-400"} />;
+  ) : <Icon size={16} aria-hidden className={active ? "text-navy-700" : "text-slate-500"} />;
 }
 
 /** Account menu: the organisation this account belongs to (or, for Zoiko staff, that it belongs to none). */
@@ -113,7 +121,7 @@ function AccountContext() {
   const c = workContext(me);
   return (
     <div className="border-b border-slate-100 px-3 py-2 text-[12px]">
-      <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">{c.kind === "organisation" ? "Member of organisation" : c.label}</div>
+      <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{c.kind === "organisation" ? "Member of organisation" : c.label}</div>
       <div className="font-medium text-slate-800">{c.name}</div>
       {c.kind !== "organisation" && <div className="text-[11px] text-slate-500">Not a member of any customer organisation</div>}
     </div>
@@ -143,7 +151,7 @@ function SidebarBody({ narrow, path, onToggle, showContext }: { narrow: boolean;
           return (
           <div key={g.group} role="group" aria-labelledby={narrow ? undefined : headingId} aria-label={narrow ? g.group : undefined} className="mb-2">
             {narrow ? (gi > 0 && <div className="mx-2 my-2 border-t border-slate-100" />) : (
-              <div id={headingId} className="px-2.5 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">{g.group}</div>
+              <div id={headingId} className="px-2.5 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{g.group}</div>
             )}
             {g.items.map(({ href, label, icon: Icon }) => {
               const active = activeHref === href;
@@ -212,22 +220,30 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
     : [{ label: "Zoiko Assure" }];
   const hits = useMemo(() => (q ? jumpTargets(personaOf(me)).filter((i) => `${i.label} ${i.group}`.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, me]);
   const pending = (alerts?.issues ?? 0) + (alerts?.facts ?? 0);
+  // Record watermark: always visible ("derived projection watermark is always visible", Vol. 1 NFRs). Phones show it
+  // under the breadcrumb, wider screens beside the account controls; the cell is added where space allows.
+  const watermark = (placement: string) => wm && (
+    <span title={`Data cell ${wm.cell_id}. Views reflect everything recorded up to sequence ${wm.record_seq} (knowledge time).`}
+      className={`${placement} shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-slate-200 px-2.5 py-1 text-[11px] text-slate-600`}>
+      <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-emerald-500" /><span className="mono"><span className="hidden 2xl:inline">{wm.cell_id} · </span>seq {wm.record_seq}</span>
+    </span>
+  );
 
   return (
     <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-white/95 px-4 backdrop-blur sm:px-6">
       <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="lg:hidden" />
-      <div className="min-w-0 flex-1"><Breadcrumb items={crumbs} /></div>
+      <div className="min-w-0 flex-1 overflow-x-clip"><Breadcrumb items={crumbs} />{watermark("mt-0.5 flex w-fit md:hidden")}</div>
 
-      <div className="flex shrink-0 items-center gap-2">
-        <div className="relative hidden md:block">
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="relative hidden shrink-0 md:block">
           <SearchInput value={q} onChange={(e) => setQ(e.target.value)} placeholder="Jump to…" aria-label="Jump to page" inputClassName="w-52 py-1"
             onKeyDown={(e) => { if (e.key === "Enter" && hits[0]) { router.push(hits[0].href); setQ(""); } if (e.key === "Escape") setQ(""); }} />
           {hits.length > 0 && (
-            <ul role="listbox" aria-label="Pages" className="absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
+            <ul aria-label="Matching pages" className="absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
               {hits.map(({ href, label, group }) => (
                 <li key={href}>
                   <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-2 px-3 py-1.5 text-[13px] text-slate-700 hover:bg-slate-50">
-                    {label}<span className="text-[11px] text-slate-400">{group}</span>
+                    {label}<span className="text-[11px] text-slate-500">{group}</span>
                   </Link>
                 </li>
               ))}
@@ -235,14 +251,9 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
           )}
         </div>
 
-        <div className="hidden max-w-[240px] md:flex"><WorkContext /></div>
+        <div className="hidden min-w-0 max-w-[240px] md:flex"><WorkContext /></div>
 
-        {wm && (
-          <span title={`Data cell ${wm.cell_id}. Views reflect everything recorded up to sequence ${wm.record_seq} (knowledge time).`}
-            className="hidden items-center gap-1.5 rounded-md border border-slate-200 px-2.5 py-1 text-[11px] text-slate-600 2xl:flex">
-            <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-emerald-500" /><span className="mono">{wm.cell_id} · seq {wm.record_seq}</span>
-          </span>
-        )}
+        {watermark("hidden md:flex")}
 
         <Dropdown label={pending ? `Notifications, ${pending} open item(s)` : "Notifications"} menuClassName="w-72"
           buttonClassName="relative inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
@@ -268,7 +279,7 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
             <span className="flex h-7 w-7 items-center justify-center rounded-full bg-navy-700 text-[11px] font-semibold text-white">{initials(me?.display_name)}</span>
             <span className="hidden text-left sm:block">
               <span className="block max-w-[160px] truncate text-[12px] font-medium text-slate-900">{shortName(me?.display_name)}</span>
-              <span className="block max-w-[160px] truncate text-[10px] text-slate-500">{me?.roles[0] ? roleLabel(me.roles[0]) : ""}</span>
+              <span className="block max-w-[160px] truncate text-[11px] text-slate-500">{me?.roles[0] ? roleLabel(me.roles[0]) : ""}</span>
             </span>
             <ChevronDown size={14} aria-hidden className="text-slate-400" />
           </>}>
@@ -278,7 +289,7 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
                 <div className="text-[13px] font-medium text-slate-900">{me?.display_name}</div>
                 <div className="text-[12px] text-slate-500">{me?.email}</div>
                 <ul className="mt-1.5 space-y-0.5" aria-label="Your roles">
-                  {me?.roles.map((r) => <li key={r} className="flex items-center justify-between gap-2 text-[12px] text-slate-700">{roleLabel(r)}<span className="mono text-[10px] text-slate-400">{r}</span></li>)}
+                  {me?.roles.map((r) => <li key={r} className="flex items-center justify-between gap-2 text-[12px] text-slate-700">{roleLabel(r)}<span className="mono text-[11px] text-slate-500">{r}</span></li>)}
                 </ul>
               </div>
               <AccountContext />
@@ -330,6 +341,7 @@ function PasswordForm({ onChanged, onCancel, submitLabel = "Update password", cu
   const [cur, setCur] = useState("");
   const [nw, setNw] = useState("");
   const [conf, setConf] = useState("");
+  const mismatch = !!conf && conf !== nw;
   const a = useAction();
   return (
     <>
@@ -340,10 +352,11 @@ function PasswordForm({ onChanged, onCancel, submitLabel = "Update password", cu
       }}>
         <Field label={currentLabel} htmlFor="pw-cur"><input id="pw-cur" type="password" autoComplete="current-password" className="input" value={cur} onChange={(e) => setCur(e.target.value)} /></Field>
         <Field label="New password" htmlFor="pw-new" hint="At least 10 characters, with upper- and lower-case letters and a digit.">
-          <input id="pw-new" type="password" autoComplete="new-password" className="input" value={nw} onChange={(e) => setNw(e.target.value)} />
+          <input id="pw-new" type="password" autoComplete="new-password" aria-describedby="pw-new-hint" className="input" value={nw} onChange={(e) => setNw(e.target.value)} />
         </Field>
-        <Field label="Confirm new password" htmlFor="pw-conf" hint={conf && conf !== nw ? <span className="text-red-700">Passwords don&apos;t match.</span> : undefined}>
-          <input id="pw-conf" type="password" autoComplete="new-password" className="input" value={conf} onChange={(e) => setConf(e.target.value)} />
+        <Field label="Confirm new password" htmlFor="pw-conf" hint={mismatch ? <span className="text-red-700">Passwords don&apos;t match.</span> : undefined}>
+          <input id="pw-conf" type="password" autoComplete="new-password" aria-invalid={mismatch} aria-describedby={mismatch ? "pw-conf-hint" : undefined}
+            className="input" value={conf} onChange={(e) => setConf(e.target.value)} />
         </Field>
         <div className="flex justify-end gap-2">
           {onCancel && <button type="button" className="btn-ghost" onClick={onCancel}>Cancel</button>}

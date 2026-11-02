@@ -4,6 +4,7 @@ import { useState } from "react";
 import { FlaskConical } from "lucide-react";
 import { api, useApi } from "@/lib/api";
 import { useAuth } from "@/lib/actor";
+import { codeText, RULE_CHANGE_CLASSES } from "@/lib/codes";
 import { A, Badge, Card, EmptyState, ErrorBox, Field, KV, LoadingSkeleton, Modal, Notice, PageHeader, useAction } from "@/components/ui";
 import { RuleSandbox, VectorReport, type FixtureVector } from "@/components/RuleTesting";
 
@@ -104,6 +105,12 @@ function SaveVector({ draft, fixture, onClose, onSaved }: { draft: any; fixture:
         Adds this fixture to <span className="mono">{draft.obligation_definition}</span> r{draft.revision} with expected result <Badge code={fixture.expected_outcome} /> at {fixture.effective_at}.
         The draft becomes a new revision and its approvals and test reports are reset.
       </p>
+      {!RULE_CHANGE_CLASSES.includes(draft.change_class) && (
+        <div className="mb-3"><Notice tone="warn">
+          This draft&rsquo;s change class ({codeText(draft.change_class, RULE_CHANGE_CLASSES)}) is not a ZA-RUL-001 §14 class. Saving the vector keeps it as stored;
+          choose a listed class in the draft editor.
+        </Notice></div>
+      )}
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Vector ID" htmlFor="gv-id" hint={duplicate ? <span className="text-red-700">A vector with this ID already exists.</span> : undefined}>
           <input id="gv-id" className="input mono" value={vectorId} onChange={(e) => setVectorId(e.target.value)} placeholder="e.g. TR-POS-2" />

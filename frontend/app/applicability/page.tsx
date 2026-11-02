@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, PageHeader, Table } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, PageHeader, PermissionNote, Table } from "@/components/ui";
 import { AttestModal } from "@/components/AttestModal";
 
 export default function Applicability() {
@@ -11,12 +12,14 @@ export default function Applicability() {
   const evals = useApi<any[]>("/applicability/evaluations");
   const [att, setAtt] = useState<any>(null);
   const [filter, setFilter] = useState("ALL");
+  const { can, why } = useCan();
   const evalById: Record<string, any> = Object.fromEntries((evals.data || []).map((e) => [e.evaluation_id, e]));
   const queue = (dets.data || []).filter((d) => filter === "ALL" || d.state === filter || (filter === "FLAGGED" && d.needs_review));
   return (
     <>
       <PageHeader spec="ZA-APP-001 · WF-APP-01" title="Applicability Review"
         subtitle="Deterministic evaluations produce PROPOSED determinations. Only an authorised human can adopt them; adoption creates the obligation instance." />
+      <PermissionNote perms={["attest"]} />
       <ErrorBox error={dets.error || evals.error} />
       <Card actions={
         <select aria-label="Filter by state" className="input w-36 py-1 text-xs" value={filter} onChange={(e) => setFilter(e.target.value)}>
@@ -34,7 +37,7 @@ export default function Applicability() {
               <td className="td whitespace-nowrap">
                 <A href={`/applicability/${d.evaluation_id}`}>Trace</A>
                 {(["PROPOSED", "IN_REVIEW"].includes(d.state) || (d.state === "ADOPTED" && d.needs_review)) && d.outcome !== "UNCERTAIN" && (
-                  <button className="btn-ghost ml-2" onClick={() => setAtt(d)}>Attest</button>
+                  <button className="btn-ghost ml-2" disabled={!can("attest")} title={why("attest")} onClick={() => setAtt(d)}>Attest</button>
                 )}
                 {d.outcome === "UNCERTAIN" && <A href="/fact-requests"> · Resolve facts</A>}
               </td>

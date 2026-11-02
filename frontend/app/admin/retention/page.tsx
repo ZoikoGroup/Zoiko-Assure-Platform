@@ -2,6 +2,7 @@
 
 import { Lock } from "lucide-react";
 import { useApi } from "@/lib/api";
+import { codeText, DATA_CLASS_CODES } from "@/lib/codes";
 import { fmtDate } from "@/lib/format";
 import { A, Badge, Card, EmptyState, ErrorBox, PageHeader, Table } from "@/components/ui";
 
@@ -19,7 +20,7 @@ export default function RetentionAndLegalHolds() {
         <Card title={`Active legal holds · ${held.length}`}>
           <EvidenceTable rows={held} loaded={data !== null} emptyText="No evidence is under legal hold." />
         </Card>
-        <Card title={`Erased evidence · ${erased.length}`} subtitle="The payload is destroyed; the manifest and ledger history remain.">
+        <Card title={`Erased evidence · ${erased.length}`} subtitle="The active payload and its data key are destroyed; backup copies are retired as those backups expire. The manifest and ledger history remain.">
           <EvidenceTable rows={erased} loaded={data !== null} emptyText="No evidence payload has been erased." />
         </Card>
         <Card title="Retention policies">
@@ -40,7 +41,7 @@ function EvidenceTable({ rows, loaded, emptyText }: { rows: any[]; loaded: boole
           <td className="td"><A href={`/evidence/${e.evidence_id}`}>{e.title}</A></td>
           <td className="td mono text-xs">{e.entity_id}</td>
           <td className="td text-xs">{fmtDate(e.coverage_from)} → {fmtDate(e.coverage_to)}</td>
-          <td className="td mono text-[11px]">{e.data_classification}</td>
+          <td className="td mono text-[11px]">{codeText(e.data_classification, DATA_CLASS_CODES)}</td>
           <td className="td"><Badge code={e.condition} /></td>
           <td className="td mono text-xs">#{e.ledger_seq}</td>
         </tr>

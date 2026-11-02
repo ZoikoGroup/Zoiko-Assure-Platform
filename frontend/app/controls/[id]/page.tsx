@@ -1,12 +1,13 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { useActorNames } from "@/lib/people";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ErrorBox, Hash, Json, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, Hash, Json, KV, LiveRegion, Modal, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
+import { ManualProvenance } from "@/components/EvidenceProvenance";
 
 export default function ControlPage() {
   const { id } = useParams<{ id: string }>();
@@ -22,13 +23,14 @@ export default function ControlPage() {
       <PageHeader kicker="Control implementation" spec="WF-STA-02 Control Evaluation" title={d?.definition.title ?? "Control"}
         subtitle={d ? `${d.definition.key} · scope ${d.subject.display_name}. Its tests and their evidence decide whether it operated in a window.` : undefined}
         actions={<>
-          <select className="input py-1 text-xs" value={days} onChange={(e) => setDays(Number(e.target.value))}>{[7, 30, 90, 180].map((x) => <option key={x} value={x}>last {x} days</option>)}</select>
+          <select aria-label="Evaluation window" className="input py-1 text-xs" value={days} onChange={(e) => setDays(Number(e.target.value))}>{[7, 30, 90, 180].map((x) => <option key={x} value={x}>last {x} days</option>)}</select>
           <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
             const now = new Date(); const r = await api(`/controls/${id}/evaluate`, { method: "POST", json: { window_from: new Date(now.getTime() - days * 864e5).toISOString(), window_to: now.toISOString() } });
             reload(); return r;
           })}>Record evaluation</button></>} />
+      <PermissionNote perms={["submit_evidence"]} />
       <ErrorBox error={error || a.error} />
-      {a.result && <div className="mb-4"><Notice tone="good">Immutable ControlEvaluation recorded: {a.result.state}.</Notice></div>}
+      <LiveRegion>{a.result && <div className="mb-4"><Notice tone="good">Immutable ControlEvaluation recorded: {a.result.state}.</Notice></div>}</LiveRegion>
       {d && (
         <div className="space-y-4">
           <Card>
@@ -49,7 +51,7 @@ export default function ControlPage() {
                     <td className="td text-[11px]">{[t.required && "required", t.primary && "primary", t.ipe_required && "IPE required", t.degrades_on_fail && "degrades"].filter(Boolean).join(" · ")}</td>
                     <td className="td"><Badge code={t.status} /></td>
                     <td className="td mono text-[11px]">{t.reason_codes.join(", ") || "—"}</td>
-                    <td className="td">{(t.evidence || []).map((e: any) => <div key={e.evidence_id ?? e}><A href={`/evidence/${e.evidence_id ?? e}`}>{String(e.evidence_id ?? e).slice(0, 8)}…</A> {e.condition && <Badge code={e.condition} />}</div>)}</td>
+                    <td className="td">{(t.evidence || []).map((e: any) => <div key={e.evidence_id ?? e}><A href={`/evidence/${e.evidence_id ?? e}`}>{String(e.evidence_id ?? e).slice(0, 8)}…</A> {e.condition && <Badge code={e.condition} />} <ManualProvenance origin={e.origin_class} /></div>)}</td>
                     <td className="td"><button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setRun(td)}>Record result</button></td>
                   </tr>
                 );
@@ -87,23 +89,24 @@ export default function ControlPage() {
 
 function RecordRun({ td, onClose, onDone }: { td: any; onClose: () => void; onDone: () => void }) {
   const today = new Date().toISOString().slice(0, 10);
-  const [f, setF] = useState({ result: "PASS", source_system: "manual", external_status: "", occurred_at: today, window_from: new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10), window_to: today, detail: "" });
+  const [f, setF] = useState({ result: "", source_system: "manual", external_status: "", occurred_at: today, window_from: new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10), window_to: today, detail: "" });
   const a = useAction();
+  const fid = useId();
   const iso = (x: string) => new Date(x).toISOString();
   return (
     <Modal open onClose={onClose} title={`Record test result · ${td.name}`}>
       <Notice>Results from external GRC tools or vendors are inputs with provenance. They never set control state directly.</Notice>
       <ErrorBox error={a.error} />
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
-        <div><label className="label">Result</label><select className="input" value={f.result} onChange={(e) => setF({ ...f, result: e.target.value })}>{["PASS", "FAIL", "ERROR", "INCONCLUSIVE", "SKIPPED"].map((x) => <option key={x}>{x}</option>)}</select></div>
-        <div><label className="label">Source system</label><input className="input" value={f.source_system} onChange={(e) => setF({ ...f, source_system: e.target.value })} /></div>
-        <div><label className="label">Occurred at</label><input type="date" className="input" value={f.occurred_at} onChange={(e) => setF({ ...f, occurred_at: e.target.value })} /></div>
-        <div><label className="label">External status</label><input className="input" value={f.external_status} onChange={(e) => setF({ ...f, external_status: e.target.value })} /></div>
-        <div><label className="label">Window from</label><input type="date" className="input" value={f.window_from} onChange={(e) => setF({ ...f, window_from: e.target.value })} /></div>
-        <div><label className="label">Window to</label><input type="date" className="input" value={f.window_to} onChange={(e) => setF({ ...f, window_to: e.target.value })} /></div>
-        <div className="sm:col-span-2"><label className="label">Detail</label><input className="input" value={f.detail} onChange={(e) => setF({ ...f, detail: e.target.value })} /></div>
+        <div><label className="label" htmlFor={`${fid}-result`}>Result (required)</label><select id={`${fid}-result`} required className="input" value={f.result} onChange={(e) => setF({ ...f, result: e.target.value })}><option value="">Select…</option>{["PASS", "FAIL", "ERROR", "INCONCLUSIVE", "SKIPPED"].map((x) => <option key={x}>{x}</option>)}</select></div>
+        <div><label className="label" htmlFor={`${fid}-source`}>Source system</label><input id={`${fid}-source`} className="input" value={f.source_system} onChange={(e) => setF({ ...f, source_system: e.target.value })} /></div>
+        <div><label className="label" htmlFor={`${fid}-at`}>Occurred at</label><input id={`${fid}-at`} type="date" className="input" value={f.occurred_at} onChange={(e) => setF({ ...f, occurred_at: e.target.value })} /></div>
+        <div><label className="label" htmlFor={`${fid}-ext`}>External status</label><input id={`${fid}-ext`} className="input" value={f.external_status} onChange={(e) => setF({ ...f, external_status: e.target.value })} /></div>
+        <div><label className="label" htmlFor={`${fid}-wf`}>Window from</label><input id={`${fid}-wf`} type="date" className="input" value={f.window_from} onChange={(e) => setF({ ...f, window_from: e.target.value })} /></div>
+        <div><label className="label" htmlFor={`${fid}-wt`}>Window to</label><input id={`${fid}-wt`} type="date" className="input" value={f.window_to} onChange={(e) => setF({ ...f, window_to: e.target.value })} /></div>
+        <div className="sm:col-span-2"><label className="label" htmlFor={`${fid}-detail`}>Detail</label><input id={`${fid}-detail`} className="input" value={f.detail} onChange={(e) => setF({ ...f, detail: e.target.value })} /></div>
       </div>
-      <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => {
+      <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={a.busy || !f.result} onClick={() => a.run(async () => {
         await api("/test-runs", { method: "POST", json: { test_definition_id: td.test_definition_id, result: f.result, source_system: f.source_system, external_status: f.external_status || null,
           occurred_at: iso(f.occurred_at), window_from: iso(f.window_from), window_to: iso(f.window_to), detail: f.detail || null, evidence_ids: [] } });
         onDone();

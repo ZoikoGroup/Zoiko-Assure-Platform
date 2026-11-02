@@ -31,7 +31,7 @@ function Audit() {
           <tr key={e.id}>
             <td className="td mono text-xs">#{e.record_seq ?? "—"}</td><td className="td mono text-xs">{e.action}</td>
             <td className="td text-xs">{e.actor_id}<div className="text-slate-500">{e.actor_type}</div></td>
-            <td className="td text-xs">{e.object_type}<div className="mono text-[10px] text-slate-500">{e.object_id?.slice(0, 13)}</div></td>
+            <td className="td text-xs">{e.object_type}<div className="mono text-[11px] text-slate-500">{e.object_id?.slice(0, 13)}</div></td>
             <td className="td text-xs">{e.prior_state ?? "∅"} → {e.new_state ?? "∅"}</td><td className="td text-xs">{e.reason ?? "—"}</td>
             <td className="td text-xs">{fmtDate(e.recorded_at, true)}</td>
           </tr>

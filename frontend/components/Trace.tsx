@@ -4,6 +4,10 @@ import { useState } from "react";
 import { Badge, ExceptionBadge } from "./ui";
 import { fmtDate } from "@/lib/format";
 
+/* In a trace, NOT_EVALUATED marks a node skipped by short-circuit: not needed for the result, so informational here
+   rather than the warning it is as a control state. Other node results take their shared tone (TRUE info, FALSE neutral). */
+const traceTone = (result?: string) => (result === "NOT_EVALUATED" ? "info" : undefined);
+
 /* Applicability trace tree (ZA-APP-001 §7) — accessible nested list, decisive-path filter. */
 export function RuleTrace({ node, depth = 0, decisiveOnly = false }: { node: any; depth?: number; decisiveOnly?: boolean }) {
   const [open, setOpen] = useState(depth < 3);
@@ -32,16 +36,16 @@ export function RuleTrace({ node, depth = 0, decisiveOnly = false }: { node: any
     <li className="my-1">
       <div className="flex flex-wrap items-center gap-2 rounded-md px-2 py-1 hover:bg-navy-50">
         {showKids ? (
-          <button className="w-4 text-xs text-slate-500" onClick={() => setOpen(!open)} aria-expanded={open} aria-label="toggle">{open ? "▾" : "▸"}</button>
+          <button type="button" className="w-4 text-xs text-slate-500" onClick={() => setOpen(!open)} aria-expanded={open} aria-label={`${node.node_type} sub-conditions`}><span aria-hidden>{open ? "▾" : "▸"}</span></button>
         ) : <span className="w-4" />}
-        <Badge code={node.result} />
+        <Badge code={node.result} tone={traceTone(node.result)} />
         {label}
-        {node.fact_revision_id && <span className="mono text-[10px] text-slate-400">rev {String(node.fact_revision_id).slice(0, 8)}</span>}
-        {node.children?.find?.((c: any) => c.fact_revision_id) && <span className="mono text-[10px] text-slate-400">rev {String(node.children.find((c: any) => c.fact_revision_id).fact_revision_id).slice(0, 8)}</span>}
+        {node.fact_revision_id && <span className="mono text-[11px] text-slate-500">rev {String(node.fact_revision_id).slice(0, 8)}</span>}
+        {node.children?.find?.((c: any) => c.fact_revision_id) && <span className="mono text-[11px] text-slate-500">rev {String(node.children.find((c: any) => c.fact_revision_id).fact_revision_id).slice(0, 8)}</span>}
         {node.reason_code && <span className="mono text-[11px] text-amber-700">{node.reason_code}</span>}
         {node.short_circuit_reason && <span className="text-[11px] italic text-slate-500">short-circuit</span>}
-        {node.source_mappings?.length > 0 && <span className="text-[10px] text-brand-700" title={JSON.stringify(node.source_mappings)}>§ {node.source_mappings.map((s: any) => (typeof s === "string" ? s : s.source_mapping_id)).join(", ")}</span>}
-        <span className="mono text-[10px] text-slate-400">#{node.node_id}</span>
+        {node.source_mappings?.length > 0 && <span className="text-[11px] text-brand-700" title={JSON.stringify(node.source_mappings)}>§ {node.source_mappings.map((s: any) => (typeof s === "string" ? s : s.source_mapping_id)).join(", ")}</span>}
+        <span className="mono text-[11px] text-slate-500">#{node.node_id}</span>
       </div>
       {showKids && open && (
         <ul className="ml-5 border-l border-navy-100 pl-2">
@@ -59,7 +63,7 @@ export function ExprTrace({ node, depth = 0 }: { node: any; depth?: number }) {
   return (
     <li className="my-1">
       <div className="flex flex-wrap items-center gap-2 rounded-md px-2 py-1 hover:bg-navy-50">
-        <Badge code={node.result === "NOT_EVALUATED" ? "NOT_EVALUATED_SC" : node.result} label={node.result} />
+        <Badge code={node.result} tone={traceTone(node.result)} />
         <span className="mono text-sm font-semibold text-navy-700">{node.node_type}{node.k ? `(${node.k})` : ""}</span>
         {node.control_key && <span className="mono text-sm text-navy-900">{node.control_key}</span>}
         {node.control_state && <Badge code={node.control_state} />}
@@ -92,16 +96,17 @@ export function SegmentRibbon({ segments, excluded = [], period, onSelect, selec
   ].sort((a, b) => new Date(a.segment_range[0]).getTime() - new Date(b.segment_range[0]).getTime());
   return (
     <div>
-      <div className="flex h-7 w-full overflow-hidden rounded-md ring-1 ring-slate-200" role="list" aria-label="Assurance period segments">
+      <div className="flex h-7 w-full overflow-hidden rounded-md ring-1 ring-slate-200" role="group" aria-label="Assurance period segments">
         {all.map((s, i) => {
           const w = ((new Date(s.segment_range[1]).getTime() - new Date(s.segment_range[0]).getTime()) / (end - start)) * 100;
+          const name = `${s.kind}: ${fmtDate(s.segment_range[0])} → ${fmtDate(s.segment_range[1])}`;
           return (
-            <button key={i} role="listitem" disabled={s.idx < 0} onClick={() => onSelect?.(s.idx)}
-              title={`${s.kind}: ${fmtDate(s.segment_range[0])} → ${fmtDate(s.segment_range[1])}`}
+            <button key={i} type="button" disabled={s.idx < 0} onClick={() => onSelect?.(s.idx)} aria-label={name} aria-pressed={s.idx >= 0 ? selected === s.idx : undefined}
+              title={name}
               style={{ width: `${w}%` }}
               className={`relative h-full border-r border-white text-[10px] font-medium mono ${SEG_CLS[s.kind]} ${selected === s.idx ? "ring-2 ring-inset ring-navy-700" : ""}`}>
               <span className="absolute inset-0 flex items-center justify-center truncate px-1">{w > 12 ? (s.kind === "EXCLUDED" ? "not applicable" : s.kind) : ""}</span>
-              {s.exception_treatments?.length > 0 && <span className="absolute right-1 top-0.5 text-[10px] text-brand-700" title="Exception treatment applies (state unchanged)">⚠</span>}
+              {s.exception_treatments?.length > 0 && <span className="absolute right-1 top-0.5 text-[11px] text-brand-700" title="Exception treatment applies (state unchanged)">⚠</span>}
             </button>
           );
         })}
