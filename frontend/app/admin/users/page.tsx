@@ -51,7 +51,7 @@ function YourAccess() {
         <ul className="grid gap-x-6 gap-y-1 sm:grid-cols-2">
           {me.permissions.map((p) => (
             <li key={p} className="flex items-baseline justify-between gap-2 border-b border-slate-100 py-1 text-[13px] text-slate-700">
-              {permissionText(p)}<span className="mono shrink-0 text-[10px] text-slate-400">{p}</span>
+              {permissionText(p)}<span className="mono shrink-0 text-[11px] text-slate-500">{p}</span>
             </li>
           ))}
         </ul>
@@ -73,7 +73,7 @@ function Directory() {
           <tr key={a.actor_id}>
             <td className="td"><div className="font-medium text-slate-900">{a.display_name}</div><div className="mono text-[11px] text-slate-500">{a.email ?? a.actor_id}</div></td>
             <td className="td"><Badge code={a.actor_type} tone="info" /></td>
-            <td className="td">{(a.roles || []).map((r: string) => <div key={r} className="text-[13px] text-slate-800">{roleLabel(r)} <span className="mono text-[10px] text-slate-500">{r}</span></div>)}</td>
+            <td className="td">{(a.roles || []).map((r: string) => <div key={r} className="text-[13px] text-slate-800">{roleLabel(r)} <span className="mono text-[11px] text-slate-500">{r}</span></div>)}</td>
             <td className="td text-xs text-slate-600">{a.authority_basis ?? "—"}</td>
           </tr>
         ))}

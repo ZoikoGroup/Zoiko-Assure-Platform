@@ -20,7 +20,7 @@ export function VectorReport({ rep }: { rep: any }) {
           {rep.results.map((r: any) => (
             <tr key={r.vector_id}>
               <td className="td"><div className="mono text-xs">{r.vector_id}</div><div className="text-[11px] text-slate-500">{r.description}</div></td>
-              <td className="td"><Badge code={r.expected} /></td><td className="td"><Badge code={r.actual ?? r.error} /></td>
+              <td className="td"><Badge code={r.expected} /></td><td className="td">{r.actual ? <Badge code={r.actual} /> : <Badge code={r.error} tone="info" title={r.message ?? r.error} />}</td>
               <td className="td"><Badge code={r.passed ? "PASS" : "FAIL"} /></td>
               <td className="td text-xs">{r.message || r.trace_mismatches?.map((m: any) => `${m.node_id}: ${m.expected}≠${m.got}`).join("; ")}</td>
             </tr>

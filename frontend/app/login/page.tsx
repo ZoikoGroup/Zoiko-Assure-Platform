@@ -20,8 +20,8 @@ const EMAIL_FORMAT = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const HIGHLIGHTS: { icon: LucideIcon; title: string; text: string }[] = [
   { icon: ScrollText, title: "Regulatory Intelligence", text: "Requirements encoded from authoritative sources and traced to their provisions." },
-  { icon: FileCheck2, title: "Evidence & Assurance", text: "Controls proven by tamper-evident evidence and assessed for named periods." },
-  { icon: Bot, title: "AI Governance", text: "AI assets and agents act only under explicit, auditable authority." },
+  { icon: FileCheck2, title: "Evidence & Assurance", text: "Controls backed by tamper-evident evidence; obligations assessed for named periods." },
+  { icon: Bot, title: "AI Governance", text: "Explicit, auditable authority grants for AI assets and agents, enforced in your own runtime." },
 ];
 
 const CHAIN = ["Source", "Applicability", "Obligation", "Control", "Evidence", "Assurance"];
@@ -34,14 +34,19 @@ function destination(me: Me): string {
   return canOpen(personaOf(me), new URL(next, window.location.origin).pathname) ? next : "/";
 }
 
-/** The backend's own wording for refusals it explains (401 wrong credentials, 423 temporarily locked, 403 organisation
- *  suspended); fixed wording for everything else, so no server internals reach the page. */
+/** Fixed wording for every outcome; the server's text is never shown. A wrong password or unknown account (401) and a
+ *  locked account (423) read the same: only an existing account can be locked, so naming the lockout would confirm the
+ *  account exists (audit FA-31). The 403 comes only after the password is verified, so naming the suspension tells
+ *  nothing to someone without valid credentials. The status code itself still differs until the backend changes. */
+const CREDENTIALS_REFUSED = "Unable to sign in with the provided credentials. Please check your details or contact your administrator.";
+
 function signInError(e: unknown): string {
   if (e instanceof ApiError) {
     if (e.status === 0) return "Couldn't reach the Zoiko Assure server. Check your connection and try again.";
     if (e.status >= 500) return "Sign-in is unavailable right now because of a server problem. Please try again shortly.";
     if (e.status === 422) return "Enter a valid work email address and your password.";
-    if (typeof e.detail === "string" && e.detail) return e.detail;
+    if (e.status === 401 || e.status === 423) return CREDENTIALS_REFUSED;
+    if (e.status === 403) return "Sign-in is disabled because your organisation's access is suspended. Contact your administrator.";
   }
   return "Sign-in didn't complete. Please try again.";
 }
@@ -204,12 +209,12 @@ export default function Login() {
                       <button type="button" onClick={() => { setEmail(a.email); setError(null); passwordRef.current?.focus(); }}
                         className={`flex w-full min-w-0 items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-slate-50 ${email === a.email ? "bg-navy-50" : ""}`}>
                         <span className="truncate text-slate-800">{a.display_name}</span>
-                        <span className="mono max-w-[45%] shrink-0 truncate text-[10px] text-slate-500">{a.roles.join(",")}</span>
+                        <span className="mono max-w-[45%] shrink-0 truncate text-[11px] text-slate-600">{a.roles.join(",")}</span>
                       </button>
                     </li>
                   ))}
                 </ul>
-                <p className="mt-1.5 px-1 text-[10px] text-slate-500">Shown only while the API runs with ZA_DEMO_MODE=1. Use the locally configured demo password.</p>
+                <p className="mt-1.5 px-1 text-[11px] text-slate-500">Shown only while the API runs with ZA_DEMO_MODE=1. Use the locally configured demo password.</p>
               </div>
             )}
           </div>

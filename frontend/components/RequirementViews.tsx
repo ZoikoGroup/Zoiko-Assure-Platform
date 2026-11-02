@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { Badge, Card, ErrorBox, KV, LoadingSkeleton, Modal, Notice, Table, useAction } from "./ui";
+import { useCan } from "@/lib/roles";
+import { Badge, Card, ErrorBox, KV, LoadingSkeleton, Modal, Notice, PermissionNote, Table, useAction } from "./ui";
 
 /** Requirement versions across instruments (GET /catalog/instruments). */
 export function RequirementList({ onOpen }: { onOpen: (id: string) => void }) {
@@ -35,16 +36,18 @@ export function RequirementReview({ id, onClose }: { id: string; onClose?: () =>
   const { data, error, reload } = useApi<any>(`/catalog/requirements/${id}`);
   const a = useAction();
   const [edit, setEdit] = useState<any>(null);
+  const { can, why } = useCan();
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-[13px] font-semibold text-slate-900">{data ? data.title : "Requirement"}</h3>
         <div className="flex gap-2">
-          {data?.lifecycle === "REVIEW_REQUIRED" && <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => { await api(`/catalog/requirements/${id}/verify`, { method: "POST" }); reload(); })}>Verify (legal reviewer)</button>}
+          {data?.lifecycle === "REVIEW_REQUIRED" && <button className="btn-primary" disabled={a.busy || !can("content_legal_review")} title={why("content_legal_review")} onClick={() => a.run(async () => { await api(`/catalog/requirements/${id}/verify`, { method: "POST" }); reload(); })}>Verify (legal reviewer)</button>}
           {onClose && <button className="btn-ghost" onClick={onClose}>Close</button>}
         </div>
       </div>
       <ErrorBox error={error || a.error} />
+      <PermissionNote perms={["content_legal_review", "content_author"]} className="" />
       {!data && !error && <LoadingSkeleton rows={4} className="p-0" />}
       {data && (
         <>
@@ -62,7 +65,7 @@ export function RequirementReview({ id, onClose }: { id: string; onClose?: () =>
                   <td className="td text-xs">{p.regulated_object}</td>
                   <td className="td"><Badge code={p.semantic_origin} /></td>
                   <td className="td"><Badge code={p.lifecycle} /></td>
-                  <td className="td">{!["VERIFIED", "PUBLISHED"].includes(p.lifecycle) && <button className="btn-ghost" onClick={() => setEdit({ ...p })}>Encode</button>}</td>
+                  <td className="td">{!["VERIFIED", "PUBLISHED"].includes(p.lifecycle) && <button className="btn-ghost" disabled={!can("content_author")} title={why("content_author")} onClick={() => setEdit({ ...p })}>Encode</button>}</td>
                 </tr>
               ))}
             </Table>

@@ -1,14 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
-import { Badge, Card, ErrorBox, KV, Modal, PageHeader, Table, useAction } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { Badge, Card, ErrorBox, KV, Modal, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 export default function CellsAndResidency() {
   return (
     <>
       <PageHeader spec="WF-TEN-01/02 · TEN-REQ-013" title="Cells & Residency"
         subtitle="Your tenant, its legal entities and the cells that hold their data. Raw entity evidence and customer assurance state stay in the entity's home cell." />
+      <PermissionNote perms={["manage_tenant"]} />
       <Tenancy />
     </>
   );
@@ -19,12 +21,14 @@ function Tenancy() {
   const [open, setOpen] = useState(false);
   const [f, setF] = useState({ legal_name: "", country: "", registration_ref: "" });
   const a = useAction();
+  const { can, why } = useCan();
+  const fid = useId();
   return (
     <div className="space-y-4">
       <ErrorBox error={error} />
       {data && (
         <>
-          <Card title={data.tenant?.legal_name} subtitle="Tenant" actions={<button className="btn-primary" onClick={() => setOpen(true)}>Register legal entity</button>}>
+          <Card title={data.tenant?.legal_name} subtitle="Tenant" actions={<button className="btn-primary" disabled={!can("manage_tenant")} title={why("manage_tenant")} onClick={() => setOpen(true)}>Register legal entity</button>}>
             <KV cols={4} items={Object.entries(data.tenant || {}).slice(0, 8).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : String(v)])} />
           </Card>
           <div className="grid gap-4 lg:grid-cols-2">
@@ -45,7 +49,10 @@ function Tenancy() {
         <ErrorBox error={a.error} />
         <div className="grid gap-3 sm:grid-cols-2">
           <p className="text-xs text-slate-600 sm:col-span-2">The home cell is assigned by the server; it cannot be chosen here.</p>
-          {(["legal_name", "country", "registration_ref"] as const).map((k) => <div key={k}><label className="label">{k.replace(/_/g, " ")}</label><input className="input" value={f[k]} onChange={(e) => setF({ ...f, [k]: e.target.value })} /></div>)}
+          {(["legal_name", "country", "registration_ref"] as const).map((k) => {
+            const req = k !== "registration_ref";
+            return <div key={k}><label className="label" htmlFor={`${fid}-${k}`}>{k.replace(/_/g, " ")}{req && " (required)"}</label><input id={`${fid}-${k}`} required={req} className="input" value={f[k]} onChange={(e) => setF({ ...f, [k]: e.target.value })} /></div>;
+          })}
         </div>
         <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={!f.legal_name || !f.country || a.busy} onClick={() => a.run(async () => {
           await api("/org/entities", { method: "POST", json: { ...f, registration_ref: f.registration_ref || null } }); setOpen(false); reload();

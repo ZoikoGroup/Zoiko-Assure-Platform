@@ -1,12 +1,12 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { useActorNames } from "@/lib/people";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ErrorBox, Hash, KV, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, Hash, KV, LiveRegion, Notice, PageHeader, PermissionNote, Table, TabPanel, Tabs, useAction } from "@/components/ui";
 import { AssertModal } from "@/components/AssertModal";
 
 export default function SubjectPage() {
@@ -25,31 +25,37 @@ export default function SubjectPage() {
   const p = prof.data;
   const reloadAll = () => { prof.reload(); hist.reload(); evals.reload(); };
   const { can, why } = useCan();
+  const fid = useId();
+  const tabsId = useId();
   const name = useActorNames();
 
   return (
     <>
       <PageHeader kicker="Subject · facts and applicability" spec="WF-APP-01 · ZA-TIM-001" title={p?.subject.display_name ?? "Subject"}
-        subtitle="The facts recorded about this subject, and which requirements they make apply. Valid time (when a fact was true) and record time (when Assure learned it) are kept separately."
+        subtitle="The facts recorded about this subject, and the applicability evaluations and determinations based on them. Valid time (when a fact was true) and record time (when Assure learned it) are kept separately."
         actions={<button className="btn-primary" disabled={a.busy || !can("request_evaluation")} title={why("request_evaluation")} onClick={() => a.run(async () => { const r = await api(`/applicability/evaluate-all?subject_id=${subjectId}`, { method: "POST" }); evals.reload(); return r; })}>Evaluate all obligations</button>} />
+      <PermissionNote perms={["request_evaluation", "manage_facts"]} />
       <ErrorBox error={prof.error || a.error} />
-      {Array.isArray(a.result) && (
-        <div className="mb-4"><Notice tone="good">Evaluated: {a.result.map((r: any) => `${r.obligation} → ${r.outcome ?? "error"}`).join(" · ")}</Notice></div>
-      )}
+      <LiveRegion>
+        {Array.isArray(a.result) && (
+          <div className="mb-4"><Notice tone="good">Evaluated: {a.result.map((r: any) => `${r.obligation} → ${r.outcome ?? "error"}`).join(" · ")}</Notice></div>
+        )}
+      </LiveRegion>
       {p && (
         <Card className="mb-4">
           <div className="flex flex-wrap items-end gap-4">
             <KV cols={4} items={[["Subject type", <Badge key="t" code={p.subject.subject_type} tone="info" />], ["Perspective", <Badge key="p" code={p.perspective.perspective} tone="info" />],
               ["Valid at", fmtDate(p.perspective.valid_at, true)], ["Known as of", <span key="k" className="mono">{p.perspective.cell_id}#{p.perspective.known_seq}</span>]]} />
             <div className="ml-auto flex flex-wrap items-end gap-2">
-              <div><label className="label">Valid at</label><input type="datetime-local" className="input py-1 text-xs" value={validAt} onChange={(e) => setValidAt(e.target.value)} /></div>
-              <div><label className="label">Known seq</label><input type="number" className="input w-28 py-1 text-xs" value={knownSeq} onChange={(e) => setKnownSeq(e.target.value)} /></div>
+              <div><label className="label" htmlFor={`${fid}-valid`}>Valid at</label><input id={`${fid}-valid`} type="datetime-local" className="input py-1 text-xs" value={validAt} onChange={(e) => setValidAt(e.target.value)} /></div>
+              <div><label className="label" htmlFor={`${fid}-seq`}>Known seq</label><input id={`${fid}-seq`} type="number" className="input w-28 py-1 text-xs" value={knownSeq} onChange={(e) => setKnownSeq(e.target.value)} /></div>
               <button className="btn-ghost" onClick={() => { setValidAt(""); setKnownSeq(""); }}>Current</button>
             </div>
           </div>
         </Card>
       )}
-      <Tabs tabs={["Fact profile", "Revision history", "Evaluations"]} value={tab} onChange={setTab} />
+      <Tabs id={tabsId} tabs={["Fact profile", "Revision history", "Evaluations"]} value={tab} onChange={setTab} />
+      <TabPanel id={tabsId} value={tab}>
       {tab === "Fact profile" && p && (
         <Card>
           {p.conflicts.length > 0 && <div className="mb-3"><Notice tone="warn">{p.conflicts.length} open fact conflict(s): {p.conflicts.map((c: any) => c.fact_definition_id?.slice(0, 8)).join(", ")}</Notice></div>}
@@ -62,7 +68,7 @@ export default function SubjectPage() {
                 <td className="td mono text-[11px]">{f.resolution.provenance_class ?? "—"}</td>
                 <td className="td text-xs">{f.resolution.valid_from ? `${fmtDate(f.resolution.valid_from)} → ${f.resolution.valid_to ? fmtDate(f.resolution.valid_to) : "open"}` : "—"}</td>
                 <td className="td"><Hash value={f.resolution.revision_id} n={8} /></td>
-                <td className="td"><button className="btn-ghost" onClick={() => setAssertFor(f)}>Assert / correct</button></td>
+                <td className="td"><button className="btn-ghost" disabled={!can("manage_facts")} title={why("manage_facts")} onClick={() => setAssertFor(f)}>Assert / correct</button></td>
               </tr>
             ))}
           </Table>
@@ -101,6 +107,7 @@ export default function SubjectPage() {
           </Table>
         </Card>
       )}
+      </TabPanel>
       <AssertModal subjectId={subjectId} fact={assertFor} onClose={() => setAssertFor(null)} onDone={() => { setAssertFor(null); reloadAll(); }} />
     </>
   );

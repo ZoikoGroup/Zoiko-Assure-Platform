@@ -1,22 +1,31 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { useAuth } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, KV, Modal, Notice, PageHeader, Table, Tabs, useAction } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, KV, Modal, Notice, PageHeader, PermissionNote, Table, TabPanel, Tabs, useAction } from "@/components/ui";
 
 export default function Connectors() {
   const [tab, setTab] = useState("Connector registry");
   // The outbox holds tenant events; content/platform staff have no standing tenant access (INV-14).
   const tenantUser = !!useAuth().me?.tenant_id;
+  const tabsId = useId();
   return (
     <>
       <PageHeader spec="FR-CON-001..004 · INV-11 · WF-EVT-03" title="Connectors"
         subtitle="Inbound source connectors and their certification, and the outbound event outbox. Customer-visible connector status is read only from the certification registry." />
-      {tenantUser && <Tabs tabs={["Connector registry", "Event outbox"]} value={tab} onChange={setTab} />}
-      {(tab === "Connector registry" || !tenantUser) && <Registry />}
-      {tab === "Event outbox" && tenantUser && <Outbox />}
+      <PermissionNote perms={["manage_connectors"]} />
+      {tenantUser ? (
+        <>
+          <Tabs id={tabsId} tabs={["Connector registry", "Event outbox"]} value={tab} onChange={setTab} />
+          <TabPanel id={tabsId} value={tab}>
+            {tab === "Connector registry" && <Registry />}
+            {tab === "Event outbox" && <Outbox />}
+          </TabPanel>
+        </>
+      ) : <Registry />}
     </>
   );
 }
@@ -24,6 +33,7 @@ export default function Connectors() {
 function Registry() {
   const { data, error, reload } = useApi<any[]>("/connectors");
   const [cert, setCert] = useState<any>(null);
+  const { can, why } = useCan();
   return (
     <>
       <p className="mb-3 text-[13px] text-slate-500">Release availability, certification and runtime health are separate dimensions.</p>
@@ -32,7 +42,7 @@ function Registry() {
         {data?.map((c) => (
           <Card key={c.connector_id} title={c.name} subtitle={`${c.provider} · ${c.source_class} · build ${c.build_version}`}
             actions={<><Badge code={c.release_availability} /><Badge code={c.certification} /><Badge code={c.runtime_health} />
-              <button className="btn-ghost" onClick={() => setCert(c)}>Certification</button></>}>
+              <button className="btn-ghost" disabled={!can("manage_connectors")} title={why("manage_connectors")} onClick={() => setCert(c)}>Certification</button></>}>
             <div className="grid gap-4 lg:grid-cols-3">
               <div>
                 <div className="label">Certification matrix</div>
@@ -72,14 +82,15 @@ function CertModal({ c, onClose, onDone }: { c: any; onClose: () => void; onDone
   const [health, setHealth] = useState(c.runtime_health);
   const [reason, setReason] = useState("");
   const a = useAction();
+  const fid = useId();
   return (
     <Modal open onClose={onClose} title={`Certification · ${c.name}`}>
       <Notice>CERTIFIED requires every row of the certification matrix to PASS (auth scope, tenant isolation, pagination snapshot, population proof, schema mapping, transforms, retries/idempotency, IPE anomalies, version compatibility).</Notice>
       <ErrorBox error={a.error} />
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
-        <div><label className="label">Certification</label><select className="input" value={state} onChange={(e) => setState(e.target.value)}>{["UNASSESSED", "CERTIFIED", "SUSPENDED", "REVOKED"].map((x) => <option key={x}>{x}</option>)}</select></div>
-        <div><label className="label">Runtime health</label><select className="input" value={health} onChange={(e) => setHealth(e.target.value)}>{["HEALTHY", "DEGRADED", "FAILED", "DISABLED"].map((x) => <option key={x}>{x}</option>)}</select></div>
-        <div className="sm:col-span-2"><label className="label">Reason</label><input className="input" value={reason} onChange={(e) => setReason(e.target.value)} /></div>
+        <div><label className="label" htmlFor={`${fid}-cert`}>Certification</label><select id={`${fid}-cert`} className="input" value={state} onChange={(e) => setState(e.target.value)}>{["UNASSESSED", "CERTIFIED", "SUSPENDED", "REVOKED"].map((x) => <option key={x}>{x}</option>)}</select></div>
+        <div><label className="label" htmlFor={`${fid}-health`}>Runtime health</label><select id={`${fid}-health`} className="input" value={health} onChange={(e) => setHealth(e.target.value)}>{["HEALTHY", "DEGRADED", "FAILED", "DISABLED"].map((x) => <option key={x}>{x}</option>)}</select></div>
+        <div className="sm:col-span-2"><label className="label" htmlFor={`${fid}-reason`}>Reason (required)</label><input id={`${fid}-reason`} required className="input" value={reason} onChange={(e) => setReason(e.target.value)} /></div>
       </div>
       <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={!reason || a.busy} onClick={() => a.run(async () => {
         await api(`/connectors/${c.connector_id}/certification`, { method: "POST", json: { certification: state, runtime_health: health, reason } }); onDone();
@@ -97,9 +108,9 @@ function Outbox() {
         {data?.map((e) => (
           <tr key={e.event_id} className="align-top">
             <td className="td mono text-xs">#{e.record_seq}</td><td className="td mono text-xs font-semibold">{e.event_type}</td>
-            <td className="td text-xs">{e.aggregate_type}<div className="mono text-[10px] text-slate-500">{e.aggregate_id?.slice(0, 13)}</div></td>
-            <td className="td mono text-[10px]">{e.schema_version} / {e.dictionary_version}</td>
-            <td className="td max-w-md"><pre className="mono whitespace-pre-wrap break-all text-[10px] text-slate-600">{JSON.stringify(e.payload)}</pre></td>
+            <td className="td text-xs">{e.aggregate_type}<div className="mono text-[11px] text-slate-500">{e.aggregate_id?.slice(0, 13)}</div></td>
+            <td className="td mono text-[11px]">{e.schema_version} / {e.dictionary_version}</td>
+            <td className="td max-w-md"><pre className="mono whitespace-pre-wrap break-all text-[11px] text-slate-600">{JSON.stringify(e.payload)}</pre></td>
             <td className="td text-xs">{fmtDate(e.available_at, true)}</td>
           </tr>
         ))}

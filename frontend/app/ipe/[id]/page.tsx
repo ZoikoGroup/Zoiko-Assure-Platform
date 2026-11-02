@@ -21,7 +21,7 @@ export default function SourceRunPage() {
       <PageHeader spec="WF-IPE-01 Source Run Inspector · WF-IPE-02 Population Reconciliation" title={d ? `${d.connector.name} · run ${id.slice(0, 8)}` : "Source run"}
         subtitle="Request, scope, consistency boundary, paging, population manifest and IPE checks for a single extraction."
         actions={<>
-          <select className="input py-1 text-xs" value={pol} onChange={(e) => setPol(e.target.value)}><option value="">Re-evaluate under policy…</option>
+          <select aria-label="IPE policy for re-evaluation" className="input py-1 text-xs" value={pol} onChange={(e) => setPol(e.target.value)}><option value="">Re-evaluate under policy…</option>
             {pols?.map((p) => <option key={p.ipe_policy_version_id} value={p.ipe_policy_version_id}>{p.name}</option>)}</select>
           <button className="btn-primary" disabled={!pol || a.busy} onClick={() => a.run(async () => { await api(`/ipe/source-runs/${id}/evaluate-ipe`, { method: "POST", json: { ipe_policy_version_id: pol } }); reload(); })}>Evaluate</button>
         </>} />
@@ -46,7 +46,7 @@ export default function SourceRunPage() {
               <div className="flex flex-wrap items-center gap-3 text-center">
                 {[["Intended source population", eq.intended_source_population], ["−", null], ["Extracted unique", eq.extracted_unique_population], ["−", null],
                   ["Governed exclusions", eq.governed_exclusions], ["=", null], ["Unresolved gap", eq.unresolved_gap_population]].map(([l, v], i) =>
-                  v === null && typeof l === "string" && l.length === 1 ? <span key={i} className="text-lg text-slate-400">{l}</span> : (
+                  v === null && typeof l === "string" && l.length === 1 ? <span key={i} className="text-lg text-slate-500">{l}</span> : (
                     <div key={i} className={`rounded-lg px-4 py-2 ring-1 ${l === "Unresolved gap" ? (v === 0 ? "bg-emerald-50 ring-emerald-200" : "bg-red-50 ring-red-200") : "bg-navy-50 ring-navy-100"}`}>
                       <div className="text-lg font-semibold text-slate-900">{v ?? "?"}</div><div className="text-[11px] text-slate-600">{l}</div>
                     </div>
@@ -91,7 +91,7 @@ export default function SourceRunPage() {
             <Table head={["Check", "Class", "Affected", "Severity", "Disposition"]} empty={!d.anomalies.length}>
               {d.anomalies.map((x: any) => (
                 <tr key={x.anomaly_id}><td className="td mono text-xs">{x.check_id}</td><td className="td mono text-xs">{x.anomaly_class}</td>
-                  <td className="td">{x.affected_count} <span className="mono text-[10px] text-slate-500">{(x.affected_keys || []).slice(0, 5).join(", ")}</span></td>
+                  <td className="td">{x.affected_count} <span className="mono text-[11px] text-slate-500">{(x.affected_keys || []).slice(0, 5).join(", ")}</span></td>
                   <td className="td">{x.severity}</td><td className="td text-xs">{x.disposition_code ?? <A href="/ipe">disposition in queue →</A>}</td></tr>
               ))}
             </Table>

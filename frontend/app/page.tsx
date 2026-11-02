@@ -38,7 +38,8 @@ export default function Dashboard() {
   const counts: Record<string, number> = scoped ? scoped.assurance_counts : d?.assurance_totals ?? {};
   const denominator = d ? (scoped ? scoped.denominator : d.by_entity.reduce((a: number, e: any) => a + e.denominator, 0)) : 0;
   const uncertain = d ? (scoped ? scoped.uncertain_evaluations : d.by_entity.reduce((a: number, e: any) => a + e.uncertain_evaluations, 0)) : 0;
-  const asOf = d ? `As of ${fmtDate(d.as_of.valid_at, true)} · record seq ${d.as_of.record_seq}` : "";
+  // When this projection was read, and the home-cell record watermark it reflects. Snapshot states keep their own period and cutoff.
+  const readAt = d ? `Read ${fmtDate(d.as_of.valid_at, true)} · known as of ${d.as_of.cell_id}#${d.as_of.record_seq}` : "";
   const scopeNote = entity ? "All entities (not available per entity)" : undefined;
 
   return (
@@ -50,13 +51,13 @@ export default function Dashboard() {
       {dash.loading && !d && <div className="card"><LoadingSkeleton rows={6} /></div>}
       {d && (
         <div className="space-y-4">
-          <NeedsAttention d={d} controls={controls.data} anomalies={anomalies.data} />
+          <NeedsAttention d={d} controls={controls.data} anomalies={anomalies.data} readAt={readAt} />
 
           <div className="flex flex-wrap items-end justify-between gap-3 pt-2">
             <div className="min-w-0">
               <h2 className="text-sm font-semibold text-slate-900">Assurance position</h2>
               <p className="mt-0.5 text-xs text-slate-500">
-                Latest period snapshot per adopted obligation, {scoped ? <>for <b className="font-medium text-slate-700">{scoped.legal_name}</b></> : "across all legal entities"}. Evidential states, not a compliance score.
+                Each adopted obligation&apos;s most recently frozen period snapshot, {scoped ? <>for <b className="font-medium text-slate-700">{scoped.legal_name}</b></> : "across all legal entities"}. Snapshots can cover different periods and record cutoffs, so read each state with the period beside it. Evidential states, not a compliance score.
               </p>
             </div>
             <EntitySelector entities={d.by_entity} value={entity} onChange={setEntity} className="w-full sm:w-60" />
@@ -73,7 +74,7 @@ export default function Dashboard() {
           </div>
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <AssuranceByState className="xl:col-span-2" counts={counts} denominator={denominator} rows={obls.data} error={obls.error} entity={entity} asOf={asOf} />
+            <AssuranceByState className="xl:col-span-2" counts={counts} denominator={denominator} rows={obls.data} error={obls.error} entity={entity} readAt={readAt} />
             <ApplicabilitySummary d={d} scopeNote={scopeNote} />
           </div>
 
@@ -90,13 +91,14 @@ export default function Dashboard() {
   );
 }
 
-function AssuranceByState({ counts, denominator, rows, error, entity, asOf, className = "" }:
-  { counts: Record<string, number>; denominator: number; rows: any[] | null; error: unknown; entity: string; asOf: string; className?: string }) {
+function AssuranceByState({ counts, denominator, rows, error, entity, readAt, className = "" }:
+  { counts: Record<string, number>; denominator: number; rows: any[] | null; error: unknown; entity: string; readAt: string; className?: string }) {
   const list = useMemo(() => (rows ?? []).filter((o) => o.lifecycle === "ADOPTED" && (!entity || o.entity_id === entity)), [rows, entity]);
   const segments = [...STATES, "NO_SNAPSHOT"].map((k) => ({ k, n: counts[k] ?? 0 })).filter((s) => s.n > 0);
   return (
-    <Card className={className} title="Assurance by state" subtitle="Latest period snapshot per adopted obligation. States are computed by the backend roll-up and never edited here."
-      actions={<A href="/assurance">View all</A>} bodyClassName="" footer={asOf}>
+    <Card className={className} title="Assurance by state" subtitle="Most recently frozen period snapshot per adopted obligation. States are computed by the backend roll-up and never edited here."
+      actions={<A href="/assurance">View all</A>} bodyClassName=""
+      footer={`${readAt}. States are not re-evaluated at that time: each comes from the snapshot in its row, with that snapshot's own period, perspective and record cutoff.`}>
       <div className="space-y-2 px-4 pt-4">
         {denominator > 0 ? (
           <>
@@ -112,7 +114,7 @@ function AssuranceByState({ counts, denominator, rows, error, entity, asOf, clas
       </div>
       <ErrorBox error={error} />
       <div className="mt-2">
-        <Table head={["Obligation", "Subject", "State", "Period · perspective", "Exceptions"]} empty={!!rows && list.length === 0}>
+        <Table head={["Obligation", "Subject", "State", "Period (end exclusive) · perspective", "Record cutoff", "Exceptions"]} empty={!!rows && list.length === 0}>
           {list.map((o) => {
             const s = o.latest_snapshot;
             return (
@@ -120,8 +122,9 @@ function AssuranceByState({ counts, denominator, rows, error, entity, asOf, clas
                 <td className="td"><Link href={`/obligations/${o.lineage_id}`} className="font-medium text-slate-900 hover:text-navy-700">{o.definition.title}</Link><div className="mono text-[11px] text-slate-500">{o.definition.key}</div></td>
                 <td className="td text-slate-600">{o.subject.display_name}</td>
                 <td className="td">{s ? <Badge code={s.state} /> : <span className="text-xs text-slate-500">Not assessed</span>}</td>
-                <td className="td text-xs text-slate-600">{s ? <><span className="whitespace-nowrap">{fmtDate(s.period_from)} → {fmtDate(s.period_to)}</span><div className="mono text-[10px] text-slate-500">{s.perspective}</div></> : "—"}</td>
-                <td className="td">{o.open_exceptions ? <Badge tone="exception" label={`${o.open_exceptions} APPROVED`} title="Approved exception(s): shown beside the state, never changing it" /> : <span className="text-xs text-slate-400">None</span>}</td>
+                <td className="td text-xs text-slate-600">{s ? <><span className="whitespace-nowrap">{fmtDate(s.period_from)} → {fmtDate(s.period_to)}</span><div className="mono text-[11px] text-slate-500">{s.perspective}</div></> : "—"}</td>
+                <td className="td text-xs text-slate-600">{s ? <><span className="mono">{s.record_cutoff_seq != null ? `#${s.record_cutoff_seq}` : "Not recorded"}</span><div className="whitespace-nowrap text-[11px] text-slate-500">frozen {fmtDate(s.created_at, true)}</div></> : "—"}</td>
+                <td className="td">{o.open_exceptions ? <Badge tone="exception" label={`${o.open_exceptions} APPROVED`} title="Approved exception(s): shown beside the state, never changing it" /> : <span className="text-xs text-slate-500">None</span>}</td>
               </tr>
             );
           })}
@@ -160,7 +163,7 @@ function ApplicabilitySummary({ d, scopeNote }: { d: any; scopeNote?: string }) 
 function EvidenceFreshness({ d, scopeNote }: { d: any; scopeNote?: string }) {
   const conds = Object.entries(d.evidence_conditions as Record<string, number>).sort((a, b) => b[1] - a[1]);
   return (
-    <Card title="Evidence freshness" subtitle="Evidence condition across artifacts" actions={<A href="/evidence">Evidence</A>}
+    <Card title="Evidence freshness" subtitle="Each artifact's condition when this dashboard was read, not within any snapshot period" actions={<A href="/evidence">Evidence</A>}
       footer={scopeNote ?? `Ledger head #${d.ledger.head_seq} · last checkpoint #${d.ledger.last_checkpointed_seq}`}>
       {conds.length === 0 ? <EmptyState title="No evidence captured yet" compact /> : (
         <ul className="divide-y divide-slate-100">
@@ -202,7 +205,7 @@ function OrgSummary({ me, org }: { me: Me | null; org: any }) {
       <div className="flex min-w-0 items-start gap-3">
         <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-navy-50 text-navy-700"><Building2 size={18} aria-hidden /></span>
         <div className="min-w-0">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Organisation</div>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">Organisation</div>
           <div className="text-[15px] font-semibold leading-6 text-slate-900">{org?.tenant.legal_name ?? me?.tenant_name}</div>
           {org && (
             <div className="text-xs text-slate-500">
@@ -213,7 +216,7 @@ function OrgSummary({ me, org }: { me: Me | null; org: any }) {
         </div>
       </div>
       <div className="min-w-0 border-t border-slate-100 pt-3 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
-        <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Signed in as</div>
+        <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">Signed in as</div>
         <div className="text-[13px] font-medium text-slate-900">{me?.display_name.replace(/\s*\(.*\)/, "")}</div>
         <div className="text-xs text-slate-500">{rolesText(me)} · <A href="/admin/users">Your access</A></div>
       </div>
@@ -224,7 +227,7 @@ function OrgSummary({ me, org }: { me: Me | null; org: any }) {
 type Attention = { key: string; n: number; code: string; label: string; why: string; href: string; next: string };
 
 /** Work that blocks or qualifies assurance, most severe first. Organisation-wide; only non-zero items are listed. */
-function NeedsAttention({ d, controls, anomalies }: { d: any; controls: any[] | null; anomalies: any[] | null }) {
+function NeedsAttention({ d, controls, anomalies, readAt }: { d: any; controls: any[] | null; anomalies: any[] | null; readAt: string }) {
   const t = d.assurance_totals as Record<string, number>;
   const sev = d.open_issues.by_severity as Record<string, number>;
   const ev = d.evidence_conditions as Record<string, number>;
@@ -235,23 +238,23 @@ function NeedsAttention({ d, controls, anomalies }: { d: any; controls: any[] | 
   const uncertain = d.by_entity.reduce((a: number, e: any) => a + e.uncertain_evaluations, 0);
   const list = (pairs: [string, number][]) => pairs.map(([k, v]) => `${v} ${k}`).join(" · ");
   const items: Attention[] = [
-    { key: "failing", n: t.FAILING ?? 0, code: "FAILING", label: "Obligations FAILING", why: "A control or required occurrence failed in the latest period snapshot.", href: "/assurance", next: "Assurance Periods" },
+    { key: "failing", n: t.FAILING ?? 0, code: "FAILING", label: "Obligations FAILING", why: "A control or required occurrence failed in the obligation's most recently frozen period snapshot.", href: "/assurance", next: "Assurance Periods" },
     { key: "review", n: t.REQUIRES_REVIEW ?? 0, code: "REQUIRES_REVIEW", label: "Obligations REQUIRES_REVIEW", why: "Conflicting or unresolved inputs need a human decision.", href: "/assurance", next: "Assurance Periods" },
     { key: "notproven", n: t.NOT_PROVEN ?? 0, code: "NOT_PROVEN", label: "Obligations NOT_PROVEN", why: "Evidence is missing, stale or IPE-unverified for part of the period.", href: "/assurance", next: "Assurance Periods" },
     { key: "unassessed", n: t.NO_SNAPSHOT ?? 0, code: "NOT_EVALUATED", label: "Adopted obligations not yet assessed", why: "No period snapshot has been frozen. Open the dossier and assess a period.", href: "/obligations", next: "Obligation Dossiers" },
     { key: "adopt", n: (d.determinations.PROPOSED ?? 0) + (d.determinations.IN_REVIEW ?? 0), code: "PROPOSED", label: "Applicability determinations awaiting adoption", why: "An APPLIES result becomes an obligation only after a named person attests it.", href: "/applicability", next: "Applicability Review" },
     { key: "rereview", n: d.determinations.needs_review ?? 0, code: "REQUIRES_REVIEW", label: "Adopted determinations flagged for re-review", why: "A newer evaluation disagrees with the adopted outcome.", href: "/applicability", next: "Applicability Review" },
-    { key: "uncertain", n: uncertain, code: "UNCERTAIN", label: "UNCERTAIN applicability evaluations", why: "Missing facts prevent a decision. Reported separately, never excluded.", href: "/applicability", next: "Applicability Review" },
+    { key: "uncertain", n: uncertain, code: "UNCERTAIN", label: "UNCERTAIN applicability evaluations", why: "Missing facts prevent a definitive outcome. Reported separately, never excluded.", href: "/applicability", next: "Applicability Review" },
     { key: "facts", n: d.open_fact_requests, code: "OPEN", label: "Open fact requests", why: "Facts requested from their owners to resolve UNCERTAIN outcomes.", href: "/fact-requests", next: "Fact Requests" },
     { key: "controls", n: ctlOff.length, code: ctlOff.some((c) => c.current_state.state === "FAILING") ? "FAILING" : "NOT_EVALUATED", label: "Controls not OPERATING", why: `${list(ctlByState as [string, number][])} (24-hour convenience view; open a control for its recorded evaluations).`, href: "/controls", next: "Controls & Tests" },
-    { key: "evidence", n: notCurrent.reduce((a, [, v]) => a + v, 0), code: ev.INVALID ? "INVALID" : "STALE", label: "Evidence not CURRENT", why: `${list(notCurrent)}. Stale or invalid evidence cannot prove a control.`, href: "/evidence", next: "Evidence Records" },
-    { key: "ipe", n: openIpe, code: "IPE_INCONCLUSIVE", label: "IPE anomalies awaiting disposition", why: "A population behind a test is not yet proven complete and accurate.", href: "/ipe", next: "IPE" },
+    { key: "evidence", n: notCurrent.reduce((a, [, v]) => a + v, 0), code: ev.INVALID ? "INVALID" : "STALE", label: "Evidence not CURRENT", why: `${list(notCurrent)}. Stale or invalid evidence cannot support current-period proof.`, href: "/evidence", next: "Evidence Records" },
+    { key: "ipe", n: openIpe, code: "IPE_INCONCLUSIVE", label: "IPE anomalies awaiting disposition", why: "A population behind a test is not yet established as complete and accurate.", href: "/ipe", next: "IPE" },
     { key: "issues", n: d.open_issues.total, code: (sev.CRITICAL || sev.HIGH) ? "FAIL" : "OPEN", label: "Open issues", why: list(Object.entries(sev).filter(([, v]) => v).map(([k, v]) => [k.toLowerCase(), v])), href: "/governance", next: "Exceptions & Issues" },
   ];
   const open = items.filter((i) => i.n > 0);
   return (
     <Card title="Needs attention" subtitle="Work that blocks or qualifies assurance, across all legal entities, most severe first." bodyClassName=""
-      footer="Built from the latest recorded data. An empty list is not a statement of compliance.">
+      footer={`${readAt}. Obligation counts use each obligation's most recently frozen snapshot. An empty list is not a statement of compliance.`}>
       {open.length === 0 ? <p className="px-4 py-4 text-[13px] text-slate-600">Nothing is flagged in the latest recorded data.</p> : (
         <ul className="grid divide-y divide-slate-100 lg:grid-cols-2 lg:divide-y-0">
           {open.map((i) => {
@@ -287,10 +290,10 @@ function RecordChain({ d, sources, controls }: { d: any; sources: any[] | null; 
   const n = (v: number | undefined) => (v === undefined ? "…" : v);
   const steps = [
     { label: "Requirements", value: `${n(sources?.length)} regulatory source(s)`, about: "Encoded from authoritative regulatory text.", href: "/sources" },
-    { label: "Applicability", value: `${out.APPLIES ?? 0} APPLIES · ${out.UNCERTAIN ?? 0} UNCERTAIN`, about: "Decides whether each requirement applies to each subject.", href: "/applicability" },
+    { label: "Applicability", value: `${out.APPLIES ?? 0} APPLIES · ${out.UNCERTAIN ?? 0} UNCERTAIN`, about: "Evaluates whether each requirement applies to each subject.", href: "/applicability" },
     { label: "Obligations", value: `${adopted} adopted`, about: "Determinations a named person has attested.", href: "/obligations" },
     { label: "Controls", value: `${n(controls?.length)} implemented`, about: "Shared controls that satisfy obligations.", href: "/controls" },
-    { label: "Evidence", value: `${evidence} artifact(s)`, about: "Test results and records proving controls operated, IPE-checked where required.", href: "/evidence" },
+    { label: "Evidence", value: `${evidence} artifact(s)`, about: "Test results and records behind control evaluations, IPE-checked where required.", href: "/evidence" },
     { label: "Assurance", value: `${adopted - (t.NO_SNAPSHOT ?? 0)} of ${adopted} assessed`, about: "Period states computed from everything above.", href: "/assurance" },
   ];
   return (
@@ -299,7 +302,7 @@ function RecordChain({ d, sources, controls }: { d: any; sources: any[] | null; 
         {steps.map((s, i) => (
           <li key={s.label} className="relative flex gap-3 pb-3 last:pb-0">
             {i < steps.length - 1 && <span aria-hidden className="absolute left-[9px] top-5 h-[calc(100%-12px)] w-px bg-slate-200" />}
-            <span aria-hidden className="mt-0.5 flex h-[19px] w-[19px] shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white text-[10px] font-semibold text-slate-500">{i + 1}</span>
+            <span aria-hidden className="mt-0.5 flex h-[19px] w-[19px] shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white text-[11px] font-semibold text-slate-500">{i + 1}</span>
             <div className="min-w-0">
               <div className="flex flex-wrap items-baseline gap-x-2">
                 <Link href={s.href} className="text-[13px] font-medium text-slate-900 hover:text-navy-700">{s.label}</Link>

@@ -1,10 +1,11 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, Hash, Json, KV, Modal, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, Hash, Json, KV, Modal, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 import { RuleTrace } from "@/components/Trace";
 import { AttestModal } from "@/components/AttestModal";
 
@@ -14,6 +15,7 @@ export default function EvaluationPage() {
   const [decisive, setDecisive] = useState(false);
   const [att, setAtt] = useState(false);
   const [chal, setChal] = useState(false);
+  const { can, why } = useCan();
   const det = e?.current_determination;
   const isLatest = det?.evaluation_id === e?.evaluation_id;
   return (
@@ -21,8 +23,9 @@ export default function EvaluationPage() {
       <PageHeader spec="WF-APP-02 · ZA-APP-001 §7" title={e ? `${e.obligation_definition.key} · ${e.subject.display_name}` : "Evaluation"}
         subtitle={e?.obligation_definition.title}
         actions={det && isLatest && <>
-          {(["PROPOSED", "IN_REVIEW"].includes(det.state) || det.needs_review) && e.outcome !== "UNCERTAIN" && <button className="btn-primary" onClick={() => setAtt(true)}>Attest</button>}
-          <button className="btn-ghost" onClick={() => setChal(true)}>Challenge</button></>} />
+          {(["PROPOSED", "IN_REVIEW"].includes(det.state) || det.needs_review) && e.outcome !== "UNCERTAIN" && <button className="btn-primary" disabled={!can("attest")} title={why("attest")} onClick={() => setAtt(true)}>Attest</button>}
+          <button className="btn-ghost" disabled={!can("challenge")} title={why("challenge")} onClick={() => setChal(true)}>Challenge</button></>} />
+      <PermissionNote perms={["attest", "challenge"]} />
       <ErrorBox error={error} />
       {e && (
         <div className="space-y-4">
@@ -51,7 +54,7 @@ export default function EvaluationPage() {
             <Card title="Frozen input bundle">
               <Table head={["Fact", "Provenance", "Revision"]}>
                 {e.input_bundle.fact_inputs.map((f: any) => (
-                  <tr key={f.fact_assertion_revision_id}><td className="td mono text-xs">{f.fact_definition}</td><td className="td mono text-[10px]">{f.provenance_class}</td><td className="td"><Hash value={f.fact_assertion_revision_id} n={8} /></td></tr>
+                  <tr key={f.fact_assertion_revision_id}><td className="td mono text-xs">{f.fact_definition}</td><td className="td mono text-[11px]">{f.provenance_class}</td><td className="td"><Hash value={f.fact_assertion_revision_id} n={8} /></td></tr>
                 ))}
                 {e.input_bundle.unknown_facts?.map((f: any) => (
                   <tr key={f.fact_definition}><td className="td mono text-xs">{f.fact_definition}</td><td className="td" colSpan={2}><Badge code="UNKNOWN" label={f.reason_code} /></td></tr>
@@ -76,7 +79,7 @@ export default function EvaluationPage() {
             <Card title="Attestations & challenges">
               {e.attestations.map((a: any) => (
                 <div key={a.attestation_id} className="mb-3 rounded-lg border border-navy-100 p-3 text-sm">
-                  <div className="mb-1 flex items-center gap-2"><Badge code={a.decision === "ADOPT" ? "ADOPTED" : "REJECTED"} /><span className="text-xs text-slate-500">{fmtDate(a.signed_at, true)} · {a.actor_id}</span></div>
+                  <div className="mb-1 flex items-center gap-2"><AttestationDecision decision={a.decision} /><span className="text-xs text-slate-500">{fmtDate(a.signed_at, true)} · {a.actor_id}</span></div>
                   <p className="text-xs italic text-navy-800">&ldquo;{a.statement}&rdquo;</p>
                 </div>
               ))}
@@ -97,18 +100,27 @@ export default function EvaluationPage() {
   );
 }
 
+/** Attestation codes (ZA-GLS-001 §07). Any other value is shown as received, never coerced to a known decision. */
+function AttestationDecision({ decision }: { decision?: string | null }) {
+  if (decision === "ATTESTED") return <Badge code="ATTESTED" />;
+  if (decision === "DECLINED") return <Badge code="DECLINED" tone="bad" />;
+  if (!decision) return <span className="text-xs text-slate-500">Decision not recorded</span>;
+  return <><Badge code={decision} tone="neutral" /><span className="text-xs text-slate-500">unrecognised decision code</span></>;
+}
+
 function Challenge({ lineage, onClose, onDone }: { lineage: string; onClose: () => void; onDone: () => void }) {
   const [cls, setCls] = useState("FACT_WRONG");
   const [detail, setDetail] = useState("");
   const a = useAction();
+  const fid = useId();
   return (
     <Modal open onClose={onClose} title="Challenge determination">
       <Notice>A challenge creates a governed record. It never rewrites the evaluation.</Notice>
       <ErrorBox error={a.error} />
       <div className="mt-3 grid gap-3">
-        <div><label className="label">Challenge class</label><select className="input" value={cls} onChange={(e) => setCls(e.target.value)}>
+        <div><label className="label" htmlFor={`${fid}-class`}>Challenge class</label><select id={`${fid}-class`} className="input" value={cls} onChange={(e) => setCls(e.target.value)}>
           {["FACT_WRONG", "FACT_MISSING", "RULE_WRONG", "INTERPRETATION"].map((x) => <option key={x}>{x}</option>)}</select></div>
-        <div><label className="label">Detail</label><textarea className="input" rows={3} value={detail} onChange={(e) => setDetail(e.target.value)} /></div>
+        <div><label className="label" htmlFor={`${fid}-detail`}>Detail (required)</label><textarea id={`${fid}-detail`} required className="input" rows={3} value={detail} onChange={(e) => setDetail(e.target.value)} /></div>
       </div>
       <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={!detail || a.busy} onClick={() => a.run(async () => {
         await api(`/applicability/determinations/${lineage}/challenge`, { method: "POST", json: { challenge_class: cls, detail } }); onDone();
