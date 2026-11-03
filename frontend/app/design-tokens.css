@@ -1,0 +1,217 @@
+/* Zoiko Assure Unified Design System: foundation tokens (Task 1, proposed for approval).
+
+   Three layers, each building on the one before:
+   1. Primitives (@theme static): the raw palette measured from the Design Governance reference, always emitted as
+      CSS variables. navy-* and brand-* (the logo orange) are defined in globals.css.
+   2. Semantic tokens (--za-*): what a value is for. Light values on :root match the current application; dark values
+      under [data-theme="dark"] match the Design Governance reference. A subtree opts into a theme with data-theme.
+   3. Utilities (@theme inline, @theme static, @utility): Tailwind classes such as bg-surface-card, text-fg-secondary,
+      border-line, bg-status-verified-tint, rounded-card, shadow-panel, p-card, gap-section and type-section.
+
+   Existing screens use none of these names, so adding them changes nothing until a component opts in.
+   Every text/background pair below meets WCAG 2.2 AA (4.5:1 for text, 3:1 for the focus ring) in both themes; the
+   Design Governance page recomputes those ratios from the live values. White text on an accent fill does not
+   (2.2:1 dark, 2.9:1 light), so text on accent fills uses --za-on-accent. */
+
+@theme static {
+  --color-gold-200: #f7d27a;
+  --color-gold-300: #f4be55;
+  --color-gold-400: #f59c0a;
+  --color-gold-500: #e27500;
+  --color-gold-600: #b45d05;
+  --color-azure-300: #8fb4f0;
+  --color-azure-400: #5aa0ff;
+  --color-azure-500: #3b82f6;
+  --color-midnight-800: #0f1f43;
+  --color-midnight-900: #111726;
+  --color-midnight-950: #0b1222;
+  --color-charcoal-700: #2b2a33;
+  --color-charcoal-800: #20222e;
+  --color-charcoal-900: #13131b;
+
+  /* Spacing roles. Fluid where a fixed value is too loose on phones or too tight on wide screens. */
+  --spacing-gutter: clamp(1rem, 3vw, 2rem);         /* page side margin */
+  --spacing-page: clamp(1.25rem, 3vw, 1.75rem);     /* page top and bottom */
+  --spacing-sidebar: 16rem;                         /* sidebar width */
+  --spacing-sidebar-inset: 1.5rem;                  /* sidebar inner padding */
+  --spacing-header: 4rem;                           /* top navigation height */
+  --spacing-card: clamp(1rem, 2vw, 1.5rem);         /* card padding */
+  --spacing-panel: clamp(1.25rem, 2.5vw, 2rem);     /* panel padding */
+  --spacing-section: 2rem;                          /* gap between page sections */
+  --spacing-stack: 1rem;                            /* gap between cards inside a panel */
+  --spacing-form: 1rem;                             /* gap between form fields */
+  --spacing-cell-x: 0.75rem;                        /* table cell, horizontal */
+  --spacing-cell-y: 0.625rem;                       /* table cell, vertical */
+
+  --radius-chip: 0.375rem;
+  --radius-control: 0.625rem;
+  --radius-button: 0.625rem;
+  --radius-nav: 0.625rem;
+  --radius-card: 0.875rem;
+  --radius-modal: 1.25rem;
+  --radius-panel: 1.5rem;
+
+  --container-content: 90rem;                       /* main content max width (1440px) */
+}
+
+:root, [data-theme="light"] {
+  --za-surface-app: #f1f5f9;          /* slate-100 */
+  --za-surface-sidebar: #0c2a3e;      /* navy-900, the organisation workspace sidebar */
+  --za-surface-raised: #ffffff;
+  --za-surface-card: #ffffff;
+  --za-surface-modal: #ffffff;
+  --za-surface-control: #ffffff;
+  --za-line: #e2e8f0;                 /* slate-200 */
+  --za-line-strong: #cbd5e1;          /* slate-300 */
+
+  --za-fg: #0f172a;                   /* slate-900 */
+  --za-fg-secondary: #475569;         /* slate-600 */
+  --za-fg-muted: #5f6b70;             /* slate-brand */
+  --za-fg-disabled: #94a3b8;          /* slate-400 */
+  --za-fg-inverse: #ffffff;
+  /* The sidebar is a dark surface in both themes, so it has its own text, line and hover tokens. */
+  --za-sidebar-fg: #e2e8f0;
+  --za-sidebar-muted: #94a3b8;
+  --za-sidebar-strong: #ffffff;
+  --za-sidebar-line: rgb(255 255 255 / 0.1);
+  --za-sidebar-hover: rgb(255 255 255 / 0.06);
+
+  --za-accent: #d9822b;               /* brand-500 */
+  --za-accent-strong: #bb6a1d;        /* brand-600 */
+  --za-accent-fg: #95521a;            /* brand-700 */
+  --za-on-accent: #1a1205;
+  --za-accent-secondary: #2a6a8f;     /* navy-500 */
+  --za-accent-secondary-fg: #1d5879;  /* navy-600 */
+  --za-focus: #2a6a8f;
+
+  --za-status-verified: #047857;  --za-status-verified-tint: #ecfdf5;  --za-status-verified-line: #a7f3d0;
+  --za-status-warning: #b45309;   --za-status-warning-tint: #fffbeb;   --za-status-warning-line: #fde68a;
+  --za-status-critical: #b91c1c;  --za-status-critical-tint: #fef2f2;  --za-status-critical-line: #fecaca;
+  --za-status-unknown: #475569;   --za-status-unknown-tint: #f1f5f9;   --za-status-unknown-line: #cbd5e1;
+  --za-status-info: #1d5879;      --za-status-info-tint: #eef4f8;      --za-status-info-line: #aecadc;
+
+  --za-shadow-card: 0 1px 2px rgb(15 23 42 / 0.05);
+  --za-shadow-panel: 0 1px 3px rgb(15 23 42 / 0.06), 0 12px 32px -20px rgb(15 23 42 / 0.18);
+  --za-shadow-modal: 0 24px 48px -12px rgb(15 23 42 / 0.25);
+  --za-shadow-glow: 0 6px 16px -6px rgb(217 130 43 / 0.45);
+  --za-scrim: rgb(15 23 42 / 0.45);   /* behind modal dialogs */
+  --za-backdrop: radial-gradient(60rem 30rem at 55% -10%, rgb(42 106 143 / 0.08), transparent 70%), #f1f5f9;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --za-surface-app: var(--color-midnight-950);
+  --za-surface-sidebar: var(--color-midnight-900);
+  --za-surface-raised: #171b28;
+  --za-surface-card: var(--color-charcoal-800);
+  --za-surface-modal: #1a1e2b;
+  --za-surface-control: #182030;
+  --za-line: rgb(255 225 200 / 0.1);
+  --za-line-strong: rgb(255 225 200 / 0.18);
+
+  --za-fg: #f5f7fb;
+  --za-fg-secondary: #a3adc2;
+  --za-fg-muted: #8a93a6;
+  --za-fg-disabled: #5f6677;
+  --za-fg-inverse: var(--color-midnight-950);
+  --za-sidebar-fg: #aab1c0;
+  --za-sidebar-muted: #8590a3;
+  --za-sidebar-strong: #f5f7fb;
+  --za-sidebar-line: rgb(255 225 200 / 0.1);
+  --za-sidebar-hover: rgb(255 255 255 / 0.05);
+
+  --za-accent: var(--color-gold-400);
+  --za-accent-strong: var(--color-gold-500);
+  --za-accent-fg: var(--color-gold-300);
+  --za-on-accent: #1a1205;
+  --za-accent-secondary: var(--color-azure-400);
+  --za-accent-secondary-fg: var(--color-azure-300);
+  --za-focus: var(--color-gold-300);
+
+  --za-status-verified: #4cc38a;  --za-status-verified-tint: rgb(76 195 138 / 0.12);   --za-status-verified-line: rgb(76 195 138 / 0.32);
+  --za-status-warning: #e5a443;   --za-status-warning-tint: rgb(229 164 67 / 0.12);    --za-status-warning-line: rgb(229 164 67 / 0.32);
+  --za-status-critical: #f87171;  --za-status-critical-tint: rgb(248 113 113 / 0.12);  --za-status-critical-line: rgb(248 113 113 / 0.32);
+  --za-status-unknown: #9aa3b5;   --za-status-unknown-tint: rgb(154 163 181 / 0.1);    --za-status-unknown-line: rgb(154 163 181 / 0.24);
+  --za-status-info: #6aa8ff;      --za-status-info-tint: rgb(106 168 255 / 0.12);      --za-status-info-line: rgb(106 168 255 / 0.32);
+
+  --za-shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.04), 0 10px 24px -14px rgb(0 0 0 / 0.7);
+  --za-shadow-panel: inset 0 1px 0 rgb(255 255 255 / 0.04), 0 28px 56px -28px rgb(0 0 0 / 0.8);
+  --za-shadow-modal: 0 32px 64px -16px rgb(0 0 0 / 0.8);
+  --za-shadow-glow: 0 10px 28px -8px rgb(245 156 10 / 0.6);
+  --za-scrim: rgb(3 6 15 / 0.72);
+  --za-backdrop:
+    radial-gradient(48rem 26rem at 58% -6%, rgb(30 64 140 / 0.45), transparent 70%),
+    radial-gradient(40rem 32rem at -8% 108%, rgb(120 72 40 / 0.4), transparent 70%),
+    radial-gradient(36rem 28rem at 108% 110%, rgb(110 70 40 / 0.22), transparent 70%),
+    var(--color-midnight-950);
+}
+
+@theme inline {
+  --color-surface-app: var(--za-surface-app);
+  --color-surface-sidebar: var(--za-surface-sidebar);
+  --color-surface-raised: var(--za-surface-raised);
+  --color-surface-card: var(--za-surface-card);
+  --color-surface-modal: var(--za-surface-modal);
+  --color-surface-control: var(--za-surface-control);
+  --color-line: var(--za-line);
+  --color-line-strong: var(--za-line-strong);
+
+  --color-fg: var(--za-fg);
+  --color-fg-secondary: var(--za-fg-secondary);
+  --color-fg-muted: var(--za-fg-muted);
+  --color-fg-disabled: var(--za-fg-disabled);
+  --color-fg-inverse: var(--za-fg-inverse);
+  --color-sidebar-fg: var(--za-sidebar-fg);
+  --color-sidebar-muted: var(--za-sidebar-muted);
+  --color-sidebar-strong: var(--za-sidebar-strong);
+  --color-sidebar-line: var(--za-sidebar-line);
+  --color-sidebar-hover: var(--za-sidebar-hover);
+
+  --color-accent: var(--za-accent);
+  --color-accent-strong: var(--za-accent-strong);
+  --color-accent-fg: var(--za-accent-fg);
+  --color-on-accent: var(--za-on-accent);
+  --color-accent-secondary: var(--za-accent-secondary);
+  --color-accent-secondary-fg: var(--za-accent-secondary-fg);
+  --color-focus: var(--za-focus);
+  --color-scrim: var(--za-scrim);
+
+  --color-status-verified: var(--za-status-verified);
+  --color-status-verified-tint: var(--za-status-verified-tint);
+  --color-status-verified-line: var(--za-status-verified-line);
+  --color-status-warning: var(--za-status-warning);
+  --color-status-warning-tint: var(--za-status-warning-tint);
+  --color-status-warning-line: var(--za-status-warning-line);
+  --color-status-critical: var(--za-status-critical);
+  --color-status-critical-tint: var(--za-status-critical-tint);
+  --color-status-critical-line: var(--za-status-critical-line);
+  --color-status-unknown: var(--za-status-unknown);
+  --color-status-unknown-tint: var(--za-status-unknown-tint);
+  --color-status-unknown-line: var(--za-status-unknown-line);
+  --color-status-info: var(--za-status-info);
+  --color-status-info-tint: var(--za-status-info-tint);
+  --color-status-info-line: var(--za-status-info-line);
+
+  --shadow-card: var(--za-shadow-card);
+  --shadow-panel: var(--za-shadow-panel);
+  --shadow-modal: var(--za-shadow-modal);
+  --shadow-glow: var(--za-shadow-glow);
+}
+
+/* Typography roles. One class sets size, line height, weight, tracking (and case or family where the role needs it). */
+@utility type-display { font-size: 2.25rem; line-height: 2.75rem; font-weight: 700; letter-spacing: -0.02em; }
+@utility type-page { font-size: 1.875rem; line-height: 2.375rem; font-weight: 600; letter-spacing: -0.01em; }
+@utility type-section { font-size: 0.8125rem; line-height: 1.25rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; }
+@utility type-card { font-size: 1.0625rem; line-height: 1.5rem; font-weight: 600; letter-spacing: -0.005em; }
+@utility type-body { font-size: 0.9375rem; line-height: 1.5rem; font-weight: 400; }
+@utility type-secondary { font-size: 0.8125rem; line-height: 1.25rem; font-weight: 400; }
+@utility type-label { font-size: 0.6875rem; line-height: 1rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
+@utility type-caption { font-size: 0.75rem; line-height: 1rem; font-weight: 400; }
+@utility type-code { font-family: var(--font-mono); font-size: 0.75rem; line-height: 1rem; font-weight: 400; letter-spacing: 0; }
+
+/* The decorative page backdrop for themed workspaces: glows over the app surface, fixed to the viewport. */
+@utility bg-backdrop { background: var(--za-backdrop); background-attachment: fixed; }
+
+/* Inside a themed subtree the focus outline uses that theme's focus colour (the global navy outline is too dark on
+   dark surfaces). Screens without data-theme keep the global outline. */
+[data-theme] :focus-visible { outline-color: var(--za-focus); }

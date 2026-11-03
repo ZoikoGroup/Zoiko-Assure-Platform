@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, RefObject, SelectHTMLAttributes } from "react";
+import { cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { ButtonHTMLAttributes, InputHTMLAttributes, KeyboardEvent as ReactKeyboardEvent, ReactNode, RefObject, SelectHTMLAttributes } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Building2, CheckCircle2, ChevronRight, CircleDashed, Flag, HelpCircle, Inbox, Info, Loader2,
@@ -319,17 +319,30 @@ export function PageHeader({ title, subtitle, actions, spec, kicker }: { title: 
    the tab. Only the selected tab's panel is rendered, so only that tab carries aria-controls. */
 const tabId = (id: string, t: string) => `${id}-tab-${t.replace(/[^A-Za-z0-9]+/g, "-")}`;
 
-export function Tabs({ id, tabs, value, onChange }: { id?: string; tabs: string[]; value: string; onChange: (t: string) => void }) {
+/** Roving focus for a tab list (WAI-ARIA tabs): Arrow keys move and select, Home and End jump, disabled tabs are skipped.
+ *  Shared by these Tabs and the design-system Tabs (components/ds). */
+export function useRovingTabs(tabs: string[], onChange: (t: string) => void, isDisabled?: (t: string) => boolean) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
-  const move = (i: number) => { const n = (i + tabs.length) % tabs.length; onChange(tabs[n]); refs.current[n]?.focus(); };
-  const keys: Record<string, (i: number) => void> = { ArrowRight: (i) => move(i + 1), ArrowLeft: (i) => move(i - 1), Home: () => move(0), End: () => move(tabs.length - 1) };
+  const move = (from: number, step: number) => {
+    for (let k = 1; k <= tabs.length; k++) {
+      const n = (((from + step * k) % tabs.length) + tabs.length) % tabs.length;
+      if (!isDisabled?.(tabs[n])) { onChange(tabs[n]); refs.current[n]?.focus(); return; }
+    }
+  };
+  const keys: Record<string, (i: number) => void> = { ArrowRight: (i) => move(i, 1), ArrowLeft: (i) => move(i, -1), Home: () => move(-1, 1), End: () => move(tabs.length, -1) };
+  const onKeyDown = (i: number) => (e: ReactKeyboardEvent) => { const k = keys[e.key]; if (k) { e.preventDefault(); k(i); } };
+  return { refs, onKeyDown };
+}
+
+export function Tabs({ id, tabs, value, onChange }: { id?: string; tabs: string[]; value: string; onChange: (t: string) => void }) {
+  const { refs, onKeyDown } = useRovingTabs(tabs, onChange);
   return (
     <div role="tablist" className="mb-4 flex flex-wrap gap-4 border-b border-slate-200">
       {tabs.map((t, i) => (
         <button key={t} ref={(el) => { refs.current[i] = el; }} role="tab" type="button" aria-selected={value === t} tabIndex={value === t ? 0 : -1}
           id={id ? tabId(id, t) : undefined} aria-controls={id && value === t ? `${id}-panel` : undefined}
           onClick={() => onChange(t)}
-          onKeyDown={(e) => { const k = keys[e.key]; if (k) { e.preventDefault(); k(i); } }}
+          onKeyDown={onKeyDown(i)}
           className={`-mb-px border-b-2 pb-2 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 ${value === t ? "border-navy-700 text-navy-800" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
           {t}
         </button>
@@ -359,10 +372,12 @@ export function Table({ head, children, empty, loading }: { head: string[]; chil
 }
 
 export type Column<T> = { key: string; header: string; render: (row: T) => ReactNode; sortValue?: (row: T) => string | number | null | undefined; className?: string };
+export type SortState = { key: string; dir: "asc" | "desc" };
 
-export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
-  { columns: Column<T>[]; rows: T[]; rowKey: (r: T) => string; empty?: ReactNode; defaultSort?: { key: string; dir: "asc" | "desc" } }) {
-  const [sort, setSort] = useState(defaultSort ?? null);
+/** Client-side sorting by a column's `sortValue`; `toggle` sorts ascending first, then flips. Shared by these tables
+ *  and the design-system DataTable (components/ds). */
+export function useSortedRows<T>(rows: T[], columns: { key: string; sortValue?: (row: T) => string | number | null | undefined }[], defaultSort?: SortState) {
+  const [sort, setSort] = useState<SortState | null>(defaultSort ?? null);
   const sorted = useMemo(() => {
     const col = sort && columns.find((c) => c.key === sort.key);
     if (!col?.sortValue) return rows;
@@ -373,6 +388,13 @@ export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
       return sort!.dir === "asc" ? r : -r;
     });
   }, [rows, columns, sort]);
+  const toggle = (key: string) => setSort((s) => ({ key, dir: s?.key === key && s.dir === "asc" ? "desc" : "asc" }));
+  return { sorted, sort, toggle };
+}
+
+export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
+  { columns: Column<T>[]; rows: T[]; rowKey: (r: T) => string; empty?: ReactNode; defaultSort?: SortState }) {
+  const { sorted, sort, toggle } = useSortedRows(rows, columns, defaultSort);
   return (
     <div className="scroll-thin overflow-x-auto">
       <table className="min-w-full border-separate border-spacing-0">
@@ -385,7 +407,7 @@ export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
                   aria-sort={active ? (sort!.dir === "asc" ? "ascending" : "descending") : undefined}>
                   {c.sortValue ? (
                     <button type="button" className="inline-flex items-center gap-1 uppercase hover:text-slate-800"
-                      onClick={() => setSort({ key: c.key, dir: active && sort!.dir === "asc" ? "desc" : "asc" })}>
+                      onClick={() => toggle(c.key)}>
                       {c.header}
                       {active ? (sort!.dir === "asc" ? <ArrowUp size={11} aria-hidden /> : <ArrowDown size={11} aria-hidden />) : <ArrowUpDown size={11} aria-hidden className="opacity-40" />}
                     </button>
@@ -526,9 +548,16 @@ export function A({ href, children }: { href: string; children: ReactNode }) {
 }
 
 /** Shown on hover or focus (WCAG 1.4.13): Escape dismisses it without moving focus or the pointer, and the gap to the
- *  bubble is padding, so the pointer can move onto it without it closing. It never takes focus. */
-export function Tooltip({ content, children, side = "top" }: { content: ReactNode; children: ReactNode; side?: "top" | "right" | "bottom" }) {
+ *  bubble is padding, so the pointer can move onto it without it closing. It never takes focus. `bubbleClassName`
+ *  replaces the bubble's look (the design-system Tooltip themes it); `describe` points a single child element at the
+ *  bubble with aria-describedby, for triggers whose name does not already say what the tooltip says. */
+export function Tooltip({ content, children, side = "top", bubbleClassName = "whitespace-nowrap rounded bg-slate-900 px-2 py-1 text-[11px] font-medium text-white shadow", describe = false }:
+  { content: ReactNode; children: ReactNode; side?: "top" | "right" | "bottom"; bubbleClassName?: string; describe?: boolean }) {
   const [open, setOpen] = useState(false);
+  const tipId = useId();
+  const trigger = describe && isValidElement<{ "aria-describedby"?: string }>(children)
+    ? cloneElement(children, { "aria-describedby": [children.props["aria-describedby"], tipId].filter(Boolean).join(" ") })
+    : children;
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
@@ -538,9 +567,9 @@ export function Tooltip({ content, children, side = "top" }: { content: ReactNod
   const pos = side === "right" ? "left-full top-1/2 pl-2 -translate-y-1/2" : side === "bottom" ? "left-1/2 top-full pt-1.5 -translate-x-1/2" : "bottom-full left-1/2 pb-1.5 -translate-x-1/2";
   return (
     <span className="relative inline-flex" onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)} onFocus={() => setOpen(true)} onBlur={() => setOpen(false)}>
-      {children}
-      <span role="tooltip" className={`absolute z-50 ${open ? "block" : "hidden"} ${pos}`}>
-        <span className="block whitespace-nowrap rounded bg-slate-900 px-2 py-1 text-[11px] font-medium text-white shadow">{content}</span>
+      {trigger}
+      <span role="tooltip" id={tipId} className={`absolute z-50 ${open ? "block" : "hidden"} ${pos}`}>
+        <span className={`block ${bubbleClassName}`}>{content}</span>
       </span>
     </span>
   );
@@ -553,7 +582,9 @@ const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), selec
 // drawer leaves the drawer open (every open overlay listens on `document`).
 const openDialogs: object[] = [];
 
-function useDialog(open: boolean, onClose: () => void, panel: RefObject<HTMLDivElement | null>) {
+/** Dialog behaviour shared by every modal surface here and in components/ds: initial focus in the body, a Tab trap,
+ *  Escape for the topmost overlay only, and focus returned to where it was. The panel needs tabIndex={-1}. */
+export function useDialog(open: boolean, onClose: () => void, panel: RefObject<HTMLDivElement | null>) {
   useEffect(() => {
     if (!open) return;
     const token = {};
@@ -652,15 +683,15 @@ export function ConfirmDialog({ title, children, confirm, busyLabel = "Submittin
   );
 }
 
-export function Dropdown({ button, label, children, align = "right", buttonClassName = "", menuClassName = "w-64" }:
-  { button: ReactNode; label: string; children: ReactNode | ((close: () => void) => ReactNode); align?: "left" | "right"; buttonClassName?: string; menuClassName?: string }) {
+/** Disclosure pattern: a button showing a panel of ordinary links and buttons reached with Tab, so no menu role or
+ *  arrow keys. Escape closes and returns focus to the button; tabbing out or clicking outside closes it too. Shared by
+ *  Dropdown and the design-system DropdownMenu (components/ds). */
+export function useDisclosure() {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const btn = useRef<HTMLButtonElement>(null);
   const panelId = useId();
   const close = useCallback(() => { setOpen(false); btn.current?.focus(); }, []);
-  // Disclosure pattern: the panel holds ordinary links and buttons reached with Tab, so no menu role or arrow keys.
-  // Escape closes and returns focus to the button; tabbing out or clicking outside closes it too.
   useEffect(() => {
     if (!open) return;
     const outside = (e: Event) => { if (root.current && !root.current.contains(e.target as Node)) setOpen(false); };
@@ -670,6 +701,12 @@ export function Dropdown({ button, label, children, align = "right", buttonClass
     document.addEventListener("keydown", onKey);
     return () => { document.removeEventListener("mousedown", outside); document.removeEventListener("focusin", outside); document.removeEventListener("keydown", onKey); };
   }, [open, close]);
+  return { open, setOpen, root, btn, panelId, close };
+}
+
+export function Dropdown({ button, label, children, align = "right", buttonClassName = "", menuClassName = "w-64" }:
+  { button: ReactNode; label: string; children: ReactNode | ((close: () => void) => ReactNode); align?: "left" | "right"; buttonClassName?: string; menuClassName?: string }) {
+  const { open, setOpen, root, btn, panelId, close } = useDisclosure();
   return (
     <div ref={root} className="relative">
       <button ref={btn} type="button" aria-label={label} aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen(!open)} className={buttonClassName}>{button}</button>
@@ -689,15 +726,27 @@ export function DropdownItem({ icon: Icon, children, onClick, href, danger }: { 
 }
 
 /* ================================================================ toasts */
-type ToastTone = "info" | "good" | "warn" | "bad";
-const ToastCtx = createContext<(text: string, tone?: ToastTone) => void>(() => {});
-export function ToastProvider({ children }: { children: ReactNode }) {
-  const [items, setItems] = useState<{ id: number; text: string; tone: ToastTone }[]>([]);
+export type ToastTone = "info" | "good" | "warn" | "bad";
+export type ToastItem = { id: number; text: string; tone: ToastTone };
+/** What useToast() returns. A provider (this one, or the design-system ToastProvider) supplies `push`, so callers work
+ *  under either. */
+export const ToastContext = createContext<(text: string, tone?: ToastTone) => void>(() => {});
+const ToastCtx = ToastContext;
+
+/** The queue behind a toast viewport: `push` adds a message that leaves after 4.5 s; `dismiss` removes one early. */
+export function useToastQueue() {
+  const [items, setItems] = useState<ToastItem[]>([]);
+  const dismiss = useCallback((id: number) => setItems((x) => x.filter((t) => t.id !== id)), []);
   const push = useCallback((text: string, tone: ToastTone = "info") => {
     const id = Date.now() + Math.random();
     setItems((x) => [...x, { id, text, tone }]);
-    setTimeout(() => setItems((x) => x.filter((t) => t.id !== id)), 4500);
-  }, []);
+    setTimeout(() => dismiss(id), 4500);
+  }, [dismiss]);
+  return { items, push, dismiss };
+}
+
+export function ToastProvider({ children }: { children: ReactNode }) {
+  const { items, push } = useToastQueue();
   return (
     <ToastCtx.Provider value={push}>
       {children}

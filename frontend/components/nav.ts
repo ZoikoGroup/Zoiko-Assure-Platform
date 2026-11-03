@@ -57,7 +57,62 @@ export const NAV: NavGroup[] = [
   ] },
 ];
 
+/** The organisation workspace sidebar (customer-organisation users), grouped as the Organization Command Center design.
+ *  Each entry opens an existing NAV screen; `more` lists the section's other NAV screens, shown beneath it while one of
+ *  them is open. Every tenant screen in NAV appears here exactly once, so no destination is lost. Presentation only:
+ *  breadcrumbs, canOpen and "Jump to" keep using NAV. */
+export type OrgNavItem = { href: string; label: string; icon: LucideIcon; more?: string[] };
+export type OrgNavGroup = { group: string; items: OrgNavItem[] };
+const ORG_NAV: OrgNavGroup[] = [
+  { group: "Workspace", items: [
+    { href: "/", label: "Overview", icon: LayoutDashboard },
+    { href: "/fact-requests", label: "My Work & Approvals", icon: HelpCircle },
+  ] },
+  { group: "Regulation", items: [
+    { href: "/regulatory", label: "Change Radar", icon: Inbox, more: ["/sources", "/rules", "/rules/workbench"] },
+    { href: "/obligations", label: "Obligations", icon: ClipboardCheck },
+  ] },
+  { group: "Assurance", items: [
+    { href: "/controls", label: "Controls & Testing", icon: SlidersHorizontal },
+    { href: "/evidence", label: "Evidence & IPE", icon: Archive, more: ["/ipe", "/ipe/runs"] },
+    { href: "/governance", label: "Findings & Actions", icon: Flag },
+    { href: "/assurance", label: "Assurance Reports", icon: CalendarRange, more: ["/packages", "/history"] },
+  ] },
+  { group: "Governance", items: [
+    { href: "/entities", label: "Entities & Scope", icon: Building2 },
+    { href: "/applicability", label: "Decisions & Attestations", icon: Scale, more: ["/applicability/trace"] },
+    { href: "/ai", label: "Agent Governance", icon: Bot },
+  ] },
+  { group: "Admin", items: [
+    { href: "/admin/users", label: "Team & Access", icon: Users },
+    { href: "/connectors", label: "Integrations", icon: Plug, more: ["/admin/identity"] },
+    { href: "/ledger", label: "Audit Trail", icon: Link2, more: ["/admin/access-log"] },
+    { href: "/admin/cells", label: "Org Settings", icon: Globe2, more: ["/admin/retention", "/admin/releases"] },
+  ] },
+];
+
 const ITEMS = NAV.flatMap((g) => g.items.map((i) => ({ ...i, group: g.group })));
+
+/** The organisation sidebar, limited to screens the tenant navigation offers. `sub` resolves `more` to NAV items, so
+ *  each sub-entry keeps its screen's own label and icon. */
+export function orgNav(): { group: string; items: (OrgNavItem & { sub: NavItem[] })[] }[] {
+  const allowed = new Set(navFor("tenant").flatMap((g) => g.items.map((i) => i.href)));
+  return ORG_NAV.map((g) => ({
+    ...g,
+    items: g.items.filter((i) => allowed.has(i.href))
+      .map((i) => ({ ...i, sub: (i.more ?? []).filter((h) => allowed.has(h)).map((h) => ITEMS.find((n) => n.href === h)!) })),
+  })).filter((g) => g.items.length > 0);
+}
+
+/** The organisation sidebar section a path belongs to, for its breadcrumb and active state. */
+export function orgSection(path: string): { group: string; item: OrgNavItem } | null {
+  const href = routeMeta(path)?.item.href;
+  for (const g of ORG_NAV) {
+    const item = g.items.find((i) => i.href === href || i.more?.includes(href ?? ""));
+    if (item) return { group: g.group, item };
+  }
+  return null;
+}
 
 /** Detail routes whose section is not their URL prefix (the source-run and evaluation-trace detail pages). */
 const DETAIL_PARENT: [RegExp, string][] = [
@@ -66,7 +121,18 @@ const DETAIL_PARENT: [RegExp, string][] = [
 ];
 
 /** Screens reached from the account menu and "Jump to" rather than the sidebar. */
-const EXTRA = [{ href: "/admin/dictionary", label: "Controlled Dictionary", group: "Administration & Trust" }];
+const EXTRA = [
+  { href: "/admin/dictionary", label: "Controlled Dictionary", group: "Administration & Trust" },
+  { href: "/design-system", label: "Design System & UI Kit", group: "Design Governance" },
+  { href: "/design-system/components", label: "Design System Components", group: "Design Governance" },
+  { href: "/design-system/flows", label: "High-Assurance Flows", group: "Design Governance" },
+  { href: "/design-system/super-admin", label: "Super Admin Planes", group: "Design Governance" },
+  { href: "/design-system/org-workspace", label: "Org Workspace", group: "Design Governance" },
+];
+
+/** Screens with their own full-page workspace chrome, shown without the application sidebar and header. They still
+ *  require a signed-in session (the Shell checks it first); the Design Governance workspace holds no tenant data. */
+export const isStandalone = (path: string) => path === "/design-system" || path.startsWith("/design-system/");
 
 /** A customer organisation's registry record is platform administration, not part of the Super Admin's own
  *  dashboard: its breadcrumb reads "Platform administration › Organisations › <name>" (the list lives on "/"). */
