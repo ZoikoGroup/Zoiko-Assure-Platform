@@ -1,30 +1,31 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, ErrorBox, Hash, Json, KV, Notice, PageHeader, Table, useAction } from "@/components/ui";
+import { useCan } from "@/lib/roles";
+import { A, Badge, Card, ErrorBox, Hash, Json, KV, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 export default function SourceRunPage() {
   const { id } = useParams<{ id: string }>();
   const { data: d, error, reload } = useApi<any>(`/ipe/source-runs/${id}`);
-  const { data: pols } = useApi<any[]>("/ipe/policies");
-  const [pol, setPol] = useState("");
   const a = useAction();
+  const { can, why } = useCan();
   const r = d?.source_run;
   const pm = d?.population_manifest;
-  const ie = d?.ipe_evaluations?.[0];
+  // The run's own result under the policy it was executed with: what assurance relies on. Later evaluations are history.
+  const ie = d?.bound_ipe_evaluation;
   const eq = d?.reconciliation_equation;
   return (
     <>
       <PageHeader spec="WF-IPE-01 Source Run Inspector · WF-IPE-02 Population Reconciliation" title={d ? `${d.connector.name} · run ${id.slice(0, 8)}` : "Source run"}
         subtitle="Request, scope, consistency boundary, paging, population manifest and IPE checks for a single extraction."
         actions={<>
-          <select aria-label="IPE policy for re-evaluation" className="input py-1 text-xs" value={pol} onChange={(e) => setPol(e.target.value)}><option value="">Re-evaluate under policy…</option>
-            {pols?.map((p) => <option key={p.ipe_policy_version_id} value={p.ipe_policy_version_id}>{p.name}</option>)}</select>
-          <button className="btn-primary" disabled={!pol || a.busy} onClick={() => a.run(async () => { await api(`/ipe/source-runs/${id}/evaluate-ipe`, { method: "POST", json: { ipe_policy_version_id: pol } }); reload(); })}>Evaluate</button>
+          <button className="btn-primary" disabled={!r || a.busy || !can("reevaluate_ipe")}
+            title={can("reevaluate_ipe") ? "Re-derives the result under the IPE policy this run was executed with. A different policy needs a new source run." : why("reevaluate_ipe")}
+            onClick={() => a.run(async () => { await api(`/ipe/source-runs/${id}/evaluate-ipe`, { method: "POST", json: { ipe_policy_version_id: r.ipe_policy_version_id } }); reload(); })}>Re-evaluate under run policy</button>
         </>} />
+      <PermissionNote perms={["reevaluate_ipe"]} />
       <ErrorBox error={error || a.error} />
       {d && (
         <div className="space-y-4">

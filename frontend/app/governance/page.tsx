@@ -43,7 +43,7 @@ function Exceptions() {
   return (
     <Card>
       <ErrorBox error={error} />
-      <Table head={["Target", "Reason", "Validity", "State", "Requested by", "Approved by", ""]} empty={data?.length === 0}>
+      <Table head={["Target", "Reason", "Validity", "State", "Requested by", "Approved by", ""]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((x) => (
           <tr key={x.exception_id}>
             <td className="td">{x.target_type === "OBLIGATION" ? <A href={`/obligations/${x.target_id}`}>obligation {x.target_id.slice(0, 8)}…</A> : <span className="mono text-xs">{x.target_type} {x.target_id.slice(0, 8)}</span>}</td>
@@ -93,7 +93,7 @@ function Compensations() {
       <div className="mt-3"><CompensationSoDNote id={sodId} stage="approve" /></div>
       <ErrorBox error={error || a.error} />
       <div className="mt-3">
-        <Table head={["Obligation", "Primary control", "Compensating expression", "Rationale", "Validity", "Status", "Proposed / approved by", ""]} empty={data?.length === 0}>
+        <Table head={["Obligation", "Primary control", "Compensating expression", "Rationale", "Validity", "Status", "Proposed / approved by", ""]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((c) => (
             <tr key={c.compensation_id}>
               <td className="td"><A href={`/obligations/${c.obligation_lineage_id}`}>{c.obligation_lineage_id.slice(0, 8)}…</A></td>
@@ -138,7 +138,7 @@ function Issues() {
   return (
     <Card subtitle="Closing an issue never changes assurance state. A new evaluation has to prove the remediation.">
       <ErrorBox error={error} />
-      <Table head={["Issue", "Type", "Severity", "Priority", "State", "Source", "Created", "Move to"]} empty={data?.length === 0}>
+      <Table head={["Issue", "Type", "Severity", "Priority", "State", "Source", "Created", "Move to"]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((i) => (
           <tr key={i.issue_id}>
             <td className="td font-medium">{i.title}</td><td className="td mono text-xs">{i.issue_type}</td>
@@ -212,7 +212,7 @@ function Risks() {
     <div className="grid gap-4 lg:grid-cols-2">
       <Card title="Risk acceptances">
         <ErrorBox error={error} />
-        <Table head={["Scope", "Residual risk", "Approver", "Validity"]} empty={data?.length === 0}>
+        <Table head={["Scope", "Residual risk", "Approver", "Validity"]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((r) => (
             <tr key={r.risk_acceptance_id}><td className="td mono text-xs">{r.scope_ref}</td><td className="td text-sm">{r.residual_risk_statement}</td>
               <td className="td text-xs">{r.approver_id}</td><td className="td text-xs">{fmtDate(r.valid_from)} → {r.valid_to ? fmtDate(r.valid_to) : "open"}</td></tr>

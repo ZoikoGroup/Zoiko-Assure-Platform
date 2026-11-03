@@ -12,7 +12,7 @@ export default function Obligations() {
         subtitle="An obligation is a requirement your organisation has adopted for one subject by attesting its applicability determination. Open a dossier to see why it applies, the controls and evidence behind it, and its period assurance state. States are evidential (PROVEN / NOT_PROVEN / FAILING / REQUIRES_REVIEW), never ‘compliant’." />
       <ErrorBox error={error} />
       <Card>
-        <Table head={["Obligation", "Subject", "Lifecycle", "Valid", "Latest snapshot", "Snapshot period (end exclusive) · perspective", "Exceptions"]} empty={data?.length === 0}>
+        <Table head={["Obligation", "Subject", "Lifecycle", "Valid", "Latest snapshot", "Snapshot period (end exclusive) · perspective", "Exceptions"]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((o) => (
             <tr key={o.lineage_id}>
               <td className="td"><A href={`/obligations/${o.lineage_id}`}>{o.definition.title}</A><div className="mono text-[11px] text-slate-500">{o.definition.key} · {o.definition.schedule_kind}</div></td>

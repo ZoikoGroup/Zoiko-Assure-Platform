@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from .auth import hash_password, password_policy_ok
 from .db import IS_POSTGRES
+from .iam import provision_roles
 from .models import Actor, AuthCredential, Tenant
 from .platform import audit
 
@@ -39,13 +40,15 @@ def _create(db: Session, *, email: str, password: str, name: str, role: str, ten
     if not password_policy_ok(password):
         log.error("Bootstrap %s %s skipped: the configured password does not meet the password policy", role, email)
         return f"{role} {email}: skipped (password does not meet policy)"
-    actor = Actor(tenant_id=tenant_id, actor_type="HUMAN", display_name=name, email=email, roles=[role],
+    actor = Actor(tenant_id=tenant_id, actor_type="HUMAN", display_name=name, email=email, roles=[],
                   authority_basis=authority_basis)
     db.add(actor)
     db.flush()
     db.add(AuthCredential(actor_id=actor.actor_id, password_hash=hash_password(password), must_change=False))
     audit(db, action="account.bootstrap_created", object_type="Actor", object_id=actor.actor_id, tenant_id=tenant_id,
           new=role, reason="Created once from the backend environment at start-up")
+    # Its authority is a recorded, scoped assignment in the role registry (ZA-IAM-001 §22; Stage 4b).
+    provision_roles(db, actor, [role], source="BOOTSTRAP", reason="One-time account bootstrap from the backend environment")
     return f"{role} {email}: created"
 
 

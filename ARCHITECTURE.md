@@ -59,7 +59,7 @@ can be traced back to its rule, facts, evidence and record cutoff.
 | Backend | Python 3.12+ (dev uses 3.14), FastAPI, SQLAlchemy 2.0, Pydantic 2 | A **modular monolith**: one deployable, with strict internal module boundaries |
 | Database | PostgreSQL 17 on `127.0.0.1:5433` (local Windows service or Docker), with **row-level security** | The only runtime database: no SQLite fallback. Tests use a throwaway SQLite only when they opt in (`ZA_ALLOW_SQLITE`) |
 | Crypto | `cryptography`: AES-256-GCM envelope encryption, HKDF, HMAC-SHA256, Ed25519; stdlib scrypt | Dev keys live in `backend/var/keys/` (stand-in for a cloud KMS/HSM) |
-| Tests | pytest + FastAPI TestClient | 58 tests on PostgreSQL (incl. RLS proofs and bootstrap tests); 50 on SQLite, where the 8 PostgreSQL-only tests skip |
+| Tests | pytest + FastAPI TestClient | 149 tests on PostgreSQL (incl. RLS, runtime-role, migration, immutability, snapshot-determinism and rule-integrity proofs); on SQLite 115 run and the 34 PostgreSQL-only tests skip |
 
 Ports: UI **5173**, API **8000**, Postgres **5433**.
 
@@ -75,9 +75,10 @@ zoiko-Assure/
 │   ├── .env                     DB connection strings (git-ignored; template: .env.example)
 │   ├── requirements.txt
 │   ├── app/
-│   │   ├── main.py              FastAPI app, start-up (bootstrap; demo seed only in demo mode), routers, CORS
+│   │   ├── main.py              FastAPI app, start-up (read-only schema/role checks; demo seed only in demo mode), routers, CORS
 │   │   ├── db.py                engines (runtime + admin), sessions, .env loading, RLS scope stamping
-│   │   ├── pg_bootstrap.py      start-up: create runtime role, tables, apply db/postgres_rls.sql
+│   │   ├── migrate.py           `python -m app.migrate`: versioned migrations, state detection, baseline adoption, checks
+│   │   ├── pg_bootstrap.py      runtime role: provisioned by the migration tool, verified at start-up
 │   │   ├── models.py            ALL tables (63), grouped by bounded context (see §7)
 │   │   ├── codes.py             controlled dictionary ZA-GLS-001: states, reason codes, engine versions
 │   │   ├── platform.py          record sequence/watermark, canonical JSON + hashing, outbox emit, audit
@@ -102,9 +103,14 @@ zoiko-Assure/
 │   │       ├── integration.py   /connectors, /ipe/*
 │   │       ├── ai.py            /ai/assets, /ai/grants, /ai/decisions (PDP), /ai/acs/evaluate
 │   │       └── dashboard.py     /dashboard (aggregates + chart series)
-│   ├── db/postgres_rls.sql      row-level security policies + append-only triggers (applied at start-up)
+│   ├── alembic.ini              Alembic configuration (use `python -m app.migrate`, see docs/database-migrations.md)
+│   ├── migrations/              env.py, versions/0001 baseline tables, versions/0002 RLS + grants + append-only triggers,
+│   │                            versions/0003 immutable completed results (privileges + guard triggers),
+│   │                            versions/0004 immutable published catalogue,
+│   │                            baseline_schema.json (validates databases created before migrations existed)
 │   ├── verifier/verify_package.py  standalone offline audit-package verifier (no Assure needed)
-│   ├── tests/                   test_engines.py, test_api.py, test_rls.py (+ conftest.py)
+│   ├── tests/                   test_engines.py, test_api.py, test_rls.py, test_migrations.py, test_immutability.py,
+│   │                            test_snapshot_determinism.py, test_rule_integrity.py (+ conftest.py)
 │   └── var/                     runtime data: encrypted evidence objects, packages, WORM checkpoints, keys
 └── frontend/
     ├── app/                     one folder per route (App Router); login/ is the only page without the shell
@@ -128,8 +134,8 @@ Browser (Next.js page)                FastAPI                                   
 useApi("/obligations/{id}")
   └─ api(): fetch with
      Authorization: Bearer <token> ─► get_ctx()  (security.py)
-                                       1. auth.resolve_token(): verify HMAC,
-                                          expiry, server-side session ──────►  auth_session lookup
+                                       1. auth.resolve_token(): SHA-256 of the
+                                          token, expiry, revocation ────────►  auth_session lookup by token_hash
                                        2. set_tenant_scope(tenant) ─────────►  set_config('app.tenant_id', …)
                                        3. return Ctx(db, actor)                 (stamped on EVERY transaction
                                      router: assurance.dossier()                 by db.py after_begin hook)
@@ -157,9 +163,13 @@ Key points:
 
 ### 6.1 Authentication (`app/auth.py`)
 - Email + password. Hashing is **scrypt** with a per-user salt and constant-time comparison.
-- On success, an `AuthSession` row is created and a token is returned: `base64(payload).base64(HMAC-SHA256)`,
-  valid 8 hours. Logout sets `revoked_at`, so the token dies immediately.
-- **Lockout:** 5 failures locks the account for 15 minutes. Errors never reveal whether an email exists.
+- On success, a new `AuthSession` row is created and an opaque random token (32 bytes) is returned once, valid 8 hours.
+  Only its SHA-256 is stored (`auth_session.token_hash`, migration 0006); no key on disk can re-create it. Logout,
+  password change and organisation suspension set `revoked_at`, and a request's writes are refused at commit if its
+  session was revoked meanwhile (`security._revalidate_session`).
+- **Lockout:** 5 failures locks the account for 15 minutes. Unknown, locked, non-interactive and wrong-password sign-ins
+  all get the same answer; the reason goes to the audit trail only (`auth.login_failed`). Refused authorisation
+  decisions are recorded as `authorization.denied`.
 - Only `HUMAN` and `EXTERNAL_AUDITOR` actors can sign in. **Agents and services can never log in.**
 - Demo mode is **off by default**. `ZA_DEMO_MODE=1` seeds the Customer Zero fixture into an empty database and, only if a
   local `ZA_DEMO_PASSWORD` is set, gives seeded people that password. No password is built in or shown on the login page.
@@ -176,8 +186,8 @@ permissions, not role names. Separation of duties is enforced in handlers. For e
 2. **Database layer (PostgreSQL RLS):**
    - The API connects as **`assure_app`**, which is non-owner and `NOBYPASSRLS`.
    - `db.py` stamps every transaction with `app.tenant_id`.
-   - `db/postgres_rls.sql` puts a `tenant_isolation` policy on 41 tables, so even a buggy query can't read or write another tenant's rows.
-   - The **owner role** (`DATABASE_ADMIN_URL`) is used only at start-up: schema, policies and seed.
+   - Migration 0002 puts a `tenant_isolation` policy on 41 tables, so even a buggy query can't read or write another tenant's rows.
+   - The **owner role** (`DATABASE_ADMIN_URL`) applies migrations (`python -m app.migrate`: schema, policies, runtime role). The API uses it only at start-up, read-only for the schema-version and role checks, and for the one-time account bootstrap and the demo seed. It never changes the schema.
    - `tests/test_rls.py` proves this directly at the database level.
 3. **`system_scope`:** the *only* way to act across tenants, and it is limited to three documented platform jobs:
    rule-release impact re-evaluation, shadow impact (aggregate output only) and cell ledger checkpoints.
@@ -245,7 +255,7 @@ describes a customer carries `tenant_id` and is RLS-protected.
 | `rules.py` | Typed AST, `OperatorSetVersion 1.0`. **Three-valued logic** (TRUE/FALSE/UNKNOWN). Short-circuited branches are `NOT_EVALUATED`, never FALSE. Decision tables: `ANY_MATCH` / `SINGLE_MATCH_VALIDATED` only (`FIRST_MATCH` is prohibited). Golden vectors must cover POSITIVE, NEGATIVE and UNKNOWN | trace tree with source mappings |
 | `facts.py` | Bitemporal fact store. `resolve_fact()` answers "what was the value at valid time T, as known at record seq S", applying provenance (P1 system … P5 AI-inferred) and expiry | value or UNKNOWN + reason |
 | `applicability.py` | Freezes an **input bundle**, dedupes by `evaluation_key`, creates PROPOSED determinations, raises FactRequests, re-evaluates when a fact changes, and replays deterministically | `APPLIES`, `DOES_NOT_APPLY`, `UNCERTAIN` |
-| `assurance.py` | Control precedence **FAILING > REQUIRES_REVIEW > NOT_EVALUATED > DEGRADED > OPERATING**. Period precedence **FAILING > REQUIRES_REVIEW > NOT_PROVEN > PROVEN**. Periods split into segments wherever inputs change; equal neighbours coalesce. Exceptions are a separate treatment and never turn a gap green | snapshot with segments, trace, dependency digest |
+| `assurance.py` | Control precedence **FAILING > REQUIRES_REVIEW > NOT_EVALUATED > DEGRADED > OPERATING**. Period precedence **FAILING > REQUIRES_REVIEW > NOT_PROVEN > PROVEN**. Periods split into segments wherever inputs change; equal neighbours coalesce. Exceptions are a separate treatment and never turn a gap green. Inputs are read in record order (`record_seq`, then id) and within the evaluated tenant, so output does not depend on physical row order or on RLS (roadmap Stage 3a; test definitions excepted, see the roadmap's gap matrix) | snapshot with segments, trace, dependency digest |
 | `evidence.py` | Payloads are AES-256-GCM encrypted with a per-object key wrapped by a tenant key. Per-tenant **hash chain** (`ZOIKO-ASSURE-EVIDENCE-LEDGER-v1`). Merkle checkpoints are signed (RFC 3161 timestamping shows `TSA_PENDING` unless configured). Erasure = destroy the data key (crypto-shred); legal holds block it | lifecycle + condition per artifact |
 | `ipe.py` | For each source run: scope/auth, consistency boundary, enumeration, source-total reconciliation, duplicates, rejects, zero-rows, schema drift, mapping, transform re-performance, source checksum | `IPE_VERIFIED`, `IPE_FAILED`, `IPE_INCONCLUSIVE`, `IPE_NOT_REQUIRED` |
 | `keys.py` | Dev KMS: master key → HKDF per-tenant keys. Ed25519 signer for releases, checkpoints and packages | — |
@@ -291,7 +301,7 @@ app/layout.tsx
 | **INV-14** | Content-operations staff have no standing access to customer data | `Ctx.tenant`, RLS |
 | DOM-INV-03 | An `UNCERTAIN` determination can't be adopted | `applicability.attest` |
 | — | No "compliant" state anywhere. Exceptions and compensations never rewrite assurance state. Closing an issue doesn't prove remediation | `codes.py`, `assurance.py` |
-| — | Evidence bytes are never replaced: supersede creates a new ID. The ledger and audit log are append-only (DB triggers) | `evidence.py`, `postgres_rls.sql` |
+| — | Evidence bytes are never replaced: supersede creates a new ID. The ledger, the audit log and completed results (evaluations, snapshots, IPE evaluations, packages, attestations, checkpoints) are append-only: no `UPDATE`/`DELETE` for the runtime role, and DB triggers that refuse those statements from every role (the table owner can still disable a trigger with DDL; audit A10). So is the published catalogue (rule versions, content releases, set versions, released fact definitions; DAT-REQ-012) | `evidence.py`, migrations 0002, 0003 and 0004 |
 | — | Published rule versions and content releases are immutable. Changes go through a new draft and a new release | `routers/rules.py` |
 
 ---
@@ -335,8 +345,9 @@ PostgreSQL (see README §"Run locally").
 
 1. **Spec:** find the requirement in the ZA-* documents and note its ID in a docstring.
 2. **Dictionary:** add any new states or reason codes to `codes.py`.
-3. **Model:** add tables or columns in `models.py`. New tenant tables need a `tenant_id`, and you must add their
-   policy to `db/postgres_rls.sql` (regenerate it the same way; see the script header).
+3. **Model and migration:** add tables or columns in `models.py`, then a reviewed migration
+   ([docs/database-migrations.md](docs/database-migrations.md)). New tenant tables need a `tenant_id`, and the migration
+   must grant the runtime role and add their RLS policy; `python -m app.migrate check` fails without the policy.
 4. **Engine:** put the logic in `engines/` as a pure function of a DB session plus inputs, and make it deterministic.
 5. **Router:** keep it thin: `Ctx` → permission check → engine → `emit` / `audit` → commit.
 6. **Tests:** add an engine test and an API test. If the change touches tenancy, extend `test_rls.py`.
@@ -353,7 +364,7 @@ PostgreSQL (see README §"Run locally").
 | Cells | One process = one cell (`eu-west-cell-a`) | Multiple regional cells, data residency |
 | Events | Outbox written transactionally, not relayed | Outbox relay to a message broker |
 | Timestamps | Checkpoints are `TSA_PENDING` unless `ZA_TSA_URL` is set | Qualified RFC 3161 TSA |
-| Schema changes | `create_all` at start-up (adds new tables, doesn't alter existing ones) | Alembic migrations |
+| Schema changes | Versioned Alembic migrations via `python -m app.migrate`; start-up only checks the revision | Same, run by the deploy pipeline after a pre-migration backup on a chosen hosting target |
 | Connectors | Source-run payloads are posted to the API | Real connector workers against vendor APIs |
 
 ---
@@ -366,7 +377,7 @@ PostgreSQL (see README §"Run locally").
 | ZA-PRD-001 | Product requirements, screens | `frontend/app/*` |
 | ZA-DOM-001 | Domain model and invariants | `models.py`, §10 |
 | ZA-GLS-001 | Controlled dictionary (states, reason codes) | `codes.py` |
-| ZA-DAT-001 | Data architecture, tenancy | `db.py`, `postgres_rls.sql` |
+| ZA-DAT-001 | Data architecture, tenancy | `db.py`, `migrate.py`, `migrations/` |
 | ZA-RUL-001 | Rule language, validation, release | `engines/rules.py`, `routers/rules.py` |
 | ZA-APP-001 | Applicability evaluation | `engines/applicability.py`, `engines/facts.py` |
 | ZA-TIM-001 | Bitemporal time model, reconstruction | `facts.py`, `/history/compare`, snapshot reproduce |

@@ -8,10 +8,10 @@
 \set ON_ERROR_STOP on
 \getenv owner_password ZA_CI_OWNER_PASSWORD
 
--- Owner/migration role, least privilege as the backend's start-up checks require (DAT-REQ-004/027, SEC-REQ-023):
--- NOSUPERUSER + CREATEROLE. It owns the test databases, creates the tables, applies db/postgres_rls.sql and
--- provisions the runtime role assure_app itself during bootstrap. The RLS policies name assure_app, so that role
--- name is fixed.
+-- Owner/migration role, least privilege as the backend's checks require (DAT-REQ-004/027, SEC-REQ-023):
+-- NOSUPERUSER + CREATEROLE. It owns the test databases; `python -m app.migrate upgrade` uses it to apply the
+-- versioned migrations (tables, RLS, append-only triggers) and to provision the runtime role assure_app. The RLS
+-- policies name assure_app, so that role name is fixed.
 CREATE ROLE assure WITH LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'owner_password';
 
 -- Every pytest session needs a database of its own: the suite stores evidence payloads in a per-session temporary

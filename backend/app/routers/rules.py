@@ -4,21 +4,23 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 from .. import codes
 from ..engines import applicability as appl
 from ..engines import keys, rules
 from ..models import (ApplicabilityEvaluation, ContentRelease, ObligationDefinition, RuleDraft, RuleVersion, Subject,
-                      utcnow)
+                      new_id, utcnow)
 from ..platform import audit, canonical_json, emit, next_record_seq, sha256_hex, to_dict
-from ..security import Ctx, get_ctx, system_scope
+from ..security import CONTENT_READERS, DOSSIER_READ, READ, Ctx, authorize, system_scope
 
 router = APIRouter(prefix="/rules")
+CONTENT_STAFF = ("content_author", "content_peer_review", "content_legal_review", "content_release")
 
 
 class DraftIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     obligation_definition_id: str
     authoring_mode: str = "AST"
     ast: dict | None = None
@@ -53,7 +55,7 @@ def _validate(ctx: Ctx, d: RuleDraft) -> dict:
 
 
 @router.get("/drafts")
-def list_drafts(ctx: Ctx = Depends(get_ctx)):
+def list_drafts(ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS))):
     out = []
     for d in ctx.db.execute(select(RuleDraft).order_by(RuleDraft.updated_at.desc())).scalars():
         x = to_dict(d)
@@ -63,7 +65,7 @@ def list_drafts(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/drafts/{draft_id}")
-def get_draft(draft_id: str, ctx: Ctx = Depends(get_ctx)):
+def get_draft(draft_id: str, ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS))):
     d = ctx.db.get(RuleDraft, draft_id)
     if not d:
         raise HTTPException(404)
@@ -74,8 +76,7 @@ def get_draft(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts")
-def create_draft(body: DraftIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def create_draft(body: DraftIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     if not ctx.db.get(ObligationDefinition, body.obligation_definition_id):
         raise HTTPException(404, "obligation definition")
     if body.decision_table and body.decision_table.get("table_mode") == "FIRST_MATCH":
@@ -93,8 +94,7 @@ def create_draft(body: DraftIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.put("/drafts/{draft_id}")
-def update_draft(draft_id: str, body: DraftIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def update_draft(draft_id: str, body: DraftIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
     if not d:
         raise HTTPException(404)
@@ -112,8 +112,7 @@ def update_draft(draft_id: str, body: DraftIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts/{draft_id}/validate")
-def validate(draft_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def validate(draft_id: str, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
     rep = _validate(ctx, d)
     d.validation_report = rep
@@ -128,8 +127,7 @@ def validate(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts/{draft_id}/test")
-def test_vectors(draft_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def test_vectors(draft_id: str, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
     rep = _validate(ctx, d)
     if not rep["ok"]:
@@ -141,12 +139,13 @@ def test_vectors(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 class SandboxIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     facts: dict
     effective_at: str = "2027-12-02"
 
 
 @router.post("/drafts/{draft_id}/sandbox")
-def sandbox(draft_id: str, body: SandboxIn, ctx: Ctx = Depends(get_ctx)):
+def sandbox(draft_id: str, body: SandboxIn, ctx: Ctx = Depends(authorize(*CONTENT_STAFF, platform=True))):
     """Run the exact draft artifact on synthetic fixtures only (WF-RUL-04); no customer data access."""
     d = ctx.db.get(RuleDraft, draft_id)
     rep = _validate(ctx, d)
@@ -165,8 +164,7 @@ def sandbox(draft_id: str, body: SandboxIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts/{draft_id}/submit-review")
-def submit_review(draft_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def submit_review(draft_id: str, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
     rep = _validate(ctx, d)
     d.validation_report = rep
@@ -187,8 +185,7 @@ def submit_review(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts/{draft_id}/peer-approve")
-def peer_approve(draft_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_peer_review")
+def peer_approve(draft_id: str, ctx: Ctx = Depends(authorize("content_peer_review", platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
     if d.status != "IN_REVIEW":
         raise HTTPException(409, "Draft not in review")
@@ -200,9 +197,7 @@ def peer_approve(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts/{draft_id}/legal-approve")
-def legal_approve(draft_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require_human("Legal interpretation approval")
-    ctx.require("content_legal_review")
+def legal_approve(draft_id: str, ctx: Ctx = Depends(authorize("content_legal_review", human=True, platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
     if d.status != "IN_REVIEW" or not d.peer_reviewer_id:
         raise HTTPException(409, "Requires IN_REVIEW with peer approval")
@@ -218,10 +213,9 @@ def legal_approve(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/drafts/{draft_id}/shadow")
-def shadow(draft_id: str, ctx: Ctx = Depends(get_ctx)):
+def shadow(draft_id: str, ctx: Ctx = Depends(authorize("content_author", "content_release", "content_legal_review",
+                                                        platform=True))):
     """Home-cell shadow execution; content ops receive aggregate buckets only (FR-APP-006)."""
-    if not ({"content_author", "content_release", "content_legal_review"} & ctx.perms()):
-        raise HTTPException(403)
     d = ctx.db.get(RuleDraft, draft_id)
     if d.status not in ("VERIFIED", "IN_REVIEW"):
         raise HTTPException(409, "Shadow requires a reviewed candidate")
@@ -236,15 +230,14 @@ def shadow(draft_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 class PublishIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     label: str
     changelog: str
 
 
 @router.post("/drafts/{draft_id}/publish")
-def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(get_ctx)):
+def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("content_release", human=True, platform=True))):
     """Fail-closed publication gates + signed ContentRelease (§15)."""
-    ctx.require_human("Content release")
-    ctx.require("content_release")
     d = ctx.db.get(RuleDraft, draft_id)
     if d.status != "VERIFIED":
         raise HTTPException(409, "Only VERIFIED drafts can be released")
@@ -252,6 +245,9 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(get_ctx)):
         raise HTTPException(403, "Separation of duties: release manager must be distinct")
     rep = _validate(ctx, d)
     if not rep["ok"]:
+        missing = [i["message"] for i in rep["issues"] if i.get("code") == "RUL_SET_REF_INVALID"]
+        if missing:
+            raise HTTPException(409, {"error": "SET_VERSION_MISSING", "message": missing[0]})
         raise HTTPException(409, "Validation failure blocks publication")
     vr = rules.run_golden_vectors(rep["compiled_ast"], d.golden_vectors, appl.load_fact_defs(ctx.db), appl.load_sets(ctx.db))
     if not vr["all_passed"]:
@@ -259,19 +255,26 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(get_ctx)):
     if d.change_class in ("EXECUTABLE_OUTCOME", "TEMPORAL", "CORRECTION", "DEPENDENCY") and not d.shadow_report:
         raise HTTPException(409, "Shadow impact required before publication")
     sets = appl.load_sets(ctx.db)
+    missing_sets = [s for s in rep.get("set_refs") or [] if s not in sets]
+    if missing_sets:
+        raise HTTPException(409, {"error": "SET_VERSION_MISSING", "set_version_id": missing_sets[0],
+                                  "message": f"Referenced SetVersion {missing_sets[0]} not found"})
     set_hashes = {s: sets[s]["hash"] for s in rep["set_refs"]}
     canon = rules.canonicalize(rep["compiled_ast"])
     h = rules.ast_hash(canon, set_hashes)
     prev = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == d.obligation_definition_id)
                           .order_by(RuleVersion.version.desc())).scalars().first()
     seq = next_record_seq(ctx.db)
-    rv = RuleVersion(obligation_definition_id=d.obligation_definition_id, version=(prev.version + 1) if prev else 1,
+    # Both rows are written once, with final values: published catalogue rows are immutable (DAT-REQ-012, migration 0004).
+    rv_id, cr_id = new_id(), new_id()
+    rv = RuleVersion(rule_version_id=rv_id, obligation_definition_id=d.obligation_definition_id,
+                     version=(prev.version + 1) if prev else 1,
                      valid_from=d.valid_from, valid_to=d.valid_to, coverage_mode="ENCODED",
                      rule_schema_version=rules.SCHEMA_VERSION, operator_set_version=rules.OPERATOR_SET_VERSION,
                      canonical_ast=canon, ast_hash=h, required_facts=rep["required_facts"],
                      set_refs=[{"set_version_id": k, "sha256": v} for k, v in set_hashes.items()],
                      source_mappings=d.source_mappings, golden_vectors=d.golden_vectors, status="PUBLISHED",
-                     content_release_id="pending", draft_id=d.draft_id, record_seq=seq)
+                     content_release_id=cr_id, draft_id=d.draft_id, record_seq=seq)
     ctx.db.add(rv)
     ctx.db.flush()
     manifest = {"label": body.label, "rule_versions": [{"rule_version_id": rv.rule_version_id, "ast_sha256": h,
@@ -285,13 +288,13 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(get_ctx)):
     import json
     manifest = json.loads(canonical_json(manifest))
     mb = canonical_json(manifest)
-    cr = ContentRelease(label=body.label, manifest=manifest, manifest_hash=sha256_hex(mb), signature=keys.sign(mb),
+    cr = ContentRelease(content_release_id=cr_id, label=body.label, manifest=manifest, manifest_hash=sha256_hex(mb),
+                        signature=keys.sign(mb),
                         signer_key_id=keys.signer_key_id(), changelog=body.changelog, shadow_summary=d.shadow_report,
                         released_by=ctx.actor.actor_id, cell_received_seq=seq,
                         correction_of_release_id=prev.content_release_id if (prev and d.change_class == "CORRECTION") else None)
     ctx.db.add(cr)
     ctx.db.flush()
-    rv.content_release_id = cr.content_release_id
     d.status = "PUBLISHED"
     emit(ctx.db, event_type="content_release.published", aggregate_type="ContentRelease", aggregate_id=cr.content_release_id,
          record_seq=seq, payload={"manifest_hash": cr.manifest_hash, "rule_version_id": rv.rule_version_id, "label": body.label})
@@ -304,7 +307,10 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(get_ctx)):
     # impact: re-evaluate previously evaluated subjects in their home cell (system service actor)
     odef = ctx.db.get(ObligationDefinition, d.obligation_definition_id)
     reevaluated = 0
-    with system_scope(ctx.db, "rule-release impact re-evaluation in subjects' home cells"):
+    # Tampered content met here fails the whole publication closed (SEC-REQ-048); it is not skipped like other errors.
+    with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=None), \
+            system_scope(ctx.db, "rule-release impact re-evaluation in subjects' home cells"):
+        appl.verify_rule_integrity(ctx.db, rv)
         subj_ids = {e.subject_id for e in ctx.db.execute(select(ApplicabilityEvaluation).where(
             ApplicabilityEvaluation.obligation_definition_id == odef.obligation_definition_id)).scalars()}
         for sid in subj_ids:
@@ -321,7 +327,7 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/versions")
-def versions(ctx: Ctx = Depends(get_ctx)):
+def versions(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     out = []
     rows = ctx.db.execute(select(RuleVersion).order_by(RuleVersion.obligation_definition_id, RuleVersion.version)).scalars().all()
     for r in rows:
@@ -334,7 +340,7 @@ def versions(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/versions/{rv_id}")
-def version(rv_id: str, ctx: Ctx = Depends(get_ctx)):
+def version(rv_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     r = ctx.db.get(RuleVersion, rv_id)
     if not r:
         raise HTTPException(404)
@@ -353,7 +359,7 @@ def _index(n, out):
 
 
 @router.get("/diff")
-def diff(a: str, b: str, ctx: Ctx = Depends(get_ctx)):
+def diff(a: str, b: str, ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS))):
     """Semantic diff by stable node id between RuleVersions or drafts (WF-RUL-03)."""
     def load(x):
         rv = ctx.db.get(RuleVersion, x)

@@ -1,13 +1,23 @@
-"""Schema + RLS bootstrap, run at API start-up with the OWNER role (idempotent)."""
+"""Runtime-role provisioning and verification (DAT-REQ-004/027, SEC-REQ-023).
+
+The schema itself is no longer built here: tables, row-level security and grants are versioned migrations applied by
+``python -m app.migrate`` (``ensure_runtime_role`` runs inside that transaction, with the owner role). API start-up
+only calls the read-only ``verify_runtime_role`` and ``verify_context_key``, as the runtime role itself.
+
+From revision 0007 (ZA-DAT-001 §13) the runtime login holds its privileges through exactly one membership,
+``assure_app_rw`` (INHERIT, without SET or ADMIN), and that group role is itself a member of nothing: the runtime
+credential cannot reach the owner, the migrator or any administrative role.
+"""
 from __future__ import annotations
 
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
-from .db import ADMIN_DATABASE_URL, BASE_DIR, DATABASE_URL, IS_POSTGRES, Base, admin_engine
+from .db import ADMIN_DATABASE_URL, DATABASE_URL
 
-RLS_SQL = BASE_DIR / "db" / "postgres_rls.sql"
+RUNTIME_ROLE = "assure_app"  # the runtime login (DATABASE_URL); its privileges come from APP_RW_ROLE since 0007
+APP_RW_ROLE = "assure_app_rw"  # ZA-DAT-001 §13 "Approved DML under RLS; no BYPASSRLS; no DDL" (migration 0007)
 
 # Attributes the runtime role must never hold (ZA-DAT-001 DAT-REQ-004/027, ZA-SEC-001 SEC-REQ-023).
 _FORBIDDEN_ATTRS = {"rolsuper": "SUPERUSER", "rolcreatedb": "CREATEDB", "rolcreaterole": "CREATEROLE",
@@ -44,11 +54,20 @@ def _assert_least_privilege(conn, role: str) -> None:
                               "WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = :r)"), params).scalar()
     if owned:
         problems.append(f"owns {owned} relation(s)")
-    member_of = conn.execute(text("SELECT g.rolname FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid "
+    # One membership is expected from revision 0007: assure_app_rw, inherited only (no SET ROLE, no ADMIN OPTION).
+    member_of = conn.execute(text("SELECT g.rolname, m.admin_option, m.set_option FROM pg_auth_members m "
+                                  "JOIN pg_roles g ON g.oid = m.roleid "
                                   "WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = :r) ORDER BY 1"),
-                             params).scalars().all()
-    if member_of:
-        problems.append("is a member of " + ", ".join(member_of))
+                             params).all()
+    unexpected = sorted({g for g, admin, can_set in member_of if g != APP_RW_ROLE or admin or can_set})
+    if unexpected:
+        problems.append("is a member of " + ", ".join(unexpected))
+    if any(g == APP_RW_ROLE for g, _, _ in member_of):
+        rw = conn.execute(text("SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, "
+                               "(SELECT count(*) FROM pg_auth_members WHERE member = r.oid) FROM pg_roles r "
+                               "WHERE rolname = :g"), {"g": APP_RW_ROLE}).one()
+        if any(rw[:6]) or rw[6]:
+            problems.append(f"inherits from {APP_RW_ROLE}, which has LOGIN, an elevated attribute or a membership")
     if problems:
         raise RuntimeRoleError(f"Refusing to start: runtime role {role!r} is not least-privilege ({'; '.join(problems)}). "
                                "Correct the role as a superuser; start-up never grants or tolerates these.")
@@ -70,22 +89,44 @@ def _provision_runtime_role(conn, role: str, password: str) -> None:
     _assert_least_privilege(conn, role)
 
 
-def _ensure_runtime_role(conn) -> None:
+def _runtime_url():
     app_url = make_url(DATABASE_URL)
-    if app_url.username == make_url(ADMIN_DATABASE_URL).username:
+    if ADMIN_DATABASE_URL and app_url.username == make_url(ADMIN_DATABASE_URL).username:
         raise RuntimeError("DATABASE_URL must use a non-owner role (e.g. assure_app) so row-level security applies; "
                            "use DATABASE_ADMIN_URL for the owner role.")
+    if app_url.username != RUNTIME_ROLE:
+        raise RuntimeRoleError(f"DATABASE_URL must connect as {RUNTIME_ROLE!r}: the row-level security policies and "
+                               f"grants (migration 0002) name that role, so any other role would bypass them.")
+    return app_url
+
+
+def ensure_runtime_role(conn) -> None:
+    """Create or update the runtime role, then prove it is least-privilege. Owner role, inside the migration transaction."""
+    app_url = _runtime_url()
     # NOBYPASSRLS / non-owner: the runtime role can never see across tenants outside system scope
     _provision_runtime_role(conn, app_url.username, app_url.password or "")
+    if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :g"), {"g": APP_RW_ROLE}).scalar():
+        # a runtime login (re)created after revision 0007 gets its one membership (0007 grants it on first upgrade)
+        _role_ddl(conn, f'GRANT {APP_RW_ROLE} TO {conn.dialect.identifier_preparer.quote(app_url.username)} '
+                        "WITH INHERIT TRUE, SET FALSE", app_url.username)
 
 
-def bootstrap() -> None:
-    if not IS_POSTGRES:
-        Base.metadata.create_all(admin_engine)
-        return
-    with admin_engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(724501)"))  # one bootstrapper at a time
-        _ensure_runtime_role(conn)
-        Base.metadata.create_all(conn)
-        with conn.connection.cursor() as cur:  # raw DBAPI cursor: no param parsing, so '%' in plpgsql is literal
-            cur.execute(RLS_SQL.read_text(encoding="utf-8"))
+def verify_context_key(conn) -> None:
+    """Start-up check, as the runtime role: the database verifies contexts signed with this process's key (0007)."""
+    from .db import context_key, context_key_id
+    expected = context_key_id(context_key())
+    found = conn.execute(text("SELECT assure_context_key_id()")).scalar()
+    if found != expected:
+        raise RuntimeRoleError("Refusing to start: the database does not hold this process's context key "
+                               f"({'none provisioned' if found is None else 'a different key'}), so every tenant context "
+                               "would be refused. Run `python -m app.migrate upgrade` with the same ZA_DATA_DIR or "
+                               "ZA_DB_CONTEXT_KEY as the API.")
+
+
+def verify_runtime_role(conn) -> None:
+    """Start-up check, read-only: the runtime role exists and is least-privilege. Never creates or alters it."""
+    role = _runtime_url().username
+    if not conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).scalar():
+        raise RuntimeRoleError(f"Runtime role {role!r} does not exist. Run `python -m app.migrate upgrade`, which "
+                               "provisions it (docs/database-migrations.md).")
+    _assert_least_privilege(conn, role)

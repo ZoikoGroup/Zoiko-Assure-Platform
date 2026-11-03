@@ -5,6 +5,9 @@
 * Expression nodes: CONTROL, ALL, ANY, K_OF_N, COMPENSATION, OPTIONAL_EVIDENCE, OCCURRENCES.
 * Period: FAILING > REQUIRES_REVIEW > NOT_PROVEN > PROVEN; every boundary creates a segment.
 * Exceptions are reported separately and never change any state (STA-REQ-014).
+* Inputs are read in record order (record_seq, then id; DAT-REQ-007, TIM-REQ-005) and within the evaluated tenant, so
+  digests, traces and selections do not depend on physical row order or on RLS (STA-REQ-020/021; roadmap Stage 3a).
+  Test definitions carry no record order and keep their stored order (roadmap §6, B1).
 """
 from __future__ import annotations
 
@@ -16,11 +19,12 @@ from sqlalchemy.orm import Session
 
 from .. import codes
 from ..models import (AssuranceSnapshot, Compensation, ControlDefinition, ControlEvaluation, ControlImplementation,
-                      ControlTestPolicy, EvidenceArtifact, EvidenceConflict, ExceptionRecord, IPEEvaluation, Issue,
+                      ControlTestPolicy, EvidenceArtifact, EvidenceConflict, ExceptionRecord, Issue,
                       ObligationDefinition, ObligationInstance, ObligationOccurrence, SatisfactionExpressionVersion,
-                      Subject, TestDefinition, TestRun)
+                      SourceRun, Subject, TestDefinition, TestRun)
 from ..platform import digest, emit, ensure_utc, next_record_seq
 from . import evidence as evd
+from . import ipe
 
 SAT, UNSAT, UNK, REV = "SATISFIED", "UNSATISFIED", "UNKNOWN", "REVIEW"
 LEAF_MAP = {"OPERATING": SAT, "FAILING": UNSAT, "NOT_EVALUATED": UNK, "DEGRADED": UNK, "REQUIRES_REVIEW": REV}
@@ -39,10 +43,15 @@ def _overlap(f, t, a, b) -> bool:
 
 # ------------------------------------------------------------------ control evaluation
 def _ipe_overall(db: Session, source_run_id: str | None, cutoff_seq: int) -> str | None:
+    """The run's bound IPE result (ipe.bound_evaluation), never the newest evaluation: a later re-evaluation, or one
+    under a weaker policy, cannot turn a failed population proof into a verified one. A run recorded after the cutoff
+    was not known then, so it supports nothing (None counts as IPE_INCONCLUSIVE below)."""
     if not source_run_id:
         return None
-    ev = db.execute(select(IPEEvaluation).where(IPEEvaluation.source_run_id == source_run_id)
-                    .order_by(IPEEvaluation.created_at.desc())).scalars().first()
+    run = db.get(SourceRun, source_run_id)
+    if run is None or run.record_seq > cutoff_seq:
+        return None
+    ev = ipe.bound_evaluation(db, run)
     return ev.overall_result if ev else None
 
 
@@ -52,7 +61,7 @@ def _evidence_admissible(db, run: TestRun, td: TestDefinition, policy: ControlTe
     if not run.evidence_ids:
         return UNK, ["MISSING_EVIDENCE"], rows
     arts = [db.get(EvidenceArtifact, e) for e in run.evidence_ids]
-    arts = [x for x in arts if x is not None and x.record_seq <= cutoff_seq]
+    arts = [x for x in arts if x is not None and x.tenant_id == run.tenant_id and x.record_seq <= cutoff_seq]
     if not arts:
         return UNK, ["MISSING_EVIDENCE"], rows
     conflict = False
@@ -93,18 +102,24 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
     if ci.record_seq > cutoff_seq or not _in(ci.valid_from, ci.valid_to, a, b):
         return {"state": "NOT_EVALUATED", "reason_codes": ["CONTROL_NOT_IMPLEMENTED"], "tests": [],
                 "precedence_rule": "3:NOT_EVALUATED", "evaluation_id": None}
-    policy = db.execute(select(ControlTestPolicy).where(ControlTestPolicy.control_implementation_id == ci.control_implementation_id,
+    policy = db.execute(select(ControlTestPolicy).where(ControlTestPolicy.tenant_id == ci.tenant_id,
+                                                        ControlTestPolicy.control_implementation_id == ci.control_implementation_id,
                                                         ControlTestPolicy.record_seq <= cutoff_seq)
-                        .order_by(ControlTestPolicy.version.desc())).scalars().first()
+                        .order_by(ControlTestPolicy.version.desc(), ControlTestPolicy.policy_version_id)).scalars().first()
     if not policy:
         return {"state": "NOT_EVALUATED", "reason_codes": ["TEST_NOT_RUN"], "tests": [],
                 "precedence_rule": "3:NOT_EVALUATED", "evaluation_id": None}
-    tds = db.execute(select(TestDefinition).where(TestDefinition.policy_version_id == policy.policy_version_id)).scalars().all()
+    # Stored order, deliberately: test definitions have no record_seq, and any other order would change this digest for
+    # multi-test policies, an engine change STA-REQ-032 reserves to an ADR (roadmap §6, B1).
+    tds = db.execute(select(TestDefinition).where(TestDefinition.tenant_id == ci.tenant_id,
+                                                  TestDefinition.policy_version_id == policy.policy_version_id)).scalars().all()
     test_rows = []
     deps = {"control_implementation": ci.control_implementation_id, "policy": policy.policy_version_id, "runs": [], "evidence": []}
     for td in tds:
-        runs = db.execute(select(TestRun).where(TestRun.test_definition_id == td.test_definition_id,
-                                                TestRun.record_seq <= cutoff_seq)).scalars().all()
+        runs = db.execute(select(TestRun).where(TestRun.tenant_id == ci.tenant_id,
+                                                TestRun.test_definition_id == td.test_definition_id,
+                                                TestRun.record_seq <= cutoff_seq)
+                          .order_by(TestRun.record_seq, TestRun.test_run_id)).scalars().all()
         runs = [r for r in runs if _overlap(r.window_from, r.window_to, a, b)]
         deps["runs"] += [r.test_run_id for r in runs]
         status, reasons, ev_rows, covered = None, [], [], []
@@ -155,7 +170,10 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
     dep_digest = digest({**deps, "window": [a, b], "cutoff": cutoff_seq, "v": codes.CONTROL_EVALUATOR_VERSION})
     out["dependency_digest"] = dep_digest
     if persist:
-        existing = db.execute(select(ControlEvaluation).where(ControlEvaluation.dependency_digest == dep_digest)).scalars().first()
+        # Concurrent requests can store twins (nothing makes the digest unique); always reuse the earliest.
+        existing = db.execute(select(ControlEvaluation).where(ControlEvaluation.tenant_id == ci.tenant_id,
+                                                              ControlEvaluation.dependency_digest == dep_digest)
+                              .order_by(ControlEvaluation.created_at, ControlEvaluation.evaluation_id)).scalars().first()
         if existing:
             out["evaluation_id"] = existing.evaluation_id
         else:
@@ -306,14 +324,16 @@ def _resolve_impl(db, tenant_id, control_key, subject: Subject, a, b, cutoff):
         return None
     subj_ids = [subject.subject_id]
     if subject.entity_id:
-        ent = db.execute(select(Subject).where(Subject.entity_id == subject.entity_id,
-                                               Subject.subject_type == "LEGAL_ENTITY")).scalars().first()
+        ent = db.execute(select(Subject).where(Subject.tenant_id == tenant_id, Subject.entity_id == subject.entity_id,
+                                               Subject.subject_type == "LEGAL_ENTITY")
+                         .order_by(Subject.subject_id)).scalars().first()
         if ent:
             subj_ids.append(ent.subject_id)
     impls = db.execute(select(ControlImplementation).where(ControlImplementation.tenant_id == tenant_id,
                                                            ControlImplementation.control_definition_id == cd.control_definition_id,
                                                            ControlImplementation.subject_id.in_(subj_ids),
-                                                           ControlImplementation.record_seq <= cutoff)).scalars().all()
+                                                           ControlImplementation.record_seq <= cutoff)
+                       .order_by(ControlImplementation.record_seq, ControlImplementation.control_implementation_id)).scalars().all()
     impls.sort(key=lambda i: subj_ids.index(i.subject_id))
     for i in impls:
         if _overlap(i.valid_from, i.valid_to, a, b):
@@ -358,15 +378,18 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                                                        ObligationInstance.lineage_id == obligation_lineage_id,
                                                        ObligationInstance.record_from_seq <= cutoff,
                                                        or_(ObligationInstance.record_to_seq.is_(None),
-                                                           ObligationInstance.record_to_seq > cutoff))).scalars().all()
+                                                           ObligationInstance.record_to_seq > cutoff))
+                       .order_by(ObligationInstance.record_from_seq, ObligationInstance.revision_id)).scalars().all()
     if not revs:
         raise HTTPException(404, "Obligation not known at this record cutoff")
-    obl = revs[-1]
+    obl = revs[-1]  # the most recently recorded revision known at the cutoff
     subject = db.get(Subject, obl.subject_id)
     odef = db.get(ObligationDefinition, obl.obligation_definition_id)
     exprs = db.execute(select(SatisfactionExpressionVersion).where(
+        SatisfactionExpressionVersion.tenant_id == tenant_id,
         SatisfactionExpressionVersion.obligation_lineage_id == obligation_lineage_id,
-        SatisfactionExpressionVersion.record_seq <= cutoff)).scalars().all()
+        SatisfactionExpressionVersion.record_seq <= cutoff)
+        .order_by(SatisfactionExpressionVersion.record_seq, SatisfactionExpressionVersion.expression_version_id)).scalars().all()
     if not exprs:
         raise HTTPException(409, "No SatisfactionExpressionVersion for obligation (configuration error)")
     active_ranges = [(ensure_utc(r.valid_from), ensure_utc(r.valid_to)) for r in revs if r.lifecycle == "ADOPTED"]
@@ -393,27 +416,35 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                                                                  ControlImplementation.control_definition_id == cd.control_definition_id)).scalars():
             impl_ids.add(ci.control_implementation_id)
             add(ci.valid_from, ci.valid_to)
-            for pol in db.execute(select(ControlTestPolicy).where(ControlTestPolicy.control_implementation_id == ci.control_implementation_id)).scalars():
-                for td in db.execute(select(TestDefinition).where(TestDefinition.policy_version_id == pol.policy_version_id)).scalars():
-                    for run in db.execute(select(TestRun).where(TestRun.test_definition_id == td.test_definition_id,
+            for pol in db.execute(select(ControlTestPolicy).where(ControlTestPolicy.tenant_id == tenant_id,
+                                                                  ControlTestPolicy.control_implementation_id == ci.control_implementation_id)).scalars():
+                for td in db.execute(select(TestDefinition).where(TestDefinition.tenant_id == tenant_id,
+                                                                  TestDefinition.policy_version_id == pol.policy_version_id)).scalars():
+                    for run in db.execute(select(TestRun).where(TestRun.tenant_id == tenant_id,
+                                                                TestRun.test_definition_id == td.test_definition_id,
                                                                 TestRun.record_seq <= cutoff)).scalars():
                         add(run.window_from, run.window_to)
                         for eid in run.evidence_ids:
                             art = db.get(EvidenceArtifact, eid)
-                            if art:
+                            if art and art.tenant_id == tenant_id:
                                 add(art.valid_until)
-    comps = db.execute(select(Compensation).where(Compensation.obligation_lineage_id == obligation_lineage_id,
-                                                  Compensation.record_seq <= cutoff)).scalars().all()
+    comps = db.execute(select(Compensation).where(Compensation.tenant_id == tenant_id,
+                                                  Compensation.obligation_lineage_id == obligation_lineage_id,
+                                                  Compensation.record_seq <= cutoff)
+                       .order_by(Compensation.record_seq, Compensation.compensation_id)).scalars().all()
     for c in comps:
         add(c.valid_from, c.valid_to)
     exceptions = db.execute(select(ExceptionRecord).where(ExceptionRecord.tenant_id == tenant_id,
                                                           ExceptionRecord.record_seq <= cutoff,
                                                           or_(ExceptionRecord.target_id == obligation_lineage_id,
-                                                              ExceptionRecord.target_id.in_(list(impl_ids) or ["-"])))).scalars().all()
+                                                              ExceptionRecord.target_id.in_(list(impl_ids) or ["-"])))
+                            .order_by(ExceptionRecord.record_seq, ExceptionRecord.exception_id)).scalars().all()
     for x in exceptions:
         add(x.valid_from, x.valid_to)
-    occs = db.execute(select(ObligationOccurrence).where(ObligationOccurrence.obligation_lineage_id == obligation_lineage_id,
-                                                         ObligationOccurrence.record_seq <= cutoff)).scalars().all()
+    occs = db.execute(select(ObligationOccurrence).where(ObligationOccurrence.tenant_id == tenant_id,
+                                                         ObligationOccurrence.obligation_lineage_id == obligation_lineage_id,
+                                                         ObligationOccurrence.record_seq <= cutoff)
+                      .order_by(ObligationOccurrence.record_seq, ObligationOccurrence.occurrence_id)).scalars().all()
     for o in occs:
         add(o.due_at)
     pts = sorted(bounds)
@@ -524,9 +555,10 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                              exception_treatments=result["exception_treatments"], reason_codes=period_reasons, created_by=actor_id)
     db.add(snap)
     db.flush()
-    prior = db.execute(select(AssuranceSnapshot).where(AssuranceSnapshot.obligation_lineage_id == obligation_lineage_id,
+    prior = db.execute(select(AssuranceSnapshot).where(AssuranceSnapshot.tenant_id == tenant_id,
+                                                       AssuranceSnapshot.obligation_lineage_id == obligation_lineage_id,
                                                        AssuranceSnapshot.snapshot_id != snap.snapshot_id)
-                       .order_by(AssuranceSnapshot.created_at.desc())).scalars().first()
+                       .order_by(AssuranceSnapshot.created_at.desc(), AssuranceSnapshot.snapshot_id.desc())).scalars().first()
     emit(db, event_type="assurance.snapshot_created", aggregate_type="AssuranceSnapshot", aggregate_id=snap.snapshot_id,
          tenant_id=tenant_id, entity_id=obl.entity_id, record_seq=seq,
          payload={"obligation_lineage_id": obligation_lineage_id, "state": period_state, "period": [period_from, period_to],
@@ -575,8 +607,12 @@ def _issue_hooks(db, tenant_id, snap: AssuranceSnapshot, odef: ObligationDefinit
     key = f"{itype}:{snap.obligation_lineage_id}"
     if db.execute(select(Issue).where(Issue.dedupe_key == key, Issue.state.notin_(["CLOSED", "CANCELLED"]))).scalars().first():
         return
-    db.add(Issue(tenant_id=tenant_id, title=f"{title}: {odef.title}", issue_type=itype, severity=sev, priority=pri,
-                 source_ref_type="AssuranceSnapshot", source_ref_id=snap.snapshot_id, dedupe_key=key))
+    iss = Issue(tenant_id=tenant_id, title=f"{title}: {odef.title}", issue_type=itype, severity=sev, priority=pri,
+                source_ref_type="AssuranceSnapshot", source_ref_id=snap.snapshot_id, dedupe_key=key)
+    db.add(iss)
+    db.flush()
+    from . import governance
+    governance.record_issue_created(db, issue=iss, actor_id="system", reason=f"Proof gap: {snap.state}")
     if snap.state == "NOT_PROVEN":
         emit(db, event_type="assurance.proof_gap_detected", aggregate_type="AssuranceSnapshot",
              aggregate_id=snap.snapshot_id, tenant_id=tenant_id, payload={"reason_codes": snap.reason_codes})

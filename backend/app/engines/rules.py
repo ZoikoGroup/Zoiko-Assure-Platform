@@ -328,8 +328,11 @@ def canonicalize(ast: dict) -> dict:
     return norm(ast)
 
 
-def ast_hash(ast: dict, set_hashes: dict[str, str]) -> str:
-    payload = {"rule_schema_version": SCHEMA_VERSION, "operator_set_version": OPERATOR_SET_VERSION,
+def ast_hash(ast: dict, set_hashes: dict[str, str], *, rule_schema_version: str = SCHEMA_VERSION,
+             operator_set_version: str = OPERATOR_SET_VERSION) -> str:
+    """ZA-RUL-001 §12 hash input. Publication hashes under this build's versions; integrity verification passes the
+    versions the RuleVersion declares (RUL-REQ-016: byte-stable under the declared RuleSchemaVersion)."""
+    payload = {"rule_schema_version": rule_schema_version, "operator_set_version": operator_set_version,
                "ast": canonicalize(ast), "set_hashes": dict(sorted(set_hashes.items()))}
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 

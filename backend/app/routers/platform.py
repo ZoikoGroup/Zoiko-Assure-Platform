@@ -21,10 +21,12 @@ from sqlalchemy import func, select
 
 from ..accounts import ORG_ADMIN_ROLE
 from ..auth import generate_password, hash_password
-from ..db import CELL_ID, set_tenant_scope
-from ..models import Actor, AuditEvent, AuthCredential, AuthSession, Cell, LegalEntity, Subject, Tenant, new_id
+from ..db import CELL_ID, capability, set_tenant_scope
+from ..iam import is_current, provision_roles
+from ..models import (Actor, AuditEvent, AuthCredential, AuthSession, Cell, LegalEntity, RoleAssignment, Subject,
+                      Tenant, new_id)
 from ..platform import audit, emit
-from ..security import Ctx, get_ctx, system_scope
+from ..security import Ctx, authorize, system_scope
 
 router = APIRouter(prefix="/platform")
 
@@ -32,17 +34,20 @@ router = APIRouter(prefix="/platform")
 STATUSES = ("ACTIVE", "SUSPENDED")
 
 
-def _platform_admin(ctx: Ctx) -> None:
-    if ctx.actor.tenant_id is not None or ctx.actor.actor_type != "HUMAN":
-        raise HTTPException(403, "Organisation management is a platform Super Admin function")
-    ctx.require("manage_organisations")
+# Reads and mutations: the deny-by-default route guard, so every refusal is one audited decision (Ctx.check).
+SUPER_ADMIN_ONLY = authorize("manage_organisations", human=True, platform=True)
 
 
 def _admins(db, tenant_ids: list[str]) -> dict[str, list[dict]]:
+    """Each organisation's current Organisation Admins, from the role registry (Stage 4b)."""
     out: dict[str, list[dict]] = {t: [] for t in tenant_ids}
     if tenant_ids:
-        for a in db.execute(select(Actor).where(Actor.tenant_id.in_(tenant_ids))).scalars():
-            if ORG_ADMIN_ROLE in (a.roles or []):
+        holders = {a.principal_id for a in db.execute(select(RoleAssignment).where(
+            RoleAssignment.tenant_id.in_(tenant_ids), RoleAssignment.role_code == ORG_ADMIN_ROLE,
+            RoleAssignment.scope_type == "TENANT")).scalars() if is_current(a)}
+        for a in db.execute(select(Actor).where(Actor.tenant_id.in_(tenant_ids))
+                            .order_by(Actor.display_name, Actor.actor_id)).scalars():
+            if a.actor_id in holders:
                 out[a.tenant_id].append({"actor_id": a.actor_id, "display_name": a.display_name, "email": a.email})
     return out
 
@@ -84,17 +89,24 @@ def _detail(ctx: Ctx, t: Tenant) -> dict:
 
 
 def _email_taken(db, email: str) -> bool:
-    return db.execute(select(Actor.actor_id).where(func.lower(Actor.email) == email)).first() is not None
+    with capability(db, "auth"):  # identity discovery across organisations (ZA-IAM-001 §22 lookup path)
+        return db.execute(select(Actor.actor_id).where(func.lower(Actor.email) == email)).first() is not None
 
 
 def _appoint_admin(ctx: Ctx, tenant_id: str, display_name: str, email: str) -> str:
     """Create a TENANT_OWNER with a one-time temporary password (hash stored, change required at first sign-in)."""
     temp = generate_password()
     admin = Actor(tenant_id=tenant_id, actor_type="HUMAN", display_name=display_name.strip(), email=email,
-                  roles=[ORG_ADMIN_ROLE], authority_basis=f"Organisation Admin appointed by {ctx.actor.display_name}")
+                  roles=[], authority_basis=f"Organisation Admin appointed by {ctx.actor.display_name}")
     ctx.db.add(admin)
     ctx.db.flush()
-    ctx.db.add(AuthCredential(actor_id=admin.actor_id, password_hash=hash_password(temp), must_change=True))
+    # The organisation's first administrator, as a recorded TENANT-scope assignment (ZA-IAM-001 §22; Stage 4b). The
+    # Super Admin gains no role in the organisation by doing this.
+    provision_roles(ctx.db, admin, [ORG_ADMIN_ROLE], source="PLATFORM_APPOINTMENT", granted_by=ctx.actor,
+                    authority=list(ctx.authority), reason=f"Organisation Admin appointed by {ctx.actor.display_name}")
+    with capability(ctx.db, "auth"):  # written now, while the identity tables are reachable
+        ctx.db.add(AuthCredential(actor_id=admin.actor_id, password_hash=hash_password(temp), must_change=True))
+        ctx.db.flush()
     audit(ctx.db, action="organisation.admin_appointed", object_type="Actor", object_id=admin.actor_id, actor=ctx.actor,
           tenant_id=tenant_id, new=ORG_ADMIN_ROLE, reason=f"Organisation Admin {email}")
     return temp
@@ -133,29 +145,36 @@ class StatusIn(BaseModel):
 
 
 @router.get("/organisations")
-def list_organisations(ctx: Ctx = Depends(get_ctx)):
-    _platform_admin(ctx)
+def list_organisations(ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
     db = ctx.db
     with system_scope(db, "Super Admin organisation registry: org_tenant / org_legal_entity metadata only"):
         tenants = db.execute(select(Tenant).order_by(Tenant.created_at)).scalars().all()
         entities = db.execute(select(LegalEntity)).scalars().all()
+        admins = _admins(db, [t.tenant_id for t in tenants])  # Organisation Admin names and emails only
     cells = {c.cell_id: c for c in db.execute(select(Cell)).scalars()}
-    admins = _admins(db, [t.tenant_id for t in tenants])
     by_tenant: dict[str, list[LegalEntity]] = {}
     for e in entities:
         by_tenant.setdefault(e.tenant_id, []).append(e)
-    return [_view(t, by_tenant.get(t.tenant_id, []), admins[t.tenant_id], cells) for t in tenants]
+    out = [_view(t, by_tenant.get(t.tenant_id, []), admins[t.tenant_id], cells) for t in tenants]
+    # The one cross-organisation read (system_scope) is a platform record of its own (IAM-REQ-037, SEC-REQ-045).
+    audit(db, action="platform.organisation_registry_read", object_type="OrganisationRegistry", object_id=CELL_ID,
+          actor=ctx.actor, reason=f"{len(tenants)} organisation(s) listed")
+    db.commit()
+    return out
 
 
 @router.get("/organisations/{tenant_id}")
-def get_organisation(tenant_id: str, ctx: Ctx = Depends(get_ctx)):
-    _platform_admin(ctx)
-    return _detail(ctx, _load(ctx, tenant_id))
+def get_organisation(tenant_id: str, ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
+    out = _detail(ctx, _load(ctx, tenant_id))
+    # Recorded under the organisation, so its own audit trail shows the platform looked at it.
+    audit(ctx.db, action="platform.organisation_viewed", object_type="Tenant", object_id=tenant_id, actor=ctx.actor,
+          tenant_id=tenant_id)
+    ctx.db.commit()
+    return out
 
 
 @router.post("/organisations", status_code=201)
-def create_organisation(body: OrganisationIn, ctx: Ctx = Depends(get_ctx)):
-    _platform_admin(ctx)
+def create_organisation(body: OrganisationIn, ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
     db = ctx.db
     cell = db.get(Cell, CELL_ID)
     if cell is None:  # the server's own cell must be provisioned before an organisation is placed in it
@@ -190,8 +209,7 @@ def create_organisation(body: OrganisationIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.patch("/organisations/{tenant_id}")
-def edit_organisation(tenant_id: str, body: OrganisationEdit, ctx: Ctx = Depends(get_ctx)):
-    _platform_admin(ctx)
+def edit_organisation(tenant_id: str, body: OrganisationEdit, ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
     t = _load(ctx, tenant_id)
     new_name = body.legal_name.strip()
     if new_name != t.legal_name:
@@ -203,8 +221,7 @@ def edit_organisation(tenant_id: str, body: OrganisationEdit, ctx: Ctx = Depends
 
 
 @router.post("/organisations/{tenant_id}/status")
-def set_status(tenant_id: str, body: StatusIn, ctx: Ctx = Depends(get_ctx)):
-    _platform_admin(ctx)
+def set_status(tenant_id: str, body: StatusIn, ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
     db = ctx.db
     t = _load(ctx, tenant_id)
     if body.status == t.status:
@@ -214,8 +231,10 @@ def set_status(tenant_id: str, body: StatusIn, ctx: Ctx = Depends(get_ctx)):
     if body.status == "SUSPENDED":  # end every live session of this organisation's people now
         now = datetime.now(timezone.utc)
         ids = [a for (a,) in db.execute(select(Actor.actor_id).where(Actor.tenant_id == tenant_id))]
-        for s in db.execute(select(AuthSession).where(AuthSession.actor_id.in_(ids), AuthSession.revoked_at.is_(None))).scalars():
-            s.revoked_at, revoked = now, revoked + 1
+        with capability(db, "auth"):  # revoked now, while the identity tables are reachable
+            for s in db.execute(select(AuthSession).where(AuthSession.actor_id.in_(ids), AuthSession.revoked_at.is_(None))).scalars():
+                s.revoked_at, revoked = now, revoked + 1
+            db.flush()
     audit(db, action="organisation.status_changed", object_type="Tenant", object_id=tenant_id, actor=ctx.actor,
           tenant_id=tenant_id, prior=prior, new=body.status,
           reason=body.reason.strip() + (f" ({revoked} session(s) revoked)" if revoked else ""))
@@ -224,8 +243,7 @@ def set_status(tenant_id: str, body: StatusIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/organisations/{tenant_id}/admins", status_code=201)
-def appoint_admin(tenant_id: str, body: AdminSpec, ctx: Ctx = Depends(get_ctx)):
-    _platform_admin(ctx)
+def appoint_admin(tenant_id: str, body: AdminSpec, ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
     t = _load(ctx, tenant_id)
     email = body.email.strip().lower()
     if _email_taken(ctx.db, email):

@@ -5,7 +5,7 @@ import re
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 from .. import codes
@@ -14,13 +14,13 @@ from ..models import (ApplicabilityEvaluation, ContentRelease, ControlDefinition
                       Instrument, ObligationDefinition, Provision, RegulatorySource, RequirementVersion, RuleVersion,
                       SetVersion)
 from ..platform import audit, canonical_json, emit, next_record_seq, sha256_hex, to_dict
-from ..security import Ctx, get_ctx
+from ..security import CONTENT_READERS, DOSSIER_READ, Ctx, authorize
 
 router = APIRouter(prefix="/catalog")
 
 
 @router.get("/instruments")
-def instruments(ctx: Ctx = Depends(get_ctx)):
+def instruments(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     out = []
     for i in ctx.db.execute(select(Instrument)).scalars():
         d = to_dict(i)
@@ -33,7 +33,7 @@ def instruments(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/sources")
-def sources(ctx: Ctx = Depends(get_ctx)):
+def sources(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     rows = ctx.db.execute(select(RegulatorySource).order_by(RegulatorySource.fetched_at.desc())).scalars().all()
     out = []
     for s in rows:
@@ -46,6 +46,7 @@ def sources(ctx: Ctx = Depends(get_ctx)):
 
 
 class SourceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     authority: str
     jurisdiction: str
     source_type: str
@@ -59,8 +60,7 @@ class SourceIn(BaseModel):
 
 
 @router.post("/sources")
-def ingest_source(body: SourceIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def ingest_source(body: SourceIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     seq = next_record_seq(ctx.db)
     s = RegulatorySource(authority=body.authority, jurisdiction=body.jurisdiction, source_type=body.source_type,
                          title=body.title, locator=body.locator, fingerprint=sha256_hex(body.raw_text),
@@ -85,6 +85,7 @@ MODAL = re.compile(r"\b(shall|must|is required to|are required to|shall not|must
 
 
 class ExtractIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     instrument_identifier: str
     requirement_key: str
     requirement_title: str
@@ -93,9 +94,8 @@ class ExtractIn(BaseModel):
 
 
 @router.post("/sources/{source_id}/extract")
-def extract(source_id: str, body: ExtractIn, ctx: Ctx = Depends(get_ctx)):
+def extract(source_id: str, body: ExtractIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     """Governed extractor proposal (non-binding). Output is AI_EXTRACTED -> REVIEW_REQUIRED (INV-09)."""
-    ctx.require("content_author")
     s = ctx.db.get(RegulatorySource, source_id)
     if not s:
         raise HTTPException(404, "source not found")
@@ -132,6 +132,7 @@ def extract(source_id: str, body: ExtractIn, ctx: Ctx = Depends(get_ctx)):
 
 
 class ProvisionEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     duty_bearer: str
     modality: str
     action: str
@@ -142,8 +143,7 @@ class ProvisionEdit(BaseModel):
 
 
 @router.put("/provisions/{provision_id}")
-def edit_provision(provision_id: str, body: ProvisionEdit, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("content_author")
+def edit_provision(provision_id: str, body: ProvisionEdit, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     p = ctx.db.get(Provision, provision_id)
     if not p:
         raise HTTPException(404)
@@ -158,10 +158,8 @@ def edit_provision(provision_id: str, body: ProvisionEdit, ctx: Ctx = Depends(ge
 
 
 @router.post("/requirements/{rv_id}/verify")
-def verify_requirement(rv_id: str, ctx: Ctx = Depends(get_ctx)):
+def verify_requirement(rv_id: str, ctx: Ctx = Depends(authorize("content_legal_review", human=True, platform=True))):
     """Qualified human legal review: REVIEW_REQUIRED -> VERIFIED (INV-09; AI cannot)."""
-    ctx.require_human("Content verification")
-    ctx.require("content_legal_review")
     rv = ctx.db.get(RequirementVersion, rv_id)
     if not rv:
         raise HTTPException(404)
@@ -182,7 +180,7 @@ def verify_requirement(rv_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/requirements/{rv_id}")
-def requirement(rv_id: str, ctx: Ctx = Depends(get_ctx)):
+def requirement(rv_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     rv = ctx.db.get(RequirementVersion, rv_id)
     if not rv:
         raise HTTPException(404)
@@ -194,7 +192,7 @@ def requirement(rv_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/obligation-definitions")
-def odefs(ctx: Ctx = Depends(get_ctx)):
+def odefs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     out = []
     for o in ctx.db.execute(select(ObligationDefinition)).scalars():
         d = to_dict(o)
@@ -209,17 +207,17 @@ def odefs(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/fact-definitions")
-def fdefs(ctx: Ctx = Depends(get_ctx)):
+def fdefs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     return [to_dict(f) for f in ctx.db.execute(select(FactDefinition).order_by(FactDefinition.key)).scalars()]
 
 
 @router.get("/sets")
-def sets(ctx: Ctx = Depends(get_ctx)):
+def sets(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     return [to_dict(s) for s in ctx.db.execute(select(SetVersion)).scalars()]
 
 
 @router.get("/controls")
-def control_defs(ctx: Ctx = Depends(get_ctx)):
+def control_defs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     out = []
     for c in ctx.db.execute(select(ControlDefinition)).scalars():
         d = to_dict(c)
@@ -230,7 +228,7 @@ def control_defs(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/releases")
-def releases(ctx: Ctx = Depends(get_ctx)):
+def releases(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     out = []
     for r in ctx.db.execute(select(ContentRelease).order_by(ContentRelease.published_at.desc())).scalars():
         d = to_dict(r)
@@ -245,7 +243,7 @@ def releases(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/releases/{release_id}/verify")
-def verify_release(release_id: str, ctx: Ctx = Depends(get_ctx)):
+def verify_release(release_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     r = ctx.db.get(ContentRelease, release_id)
     if not r:
         raise HTTPException(404)
@@ -256,7 +254,7 @@ def verify_release(release_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/coverage")
-def coverage(ctx: Ctx = Depends(get_ctx)):
+def coverage(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     return {"dimension": codes.DIMENSIONS["coverage_mode"],
             "instruments": [{"identifier": i.identifier, "title": i.title, "coverage_mode": i.coverage_mode,
                              "jurisdiction": i.jurisdiction} for i in ctx.db.execute(select(Instrument)).scalars()]}

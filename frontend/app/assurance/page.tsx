@@ -48,7 +48,7 @@ export default function Assurance() {
         </>} />
       <ErrorBox error={obls.error || org.error} />
       <Card bodyClassName="">
-        {obls.loading && !obls.data ? <LoadingSkeleton rows={5} /> : (
+        {!obls.data ? (!obls.error && <LoadingSkeleton rows={5} />) : (
           <DataTable columns={columns} rows={rows} rowKey={(o) => o.lineage_id} defaultSort={{ key: "obl", dir: "asc" }} />
         )}
       </Card>

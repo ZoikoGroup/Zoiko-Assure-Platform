@@ -28,6 +28,9 @@ type AuthCtx = {
   refresh: () => Promise<void>;
 };
 
+/** How long a full page load waits for the server to confirm the session before treating the check as failed. */
+const SESSION_CHECK_TIMEOUT_MS = 10_000;
+
 const Ctx = createContext<AuthCtx>({
   me: null, ready: false, actorId: "", login: async () => { throw new ApiError(0, "No auth provider"); }, logout: async () => {}, refresh: async () => {},
 });
@@ -41,14 +44,20 @@ export function ActorProvider({ children }: { children: React.ReactNode }) {
   const loadSession = useCallback(async () => {
     const t = getToken();
     if (!t) { setMe(null); setReady(true); return; }
+    // A server that accepts the connection but never answers would otherwise leave the session check, and the page,
+    // pending forever. After the timeout it is treated like any other failed check: no identity, back to sign-in.
+    const timeout = new AbortController();
+    const timer = window.setTimeout(() => timeout.abort(), SESSION_CHECK_TIMEOUT_MS);
     try {
-      const r = await fetch(`${API}/auth/session`, { headers: { Authorization: `Bearer ${t}` }, cache: "no-store" });
+      const r = await fetch(`${API}/auth/session`, { headers: { Authorization: `Bearer ${t}` }, cache: "no-store",
+                                                    signal: timeout.signal });
       if (!r.ok) throw new Error();
       setMe((await r.json()).actor);
     } catch {
       clearToken();
       setMe(null);
     } finally {
+      window.clearTimeout(timer);
       setReady(true);
     }
   }, []);

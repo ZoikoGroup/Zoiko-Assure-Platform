@@ -4,7 +4,8 @@
     .venv\\Scripts\\python.exe tools\\migrate_sqlite_to_postgres.py --apply    # migrate, verify, commit
 
 Target: the owner role in DATABASE_ADMIN_URL (real environment variables override backend/.env, as for the API).
-The owner is not subject to row-level security, as for the API's own schema bootstrap and demo seed.
+The owner is not subject to row-level security, as for the schema migrations and demo seed. The target must already be
+at the head schema revision (`python -m app.migrate upgrade`); this tool never creates or alters the schema.
 
 Guarantees
 * Insert-only and repeatable. A row whose primary key already exists in PostgreSQL is never updated: a repeat run
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -32,6 +34,7 @@ from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
+os.environ.setdefault("ZA_ADMIN_TOOL", "1")  # an operator tool: backend/.env may supply DATABASE_ADMIN_URL
 
 from sqlalchemy import (JSON, Numeric, String, Text, bindparam, cast, create_engine, func, inspect, select, text,  # noqa: E402
                         tuple_, type_coerce)
@@ -135,13 +138,13 @@ def migrate(sqlite_path: Path, apply: bool) -> int:
     print(f"source : {sqlite_path} (read-only)")
     print(f"target : {safe_target(ADMIN_DATABASE_URL)}  [{'APPLY' if apply else 'DRY RUN, rolled back'}]")
 
-    missing = [t.name for t in Base.metadata.sorted_tables if t.name not in set(inspect(admin_engine).get_table_names())]
-    if missing:
-        if not apply:
-            print(f"The PostgreSQL schema is missing {len(missing)} table(s); --apply creates it first (API start-up bootstrap).")
-            return 2
-        from app.pg_bootstrap import bootstrap
-        bootstrap()  # same idempotent schema + RLS + runtime-role bootstrap the API runs at start-up
+    # The schema comes only from the versioned migrations (docs/database-migrations.md); this tool never creates it.
+    from app.migrate import SchemaVersionError, require_current
+    try:
+        require_current()
+    except SchemaVersionError as e:
+        print(f"STOP: {e}")
+        return 2
 
     src = create_engine(f"sqlite:///file:{sqlite_path.resolve().as_posix()}?mode=ro&uri=true")
     src_tables = set(inspect(src).get_table_names())
@@ -157,7 +160,7 @@ def migrate(sqlite_path: Path, apply: bool) -> int:
     report, problems = [], []
     with Session(admin_engine) as dst:
         dst.execute(text("SET LOCAL TimeZone = 'UTC'"))
-        dst.execute(text("SELECT pg_advisory_xact_lock(724501)"))  # serialise with API start-up bootstrap
+        dst.execute(text("SELECT pg_advisory_xact_lock(724501)"))  # serialise with schema migrations (app.migrate)
         dst.execute(text("SELECT pg_advisory_xact_lock(724502)"))  # and with account bootstrap
         # Requests that need a record_seq wait until this transaction ends, so no new record can interleave.
         dst.execute(text(f"LOCK TABLE {SEQ_TABLE} IN EXCLUSIVE MODE"))

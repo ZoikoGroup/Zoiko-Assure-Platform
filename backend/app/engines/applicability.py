@@ -5,6 +5,8 @@ request -> resolve subject -> resolve facts (bitemporal) -> freeze EvaluationInp
 """
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import HTTPException
@@ -12,14 +14,16 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .. import codes
-from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation,
+from ..db import CELL_ID
+from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, ContentRelease,
                       FactDefinition, FactRequest, Issue, ObligationDefinition, ObligationInstance, RuleVersion,
                       SatisfactionExpressionVersion, SetVersion, Subject, new_id)
-from ..platform import audit, digest, emit, ensure_utc, next_record_seq
+from ..platform import audit, canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
 from . import rules
 from .facts import resolve_fact
 
 ATTESTATION_STATEMENT_V = "ATT-STMT-1.0"
+log = logging.getLogger(__name__)
 
 
 def load_fact_defs(db: Session) -> dict[str, dict]:
@@ -37,17 +41,126 @@ def load_sets(db: Session) -> dict[str, dict]:
 
 
 def resolve_rule(db: Session, odef: ObligationDefinition, effective: date, cutoff_seq: int) -> RuleVersion:
-    q = select(RuleVersion).where(RuleVersion.obligation_definition_id == odef.obligation_definition_id,
-                                  RuleVersion.status == "PUBLISHED", RuleVersion.record_seq <= cutoff_seq,
-                                  RuleVersion.valid_from <= effective,
-                                  or_(RuleVersion.valid_to.is_(None), RuleVersion.valid_to > effective))
-    rv = db.execute(q.order_by(RuleVersion.version.desc())).scalars().first()
+    published = select(RuleVersion).where(RuleVersion.obligation_definition_id == odef.obligation_definition_id,
+                                          RuleVersion.status == "PUBLISHED", RuleVersion.record_seq <= cutoff_seq)
+    effective_now = (RuleVersion.valid_from <= effective) & or_(RuleVersion.valid_to.is_(None), RuleVersion.valid_to > effective)
+    rv = db.execute(published.where(effective_now).order_by(RuleVersion.version.desc())).scalars().first()
+    # The effective period is read from the mutable row. A newer PUBLISHED version passed over because its period does
+    # not cover `effective` is skipped only if that period is the one its signed release declares; otherwise its row was
+    # altered below the application and binding an older version would be a silent fallback (Task 0; APP-REQ-006,
+    # SEC-REQ-048). verify_rule_integrity raises RuleIntegrityError, which fails the operation closed.
+    newer = published.where(~effective_now)
+    if rv is not None:
+        newer = newer.where(RuleVersion.version > rv.version)
+    for skipped in db.execute(newer.order_by(RuleVersion.version.desc())).scalars():
+        verify_rule_integrity(db, skipped)
     if rv is None:
         raise HTTPException(409, {"error": "RULE_NOT_EFFECTIVE",
                                   "message": f"No PUBLISHED RuleVersion for {odef.key} effective {effective} at record seq {cutoff_seq}"})
     if rv.coverage_mode != "ENCODED" or odef.coverage_mode != "ENCODED":
         raise HTTPException(409, {"error": "COVERAGE_NOT_ENCODED", "message": "MONITORING_ONLY content cannot bind applicability"})
     return rv
+
+
+# ---------------------------------------------------------------- rule integrity before input freeze (ZA-APP-001 §13)
+class RuleIntegrityError(Exception):
+    """A binding RuleVersion failed integrity verification: RUL_SIGNATURE_INVALID (ZA-RUL-001 §18). Deliberately not an
+    HTTPException, so no caller can absorb it as an ordinary evaluation error: the operation fails closed (SEC-REQ-048),
+    with no fallback to another RuleVersion and never UNCERTAIN (APP-REQ-019). See integrity_fail_closed."""
+    code = "RUL_SIGNATURE_INVALID"
+
+    def __init__(self, rv: RuleVersion, check: str, artifact_id: str):
+        super().__init__(f"{self.code}: {check} ({artifact_id}, rule version {rv.rule_version_id})")
+        self.check = check
+        self.artifact_id = artifact_id  # the artifact that failed: the RuleVersion, a SetVersion or the release
+        self.rule_version_id = rv.rule_version_id
+        self.content_release_id = rv.content_release_id
+
+
+def _integrity_failure(db: Session, rv: RuleVersion) -> tuple[str, str] | None:
+    """(check, failing artifact ID) for the first failed check, or None."""
+    pins = {}
+    for ref in rv.set_refs or []:  # 1. each pinned SetVersion still hashes to its pin (RUL-REQ-014)
+        sv = db.get(SetVersion, ref["set_version_id"])
+        if sv is None:
+            return "SET_VERSION_MISSING", ref["set_version_id"]
+        h = rules.set_hash(sv.element_type, sv.members)
+        if h != ref["sha256"] or h != sv.canonical_hash:
+            return "SET_HASH_MISMATCH", sv.set_version_id
+        pins[sv.set_version_id] = h
+    # 2. the authoritative AST hash, recomputed under the declared versions (ZA-RUL-001 §12; RUL-REQ-016)
+    if rules.ast_hash(rv.canonical_ast, pins, rule_schema_version=rv.rule_schema_version,
+                      operator_set_version=rv.operator_set_version) != rv.ast_hash:
+        return "AST_HASH_MISMATCH", rv.rule_version_id
+    # 3. the release the RuleVersion names: PUBLISHED, signed, manifest hash recomputes (RUL-REQ-027)
+    cr = db.get(ContentRelease, rv.content_release_id)
+    if cr is None or cr.status != "PUBLISHED":
+        return "RELEASE_NOT_PUBLISHED", rv.content_release_id
+    if sha256_hex(canonical_json(cr.manifest)) != cr.manifest_hash:
+        return "MANIFEST_HASH_MISMATCH", cr.content_release_id
+    if not cr.signature:
+        return "RELEASE_UNSIGNED", cr.content_release_id
+    # 4. the manifest covers exactly this RuleVersion: ID, AST hash, every field it declares, the same SetVersion pins
+    entries = [e for e in cr.manifest["rule_versions"] if e["rule_version_id"] == rv.rule_version_id]
+    if len(entries) != 1 or entries[0]["ast_sha256"] != rv.ast_hash:
+        return "RELEASE_DOES_NOT_COVER_RULE_VERSION", cr.content_release_id
+    declared = {"rule_schema_version": rv.rule_schema_version, "operator_set_version": rv.operator_set_version,
+                "valid_from": rv.valid_from.isoformat(), "valid_to": rv.valid_to.isoformat() if rv.valid_to else None}
+    if any(k in entries[0] and entries[0][k] != v for k, v in declared.items()):
+        return "RELEASE_ENTRY_MISMATCH", cr.content_release_id
+    pinned = sorted((r["set_version_id"], r["sha256"]) for r in cr.manifest.get("set_refs") or [])
+    if pinned != sorted(pins.items()):
+        return "RELEASE_SET_PINS_MISMATCH", cr.content_release_id
+    return None
+
+
+def verify_rule_integrity(db: Session, rv: RuleVersion) -> None:
+    """APP-REQ-006 / RUL-REQ-027 hash and release binding of a binding RuleVersion, checked before input freeze.
+    Malformed released content fails the same way. The release signature must be present but is NOT verified: that needs
+    the content-release trust decision (A9b; docs/backend-decision-brief-content-signature-trust.md)."""
+    try:
+        failure = _integrity_failure(db, rv)
+    except (KeyError, TypeError, AttributeError, ValueError):
+        failure = "MALFORMED_CONTENT", rv.rule_version_id
+    if failure:
+        raise RuleIntegrityError(rv, *failure)
+
+
+def record_integrity_failure(db: Session, err: RuleIntegrityError, *, actor, tenant_id: str | None) -> None:
+    """SEC-REQ-048's security signal: `security.content_signature_failed` (ZA-SEC-001 §23; ZA-EVT-001 §19,
+    SECURITY_CRITICAL). The failed operation's transaction is rolled back first, so nothing it wrote survives. The
+    verification result is then committed on its own, in the same session and role: an audit record plus the event in
+    the transactional outbox (ZA-EVT-001: security-critical events originate from the outbox, tied to committed security
+    state). No second connection, owner credential or other store is involved."""
+    db.rollback()
+    seq = next_record_seq(db)
+    audit(db, action="content.verify", object_type="RuleVersion", object_id=err.rule_version_id, actor=actor,
+          tenant_id=tenant_id, new=err.code, reason=f"{err.check}: {err.artifact_id}", record_seq=seq)
+    emit(db, event_type="security.content_signature_failed", aggregate_type="ContentRelease",
+         aggregate_id=err.content_release_id, tenant_id=tenant_id, record_seq=seq,
+         payload={"content_release_id": err.content_release_id, "rule_version_id": err.rule_version_id,
+                  "artifact_id": err.artifact_id, "cell_id": CELL_ID, "verification_result": err.check})
+    db.commit()
+
+
+@contextmanager
+def integrity_fail_closed(db: Session, *, actor, tenant_id: str | None):
+    """Wraps every request path that evaluates a binding RuleVersion. On RUL_SIGNATURE_INVALID the whole operation fails
+    closed: its transaction is rolled back, the security signal is committed, and the caller gets an error, never a
+    partial or fallback result. The refusal does not depend on the signal being recorded."""
+    try:
+        yield
+    except RuleIntegrityError as err:
+        log.error("%s: %s on %s for rule version %s (content release %s); evaluation refused",
+                  err.code, err.check, err.artifact_id, err.rule_version_id, err.content_release_id)
+        try:
+            record_integrity_failure(db, err, actor=actor, tenant_id=tenant_id)
+        except Exception:  # noqa: BLE001 - still refuse; the failure to record is logged
+            db.rollback()
+            log.exception("could not record security.content_signature_failed for rule version %s", err.rule_version_id)
+        raise HTTPException(500, {"error": err.code, "rule_version_id": err.rule_version_id,
+                                  "message": "Released rule content failed integrity verification; the evaluation "
+                                             "was refused."}) from None
 
 
 def _display(fd: dict, value):
@@ -66,6 +179,7 @@ def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationD
         from ..platform import current_watermark
         record_cutoff_seq = current_watermark(db)["record_seq"]
     rv = rule_version or resolve_rule(db, odef, effective_at.date(), record_cutoff_seq)
+    verify_rule_integrity(db, rv)  # before input freeze (ZA-APP-001 §13); raises RuleIntegrityError
     fact_defs = load_fact_defs(db)
     sets = load_sets(db)
     fdmodels = {fd.key: fd for fd in db.execute(select(FactDefinition)).scalars()}
@@ -143,6 +257,22 @@ def current_determination(db: Session, tenant_id: str, subject_id: str, odef_id:
         ApplicabilityDetermination.obligation_definition_id == odef_id,
         ApplicabilityDetermination.record_to_seq.is_(None)).order_by(
         ApplicabilityDetermination.record_from_seq.desc())).scalars().first()
+
+
+def current_determinations(db: Session, tenant_id: str, pairs: set[tuple[str, str]]) -> dict[tuple[str, str], ApplicabilityDetermination]:
+    """current_determination() for many (subject_id, obligation_definition_id) pairs in one query (list views)."""
+    out: dict[tuple[str, str], ApplicabilityDetermination] = {}
+    if not pairs:
+        return out
+    for d in db.execute(select(ApplicabilityDetermination).where(
+            ApplicabilityDetermination.tenant_id == tenant_id,
+            ApplicabilityDetermination.subject_id.in_({s for s, _ in pairs}),
+            ApplicabilityDetermination.record_to_seq.is_(None)).order_by(
+            ApplicabilityDetermination.record_from_seq.desc())).scalars():
+        key = (d.subject_id, d.obligation_definition_id)
+        if key in pairs:
+            out.setdefault(key, d)
+    return out
 
 
 def _new_det_revision(db, prev: ApplicabilityDetermination | None, *, tenant_id, subject_id, odef_id, evaluation,
@@ -335,18 +465,26 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
     """Impact scheduling: re-evaluate dependents of a changed FactDefinition (ZA-APP-001 §10)."""
     subjects = [holder]
     if holder.subject_type == "LEGAL_ENTITY":
-        subjects += db.execute(select(Subject).where(Subject.entity_id == holder.entity_id,
-                                                     Subject.subject_id != holder.subject_id)).scalars().all()
+        subjects += db.execute(select(Subject).where(Subject.tenant_id == tenant_id,
+                                                     Subject.entity_id == holder.entity_id,
+                                                     Subject.subject_id != holder.subject_id)
+                               .order_by(Subject.subject_id)).scalars().all()
     results = []
     for s in subjects:
-        odefs = db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)).scalars().all()
+        odefs = db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)
+                           .order_by(ObligationDefinition.key, ObligationDefinition.obligation_definition_id)).scalars().all()
         for od in odefs:
-            rv = db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == od.obligation_definition_id,
-                                                      RuleVersion.status == "PUBLISHED")).scalars().first()
-            if not rv or fd.key not in rv.required_facts:
+            # A dependent if any published version needs the fact (deterministic; the evaluation resolves the version).
+            versions = db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == od.obligation_definition_id,
+                                                            RuleVersion.status == "PUBLISHED")
+                                  .order_by(RuleVersion.version.desc())).scalars().all()
+            if not any(fd.key in v.required_facts for v in versions):
                 continue
-            had = db.execute(select(ApplicabilityEvaluation).where(ApplicabilityEvaluation.subject_id == s.subject_id,
-                                                                   ApplicabilityEvaluation.obligation_definition_id == od.obligation_definition_id)).scalars().first()
+            had = db.execute(select(ApplicabilityEvaluation).where(
+                ApplicabilityEvaluation.tenant_id == tenant_id,
+                ApplicabilityEvaluation.subject_id == s.subject_id,
+                ApplicabilityEvaluation.obligation_definition_id == od.obligation_definition_id)
+                .order_by(ApplicabilityEvaluation.record_seq.desc())).scalars().first()
             if not had:
                 continue
             try:

@@ -64,7 +64,7 @@ export default function Packages() {
       </div>
       {vr.result && <div className="mt-4"><VerifyReport r={vr.result} /></div>}
       <Card className="mt-4" title="Packages">
-        <Table head={["Package", "Entity", "Period", "Cutoff", "Manifest hash", "Status", "Created", ""]} empty={data?.length === 0}>
+        <Table head={["Package", "Entity", "Period", "Cutoff", "Manifest hash", "Status", "Created", ""]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((p) => <PackageRow key={p.package_id} p={p} />)}
         </Table>
       </Card>

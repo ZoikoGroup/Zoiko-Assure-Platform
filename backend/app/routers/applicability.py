@@ -12,9 +12,12 @@ from ..engines.facts import assert_fact, assertion_value, resolve_fact
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, DeterminationChallenge,
                       FactAssertion, FactConflict, FactDefinition, FactRequest, ObligationDefinition, RuleVersion, Subject)
 from ..platform import current_watermark, emit, ensure_utc, next_record_seq, to_dict
-from ..security import Ctx, get_ctx
+from ..security import DOSSIER_READ, READ, Ctx, authorize, entity_of
 
 router = APIRouter()
+# Stage 4: how subjects and evaluations resolve to their legal entity, so entity-scoped roles reach their entity only.
+SUBJECT = entity_of(Subject, "subject_id", "subject")
+EVALUATION = entity_of(ApplicabilityEvaluation, "evaluation_id", "evaluation")
 
 
 def _fact_row(db, a: FactAssertion, fd: FactDefinition) -> dict:
@@ -26,7 +29,7 @@ def _fact_row(db, a: FactAssertion, fd: FactDefinition) -> dict:
 
 
 @router.get("/subjects/{subject_id}/facts")
-def fact_profile(subject_id: str, valid_at: datetime | None = None, known_seq: int | None = None, ctx: Ctx = Depends(get_ctx)):
+def fact_profile(subject_id: str, valid_at: datetime | None = None, known_seq: int | None = None, ctx: Ctx = Depends(authorize(*READ, entity=SUBJECT))):
     """Fact profile at an explicit bitemporal coordinate (CURRENT if both omitted; echoed back)."""
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
     wm = current_watermark(ctx.db)
@@ -53,7 +56,7 @@ def fact_profile(subject_id: str, valid_at: datetime | None = None, known_seq: i
 
 
 @router.get("/subjects/{subject_id}/facts/history")
-def fact_history(subject_id: str, ctx: Ctx = Depends(get_ctx)):
+def fact_history(subject_id: str, ctx: Ctx = Depends(authorize(*READ, entity=SUBJECT))):
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
     fds = {f.fact_definition_id: f for f in ctx.db.execute(select(FactDefinition)).scalars()}
     rows = ctx.db.execute(select(FactAssertion).where(FactAssertion.tenant_id == ctx.tenant,
@@ -75,8 +78,7 @@ class FactIn(BaseModel):
 
 
 @router.post("/subjects/{subject_id}/facts")
-def assert_fact_ep(subject_id: str, body: FactIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("manage_facts")
+def assert_fact_ep(subject_id: str, body: FactIn, ctx: Ctx = Depends(authorize("manage_facts"))):
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
     fd = ctx.db.execute(select(FactDefinition).where(FactDefinition.key == body.fact_key)).scalars().first()
     if not fd:
@@ -91,15 +93,17 @@ def assert_fact_ep(subject_id: str, body: FactIn, ctx: Ctx = Depends(get_ctx)):
             raise HTTPException(422, f"{fd.key} does not allow manual attestation; use a certified source")
     else:
         raise HTTPException(403, "System-sourced facts must arrive through the certified connector path, not this endpoint")
-    created = assert_fact(ctx.db, tenant_id=ctx.tenant, subject=s, fd=fd, value=body.value, valid_from=body.valid_from,
-                          valid_to=body.valid_to, provenance_class=provenance, source_ref=body.source_ref,
-                          actor_id=ctx.actor.actor_id, change_kind=body.change_kind, reason=body.reason)
-    reeval = appl.reevaluate_for_fact(ctx.db, tenant_id=ctx.tenant, holder=s, fd=fd, actor_id=ctx.actor.actor_id)
-    ctx.db.commit()
+    with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):
+        created = assert_fact(ctx.db, tenant_id=ctx.tenant, subject=s, fd=fd, value=body.value, valid_from=body.valid_from,
+                              valid_to=body.valid_to, provenance_class=provenance, source_ref=body.source_ref,
+                              actor_id=ctx.actor.actor_id, change_kind=body.change_kind, reason=body.reason)
+        reeval = appl.reevaluate_for_fact(ctx.db, tenant_id=ctx.tenant, holder=s, fd=fd, actor_id=ctx.actor.actor_id)
+        ctx.db.commit()
     return {"revisions": [_fact_row(ctx.db, a, fd) for a in created], "impact_reevaluations": reeval}
 
 
 class EvalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     subject_id: str
     obligation_definition_id: str
     effective_at: datetime | None = None
@@ -107,7 +111,10 @@ class EvalIn(BaseModel):
     trigger: str = "EXPLICIT_REQUEST"
 
 
-def _eval_view(db, e: ApplicabilityEvaluation) -> dict:
+_LOOK_UP = object()
+
+
+def _eval_view(db, e: ApplicabilityEvaluation, det=_LOOK_UP) -> dict:
     d = to_dict(e)
     od = db.get(ObligationDefinition, e.obligation_definition_id)
     s = db.get(Subject, e.subject_id)
@@ -116,51 +123,62 @@ def _eval_view(db, e: ApplicabilityEvaluation) -> dict:
     d["subject"] = {"display_name": s.display_name, "subject_type": s.subject_type}
     d["rule_version"] = {"version": rv.version, "ast_hash": rv.ast_hash, "content_release_id": rv.content_release_id,
                          "source_mappings": rv.source_mappings}
-    det = appl.current_determination(db, e.tenant_id, e.subject_id, e.obligation_definition_id)
+    if det is _LOOK_UP:
+        det = appl.current_determination(db, e.tenant_id, e.subject_id, e.obligation_definition_id)
     d["current_determination"] = to_dict(det) if det else None
     return d
 
 
 @router.post("/applicability/evaluations")
-def request_evaluation(body: EvalIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("request_evaluation")
+def request_evaluation(body: EvalIn, ctx: Ctx = Depends(authorize("request_evaluation"))):
     s = ctx.scoped(ctx.db.get(Subject, body.subject_id), "subject")
     od = ctx.db.get(ObligationDefinition, body.obligation_definition_id)
     if not od:
         raise HTTPException(404, "obligation definition")
-    ev = appl.evaluate(ctx.db, tenant_id=ctx.tenant, subject=s, odef=od,
-                       effective_at=body.effective_at or datetime.now(timezone.utc),
-                       record_cutoff_seq=body.record_cutoff_seq, trigger=body.trigger, actor_id=ctx.actor.actor_id)
+    with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):
+        ev = appl.evaluate(ctx.db, tenant_id=ctx.tenant, subject=s, odef=od,
+                           effective_at=body.effective_at or datetime.now(timezone.utc),
+                           record_cutoff_seq=body.record_cutoff_seq, trigger=body.trigger, actor_id=ctx.actor.actor_id)
     ctx.db.commit()
     return _eval_view(ctx.db, ev)
 
 
 @router.post("/applicability/evaluate-all")
-def evaluate_all(subject_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("request_evaluation")
+def evaluate_all(subject_id: str, ctx: Ctx = Depends(authorize("request_evaluation"))):
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
     out = []
-    for od in ctx.db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)).scalars():
-        try:
-            ev = appl.evaluate(ctx.db, tenant_id=ctx.tenant, subject=s, odef=od, effective_at=datetime.now(timezone.utc),
-                               record_cutoff_seq=None, trigger="EXPLICIT_REQUEST", actor_id=ctx.actor.actor_id)
-            out.append({"obligation": od.key, "outcome": ev.outcome, "evaluation_id": ev.evaluation_id})
-        except HTTPException as e:
-            out.append({"obligation": od.key, "error": e.detail})
+    with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):  # no partial batch on tampering
+        for od in ctx.db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)).scalars():
+            try:
+                ev = appl.evaluate(ctx.db, tenant_id=ctx.tenant, subject=s, odef=od, effective_at=datetime.now(timezone.utc),
+                                   record_cutoff_seq=None, trigger="EXPLICIT_REQUEST", actor_id=ctx.actor.actor_id)
+                out.append({"obligation": od.key, "outcome": ev.outcome, "evaluation_id": ev.evaluation_id})
+            except HTTPException as e:
+                out.append({"obligation": od.key, "error": e.detail})
     ctx.db.commit()
     return out
 
 
 @router.get("/applicability/evaluations")
-def list_evaluations(subject_id: str | None = None, ctx: Ctx = Depends(get_ctx)):
+def list_evaluations(subject_id: str | None = None, ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     q = select(ApplicabilityEvaluation).where(ApplicabilityEvaluation.tenant_id == ctx.tenant)
     if subject_id:
         q = q.where(ApplicabilityEvaluation.subject_id == subject_id)
-    return [_eval_view(ctx.db, e) for e in ctx.db.execute(q.order_by(ApplicabilityEvaluation.record_seq.desc()).limit(200)).scalars()]
+    evs = ctx.db.execute(q.order_by(ApplicabilityEvaluation.record_seq.desc()).limit(200)).scalars().all()
+    # What the rows refer to, read once instead of per row: the subjects, obligation definitions and rule versions are
+    # loaded into the session (and held here) so db.get() in _eval_view finds them without a query.
+    refs = [*ctx.db.execute(select(Subject).where(Subject.subject_id.in_({e.subject_id for e in evs}))).scalars(),
+            *ctx.db.execute(select(ObligationDefinition).where(
+                ObligationDefinition.obligation_definition_id.in_({e.obligation_definition_id for e in evs}))).scalars(),
+            *ctx.db.execute(select(RuleVersion).where(RuleVersion.rule_version_id.in_({e.rule_version_id for e in evs}))).scalars()]
+    dets = appl.current_determinations(ctx.db, ctx.tenant, {(e.subject_id, e.obligation_definition_id) for e in evs})
+    out = [_eval_view(ctx.db, e, dets.get((e.subject_id, e.obligation_definition_id))) for e in evs]
+    del refs
+    return out
 
 
 @router.get("/applicability/evaluations/{evaluation_id}")
-def get_evaluation(evaluation_id: str, ctx: Ctx = Depends(get_ctx)):
+def get_evaluation(evaluation_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=EVALUATION))):
     e = ctx.scoped(ctx.db.get(ApplicabilityEvaluation, evaluation_id), "evaluation")
     d = _eval_view(ctx.db, e)
     d["determination_history"] = [to_dict(x) for x in ctx.db.execute(select(ApplicabilityDetermination).where(
@@ -172,7 +190,8 @@ def get_evaluation(evaluation_id: str, ctx: Ctx = Depends(get_ctx)):
     d["attestations"] = [to_dict(a) for a in ctx.db.execute(select(AdoptionAttestation).where(
         AdoptionAttestation.tenant_id == ctx.tenant,
         AdoptionAttestation.target_revision_id.in_([x["revision_id"] for x in d["determination_history"]] or ["-"]))).scalars()]
-    d["replay"] = _replay(ctx, e)
+    with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):
+        d["replay"] = _replay(ctx, e)
     return d
 
 
@@ -189,7 +208,7 @@ def _replay(ctx: Ctx, e: ApplicabilityEvaluation) -> dict:
 
 
 @router.get("/applicability/determinations")
-def determinations(ctx: Ctx = Depends(get_ctx)):
+def determinations(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     rows = ctx.db.execute(select(ApplicabilityDetermination).where(ApplicabilityDetermination.tenant_id == ctx.tenant,
                                                                    ApplicabilityDetermination.record_to_seq.is_(None))).scalars().all()
     out = []
@@ -204,13 +223,14 @@ def determinations(ctx: Ctx = Depends(get_ctx)):
 
 
 class AttestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     decision: str  # ADOPT | REJECT
     authority_basis: str
     reason: str | None = None
 
 
 @router.post("/applicability/determinations/{lineage_id}/attest")
-def attest(lineage_id: str, body: AttestIn, ctx: Ctx = Depends(get_ctx)):
+def attest(lineage_id: str, body: AttestIn, ctx: Ctx = Depends(authorize("attest", human=True))):
     if body.decision not in ("ADOPT", "REJECT"):
         raise HTTPException(422, "decision must be ADOPT or REJECT")
     r = appl.attest(ctx.db, ctx=ctx, determination_lineage_id=lineage_id, decision=body.decision,
@@ -221,14 +241,14 @@ def attest(lineage_id: str, body: AttestIn, ctx: Ctx = Depends(get_ctx)):
 
 
 class ChallengeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     challenge_class: str  # FACT_WRONG, FACT_MISSING, RULE_WRONG, INTERPRETATION
     detail: str
 
 
 @router.post("/applicability/determinations/{lineage_id}/challenge")
-def challenge(lineage_id: str, body: ChallengeIn, ctx: Ctx = Depends(get_ctx)):
+def challenge(lineage_id: str, body: ChallengeIn, ctx: Ctx = Depends(authorize("challenge"))):
     """Challenge creates a governed record; never rewrites the evaluation (FR-APP-005)."""
-    ctx.require("challenge")
     cur = ctx.db.execute(select(ApplicabilityDetermination).where(ApplicabilityDetermination.tenant_id == ctx.tenant,
                                                                   ApplicabilityDetermination.lineage_id == lineage_id,
                                                                   ApplicabilityDetermination.record_to_seq.is_(None))).scalars().first()
@@ -253,7 +273,7 @@ def challenge(lineage_id: str, body: ChallengeIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/fact-requests")
-def fact_requests(ctx: Ctx = Depends(get_ctx)):
+def fact_requests(ctx: Ctx = Depends(authorize(*READ))):
     out = []
     for fr in ctx.db.execute(select(FactRequest).where(FactRequest.tenant_id == ctx.tenant)
                              .order_by(FactRequest.created_at.desc())).scalars():
@@ -268,18 +288,19 @@ def fact_requests(ctx: Ctx = Depends(get_ctx)):
 
 @router.get("/history/compare")
 def compare(subject_id: str, obligation_definition_id: str, valid_at: datetime, left_seq: int, right_seq: int,
-            ctx: Ctx = Depends(get_ctx)):
+            ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=SUBJECT))):
     """Same valid time, two record cutoffs: AS_KNOWN_THEN vs RECONSTRUCTED_NOW (ZA-TIM-001 §12)."""
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
     od = ctx.db.get(ObligationDefinition, obligation_definition_id)
     sides = {}
-    for name, seq in (("left", left_seq), ("right", right_seq)):
-        try:
-            r = appl.evaluate(ctx.db, tenant_id=ctx.tenant, subject=s, odef=od, effective_at=valid_at, record_cutoff_seq=seq,
-                              trigger="RECONSTRUCTION", actor_id=ctx.actor.actor_id, persist=False)
-            sides[name] = {"known_seq": seq, **r}
-        except HTTPException as e:
-            sides[name] = {"known_seq": seq, "error": e.detail}
+    with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):
+        for name, seq in (("left", left_seq), ("right", right_seq)):
+            try:
+                r = appl.evaluate(ctx.db, tenant_id=ctx.tenant, subject=s, odef=od, effective_at=valid_at,
+                                  record_cutoff_seq=seq, trigger="RECONSTRUCTION", actor_id=ctx.actor.actor_id, persist=False)
+                sides[name] = {"known_seq": seq, **r}
+            except HTTPException as e:
+                sides[name] = {"known_seq": seq, "error": e.detail}
     diffs = []
     if "rule_version_id" in sides["left"] and "rule_version_id" in sides["right"]:
         if sides["left"]["rule_version_id"] != sides["right"]["rule_version_id"]:

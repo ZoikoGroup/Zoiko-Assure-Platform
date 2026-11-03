@@ -5,7 +5,7 @@ import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { AI_ASSET_KINDS } from "@/lib/codes";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ConfirmDialog, ErrorBox, FieldError, Json, LiveRegion, Modal, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ConfirmDialog, ErrorBox, FieldError, Json, LiveRegion, LoadingSkeleton, Modal, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 const LEVELS = [["A0", "Observe"], ["A1", "Recommend"], ["A2", "Prepare"], ["A3", "Execute (reversible)"]];
 /* ZA-ARCH-001 §12.1 asset registry kinds (lib/codes). Stored kinds outside this list are shown as received and marked, never rewritten. */
@@ -28,6 +28,7 @@ export default function AI() {
       <ErrorBox error={error} />
       <Notice>Authority levels run A0 Observe → A1 Recommend → A2 Prepare → A3 Execute (reversible). A4 material autonomy is excluded from the initial production scope. Enforcement stays in the customer runtime; Assure returns a decision, its obligation context and a receipt.</Notice>
       <div className="mt-4 space-y-4">
+        {!data && !error && <Card><LoadingSkeleton rows={4} /></Card>}
         {data?.map((s) => {
           const v = s.versions[0];
           return (

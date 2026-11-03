@@ -21,7 +21,7 @@ export default function Controls() {
       <ErrorBox error={error} />
       <Notice>The state column is a 24-hour convenience view. Authoritative states are immutable ControlEvaluations pinned to windows and record cutoffs.</Notice>
       <Card className="mt-4">
-        <Table head={["Control", "Scope", "Method", "Owner", "Since", "Current state", "Reasons"]} empty={data?.length === 0}>
+        <Table head={["Control", "Scope", "Method", "Owner", "Since", "Current state", "Reasons"]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((c) => (
             <tr key={c.control_implementation_id}>
               <td className="td"><A href={`/controls/${c.control_implementation_id}`}>{c.definition.title}</A><div className="mono text-[11px] text-slate-500">{c.definition.key}</div></td>

@@ -1,13 +1,15 @@
 # Deploys one CI-verified release to one GitHub Environment. Called by deploy.yml for `staging`, then `production`.
 # Documented in docs/ci-cd.md.
 #
-# Order: validate configuration -> verify release bundle -> build frontend for this environment -> apply approved
-# migrations -> deploy backend -> verify backend -> deploy frontend -> verify frontend and frontend->backend ->
-# record the result. Any failure stops the job before the next step, so a release is never exposed after a failed
-# migration or health check.
+# Order: validate configuration -> verify release bundle -> build frontend for this environment -> back up the
+# database -> apply approved migrations -> deploy backend -> verify backend -> deploy frontend -> verify frontend and
+# frontend->backend -> record the result. Any failure stops the job before the next step, so a release is never
+# exposed after a failed backup, migration or health check.
 #
-# Fails closed today: steps marked DEPLOYMENT TARGET REQUIRED and BLOCKED — VERSIONED MIGRATION SYSTEM REQUIRED exit 1
-# until a deployment target and a migration system exist. They do not create, alter, reset or seed any database.
+# Migrations run here, as their own step, with `python -m app.migrate` from the release bundle
+# (docs/database-migrations.md); the API never creates or alters its schema. Fails closed today: steps marked
+# DEPLOYMENT TARGET REQUIRED (including the pre-migration backup) exit 1 until a deployment target exists (G-10), so
+# no staging or production database is touched yet. Nothing in this workflow resets, drops or seeds a database.
 name: Deploy environment
 
 on:
@@ -117,18 +119,56 @@ jobs:
           npx tsc --noEmit
           npm run build
 
+      # The migration tool runs from the verified release bundle: the backend source and the dependency set CI tested.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"  # ci.yml PYTHON_VERSION
+
+      - name: Prepare migration tool from the release bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/backend-release"
+          tar -xzf "$RUNNER_TEMP/release/backend-src.tar.gz" -C "$RUNNER_TEMP/backend-release"
+          test -f "$RUNNER_TEMP/backend-release/backend/migrations/baseline_schema.json"
+          python -m venv "$RUNNER_TEMP/migrate-venv"
+          "$RUNNER_TEMP/migrate-venv/bin/python" -m pip install --no-deps --disable-pip-version-check \
+            -r "$RUNNER_TEMP/release/backend-requirements.lock.txt"
+          "$RUNNER_TEMP/migrate-venv/bin/python" -m pip check
+
+      - name: Back up the database before migrating
+        id: backup
+        run: |
+          # Target-specific (G-10). Take a restorable backup of this environment's database (a managed-database
+          # snapshot, or `pg_dump --format=custom` to protected storage), confirm it completed, and record its
+          # identifier in the deployment record. Migrations never run without it: recovery from a failed or wrong
+          # release is a restore or a forward fix, not a downgrade (docs/database-migrations.md).
+          echo "::error title=DEPLOYMENT TARGET REQUIRED::No pre-migration backup is implemented for $ZA_ENVIRONMENT (docs/database-migrations.md)."
+          exit 1
+
       - name: Apply approved database migrations
         id: migrate
+        working-directory: ${{ runner.temp }}/backend-release/backend
+        env:
+          # Only this step holds the owner/migration credential. The runtime URL is here so the tool can provision and
+          # verify the runtime role assure_app with its password. The tool prints user@host/database, never a password.
+          DATABASE_ADMIN_URL: ${{ secrets.ZA_MIGRATION_DATABASE_URL }}
+          DATABASE_URL: ${{ secrets.ZA_DATABASE_URL }}
+          ZA_SKIP_DOTENV: "1"
         run: |
-          # BLOCKED: the backend has no versioned migration system. Its schema comes from create_all plus
-          # db/postgres_rls.sql, applied by app/pg_bootstrap.py at API start-up with the owner role. That is not a
-          # production migration system, and this pipeline will not create or alter a staging/production schema
-          # through it.
-          # When migrations exist (planned: Alembic, DAT-REQ-023/039), run only the reviewed migrations here, giving
-          # this step alone the owner/migration credential (the ZA_MIGRATION_DATABASE_URL environment secret, mapped
-          # in the step's own env), and never a reset, DROP, test seed or Customer Zero seed.
-          echo "::error title=BLOCKED — VERSIONED MIGRATION SYSTEM REQUIRED::No versioned, reviewed migrations exist for $ZA_ENVIRONMENT. Deployment stops before any schema change (docs/ci-cd.md)."
-          exit 1
+          py="$RUNNER_TEMP/migrate-venv/bin/python"
+          # 1. Read-only. Exit 0: at head. 1: work due (empty, behind, or a database created by the pre-migration
+          #    start-up that matches the recorded baseline exactly). 2: refused (drift, unknown revision, inconsistent
+          #    version table); nothing is changed and an operator must reconcile it first.
+          rc=0; "$py" -m app.migrate status || rc=$?
+          if [ "$rc" -ge 2 ]; then
+            echo "::error title=Migrations refused::$ZA_ENVIRONMENT is in a state the migration tool will not change automatically; nothing was changed (docs/database-migrations.md)."
+            exit 1
+          fi
+          # 2. The reviewed revisions shipped in this release, in order, in one transaction under the migration lock.
+          #    A failure rolls the whole run back and stops the deployment here.
+          "$py" -m app.migrate upgrade
+          # 3. Read-only verification: head revision, no drift from the models, RLS on every tenant table.
+          "$py" -m app.migrate check
 
       - name: Deploy backend
         id: deploy_backend
@@ -137,6 +177,9 @@ jobs:
           # release bundle with: DATABASE_URL from secrets.ZA_DATABASE_URL (runtime role), ZA_CORS, ZA_CELL_ID,
           # ZA_DEMO_MODE=0, persistent ZA_DATA_DIR storage, and without ZA_DEV_IDENTITY_HEADER. Deploy to an inactive
           # slot / new revision and keep it out of traffic until the verification below passes.
+          # The API refuses to start unless the schema is at this release's head revision, and never changes it. It
+          # still needs DATABASE_ADMIN_URL at start-up (read-only schema and role checks, one-time account bootstrap);
+          # removing the owner credential from the API process is an open item (docs/ci-cd.md).
           echo "::error title=DEPLOYMENT TARGET REQUIRED::No backend deployment target is implemented (docs/ci-cd.md)."
           exit 1
 
@@ -168,6 +211,7 @@ jobs:
         if: ${{ always() }}
         env:
           CONFIG: ${{ steps.config.outcome }}
+          BACKUP: ${{ steps.backup.outcome }}
           MIGRATE: ${{ steps.migrate.outcome }}
           DEPLOY_BACKEND: ${{ steps.deploy_backend.outcome }}
           VERIFY_BACKEND: ${{ steps.verify_backend.outcome }}
@@ -179,11 +223,13 @@ jobs:
           cp "$RUNNER_TEMP"/verify-*.json "$RUNNER_TEMP/record/" 2> /dev/null || true
           jq -n --arg env "$ZA_ENVIRONMENT" --arg sha "$RELEASE_SHA" --arg run "$GITHUB_RUN_ID" \
                 --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg status "$JOB_STATUS" \
-                --arg config "$CONFIG" --arg migrate "$MIGRATE" --arg deploy_backend "$DEPLOY_BACKEND" \
+                --arg config "$CONFIG" --arg backup "$BACKUP" --arg migrate "$MIGRATE" \
+                --arg deploy_backend "$DEPLOY_BACKEND" \
                 --arg verify_backend "$VERIFY_BACKEND" --arg deploy_frontend "$DEPLOY_FRONTEND" \
                 --arg verify_frontend "$VERIFY_FRONTEND" \
                 '{environment: $env, commit: $sha, deploy_run_id: $run, recorded_at: $at, result: $status,
-                  steps: {validate_configuration: $config, migrations: $migrate, deploy_backend: $deploy_backend,
+                  steps: {validate_configuration: $config, backup: $backup, migrations: $migrate,
+                          deploy_backend: $deploy_backend,
                           verify_backend: $verify_backend, deploy_frontend: $deploy_frontend,
                           verify_frontend: $verify_frontend}}' > "$RUNNER_TEMP/record/deployment.json"
           cat "$RUNNER_TEMP/record/deployment.json"

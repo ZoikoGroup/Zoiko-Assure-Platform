@@ -32,7 +32,7 @@ function Anomalies() {
   return (
     <Card subtitle="A disposition is a governed record. It never edits the original check result.">
       <ErrorBox error={error} />
-      <Table head={["Check", "Class", "Dimension", "Affected", "Severity", "Disposition", ""]} empty={data?.length === 0}>
+      <Table head={["Check", "Class", "Dimension", "Affected", "Severity", "Disposition", ""]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((x) => (
           <tr key={x.anomaly_id}>
             <td className="td mono text-xs">{x.check_id}</td><td className="td mono text-xs">{x.anomaly_class}</td><td className="td text-xs">{x.dimension}</td>
@@ -60,7 +60,7 @@ function Policies() {
   return (
     <Card>
       <ErrorBox error={error} />
-      <Table head={["Policy", "Purpose", "Completeness checks", "Accuracy checks", "Allowed exclusions", "Partial"]}>
+      <Table head={["Policy", "Purpose", "Completeness checks", "Accuracy checks", "Allowed exclusions", "Partial"]} loading={!data && !error}>
         {data?.map((p) => (
           <tr key={p.ipe_policy_version_id}>
             <td className="td font-medium">{p.name}</td><td className="td text-xs">{p.purpose}</td>

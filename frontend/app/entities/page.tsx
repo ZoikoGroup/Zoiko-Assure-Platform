@@ -3,7 +3,7 @@
 import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ErrorBox, Modal, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, LoadingSkeleton, Modal, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 const TYPES = ["BUSINESS_UNIT", "REGULATED_ACTIVITY", "PRODUCT_SERVICE", "ENVIRONMENT", "AI_ASSET", "CONTRACT_THIRD_PARTY"];
 
@@ -24,6 +24,7 @@ export default function Entities() {
       <PermissionNote perms={["manage_facts"]} />
       <ErrorBox error={error} />
       <div className="space-y-4">
+        {!data && !error && <Card><LoadingSkeleton rows={4} /></Card>}
         {[...groups.entries()].map(([eid, subs]) => (
           <Card key={eid} title={<>{ents[eid]?.legal_name ?? eid} <span className="text-xs font-normal text-slate-500">· legal entity</span></>}
             subtitle={ents[eid] ? `${ents[eid].country} · data held in ${ents[eid].home_cell_id} · ${subs.length} subject(s)` : undefined}>

@@ -1,8 +1,8 @@
 """Logical/physical data model (ZA-DAT-001).
 
 Bounded schemas are expressed as table-name prefixes so the same model works on
-SQLite (dev) and PostgreSQL (where ``db/postgres_rls.sql`` adds RLS/exclusion
-constraints). Authoritative fields are typed relational columns; JSON is used
+SQLite (dev) and PostgreSQL (where migration 0002 adds RLS and the append-only
+triggers). Authoritative fields are typed relational columns; JSON is used
 only for validated canonical artifacts (AST, traces, manifests) per DAT-REQ-006.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import (JSON, BigInteger, Boolean, Date, DateTime, ForeignKey, Integer,
+from sqlalchemy import (JSON, BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer,
                         LargeBinary, Numeric, String, Text, UniqueConstraint, Index)
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -141,6 +141,7 @@ class Actor(Base):
     actor_type: Mapped[str] = mapped_column(String(32))
     display_name: Mapped[str] = mapped_column(String(120))
     email: Mapped[str | None] = mapped_column(String(200))
+    # Cache of the current organisation-/platform-wide roles since migration 0009; authority is iam_role_assignment.
     roles: Mapped[list] = mapped_column(JSON, default=list)
     authority_basis: Mapped[str | None] = mapped_column(String(200))
 
@@ -158,14 +159,74 @@ class AuthCredential(Base):
 
 
 class AuthSession(Base):
-    """Server-side session record so logout / revocation is effective before token expiry."""
+    """Server-side session record so logout / revocation is effective before token expiry.
+    Holds only the SHA-256 of the bearer token (migration 0006); the token itself is never stored."""
     __tablename__ = "auth_session"
     session_id: Mapped[str] = _id()
     actor_id: Mapped[str] = mapped_column(String(36), index=True)
+    token_hash: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(TS)
     revoked_at: Mapped[datetime | None] = mapped_column(TS)
     user_agent: Mapped[str | None] = mapped_column(String(300))
+
+
+# ---------------------------------------------------------------- IAM role registry (ZA-IAM-001 §02, §22; 0009)
+ROLE_ASSIGNMENT_SCOPE_CHECK = (
+    "(scope_type = 'PLATFORM' AND tenant_id IS NULL AND scope_id IS NULL)"
+    " OR (scope_type = 'TENANT' AND tenant_id IS NOT NULL AND scope_id = tenant_id)"
+    " OR (scope_type = 'LEGAL_ENTITY' AND tenant_id IS NOT NULL AND scope_id IS NOT NULL)")
+
+
+class RoleAssignment(Base):
+    """A principal's role at an explicit scope for a valid-time period (IAM-REQ-010). The authority source for
+    authorisation (app/iam.py); ``org_actor.roles`` is only a cache. Revocation closes the row (status, valid_to and the
+    revoked_* columns, the only columns a database trigger lets change); history is in RoleAssignmentEvent."""
+    __tablename__ = "iam_role_assignment"
+    __table_args__ = (CheckConstraint(ROLE_ASSIGNMENT_SCOPE_CHECK, name="ck_iam_role_assignment_scope"),
+                      CheckConstraint("status IN ('ACTIVE', 'REVOKED')", name="ck_iam_role_assignment_status"),
+                      CheckConstraint("valid_to IS NULL OR valid_to >= valid_from", name="ck_iam_role_assignment_period"))
+    assignment_id: Mapped[str] = _id()
+    tenant_id: Mapped[str | None] = mapped_column(String(36), index=True)  # NULL: Zoiko platform principal
+    principal_id: Mapped[str] = mapped_column(String(36), index=True)
+    role_code: Mapped[str] = mapped_column(String(64))
+    scope_type: Mapped[str] = mapped_column(String(16))  # TENANT, LEGAL_ENTITY, PLATFORM
+    scope_id: Mapped[str | None] = mapped_column(String(36))  # tenant_id, entity_id, or NULL for PLATFORM
+    valid_from: Mapped[datetime] = mapped_column(TS)
+    valid_to: Mapped[datetime | None] = mapped_column(TS)
+    status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
+    source: Mapped[str] = mapped_column(String(32))  # MIGRATION, BOOTSTRAP, SEED, PLATFORM_APPOINTMENT, ADMIN
+    granted_by: Mapped[str | None] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    recorded_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(TS)
+    revoked_by: Mapped[str | None] = mapped_column(String(36))
+    revoke_reason: Mapped[str | None] = mapped_column(Text)
+    revoked_record_seq: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class RoleAssignmentEvent(Base):
+    """Append-only history of role assignments: who assigned or revoked what, at which scope, on whose authority and
+    under which policy version (IAM-INV-09, IAM-REQ-037, IAM §21)."""
+    __tablename__ = "iam_role_assignment_event"
+    event_id: Mapped[str] = _id()
+    tenant_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    assignment_id: Mapped[str] = mapped_column(String(36), index=True)
+    principal_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(16))  # ASSIGNED, REVOKED
+    role_code: Mapped[str] = mapped_column(String(64))
+    scope_type: Mapped[str] = mapped_column(String(16))
+    scope_id: Mapped[str | None] = mapped_column(String(36))
+    valid_from: Mapped[datetime] = mapped_column(TS)
+    valid_to: Mapped[datetime | None] = mapped_column(TS)
+    source: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    authorized_by: Mapped[list] = mapped_column(JSON, default=list)  # the actor's authorising assignment IDs
+    policy_version: Mapped[str] = mapped_column(String(40))
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    recorded_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
 
 
 # ---------------------------------------------------------------- catalog
@@ -539,6 +600,23 @@ class ObligationOccurrence(Base):
     record_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+class ObligationOccurrenceEvent(Base):
+    __tablename__ = "assurance_obligation_occurrence_event"
+    event_id: Mapped[str] = _id()
+    occurrence_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    obligation_lineage_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))  # SCHEDULED, FULFILLED, DISPUTED, BASELINE
+    actor_id: Mapped[str] = mapped_column(String(36))
+    window_from: Mapped[datetime] = mapped_column(TS)
+    due_at: Mapped[datetime] = mapped_column(TS)
+    fulfilled_at: Mapped[datetime | None] = mapped_column(TS)
+    evidence_ids: Mapped[list] = mapped_column(JSON, default=list)
+    is_late: Mapped[bool] = mapped_column(Boolean, default=False)
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
 class ControlImplementation(Base):
     __tablename__ = "assurance_control_implementation_revision"
     __table_args__ = (UniqueConstraint("tenant_id", "control_definition_id", "subject_id", "variant"),)  # INV-08
@@ -618,6 +696,22 @@ class Compensation(Base):
     record_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+class CompensationEvent(Base):
+    __tablename__ = "assurance_compensation_event"
+    event_id: Mapped[str] = _id()
+    compensation_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))  # SUBMITTED, APPROVED, REJECTED, REVOKED, BASELINE
+    from_status: Mapped[str | None] = mapped_column(String(32))
+    to_status: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    obligation_lineage_id: Mapped[str] = mapped_column(String(36))
+    primary_control_key: Mapped[str] = mapped_column(String(80))
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
 class ControlEvaluation(Base):
     """Immutable derived control state (DAT-REQ-011)."""
     __tablename__ = "assurance_control_evaluation"
@@ -677,6 +771,24 @@ class ExceptionRecord(Base):
     record_seq: Mapped[int] = mapped_column(BigInteger)
 
 
+class ExceptionEvent(Base):
+    __tablename__ = "assurance_exception_event"
+    event_id: Mapped[str] = _id()
+    exception_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))  # REQUESTED, APPROVED, REJECTED, REVOKED, BASELINE
+    from_state: Mapped[str | None] = mapped_column(String(32))
+    to_state: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    target_type: Mapped[str] = mapped_column(String(32))
+    target_id: Mapped[str] = mapped_column(String(36))
+    valid_from: Mapped[datetime] = mapped_column(TS)
+    valid_to: Mapped[datetime] = mapped_column(TS)
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
 class RiskAcceptance(Base):
     __tablename__ = "governance_risk_acceptance_revision"
     risk_acceptance_id: Mapped[str] = _id()
@@ -702,6 +814,21 @@ class Issue(Base):
     owner_actor_id: Mapped[str | None] = mapped_column(String(36))
     due_at: Mapped[datetime | None] = mapped_column(TS)
     dedupe_key: Mapped[str] = mapped_column(String(200), index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
+class IssueEvent(Base):
+    __tablename__ = "assurance_issue_event"
+    event_id: Mapped[str] = _id()
+    issue_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))  # CREATED, TRANSITIONED, ASSIGNED, RESOLVED, CANCELLED, BASELINE
+    from_state: Mapped[str | None] = mapped_column(String(32))
+    to_state: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    owner_actor_id: Mapped[str | None] = mapped_column(String(36))
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
 
 
@@ -812,6 +939,20 @@ class EvidenceConflict(Base):
     created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
 
 
+class EvidenceConflictEvent(Base):
+    __tablename__ = "evidence_conflict_event"
+    event_id: Mapped[str] = _id()
+    conflict_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))  # OPENED, RESOLVED, BASELINE
+    status: Mapped[str] = mapped_column(String(32))      # OPEN, RESOLVED
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str] = mapped_column(Text)
+    member_evidence_ids: Mapped[list] = mapped_column(JSON)
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
 class LegalHold(Base):
     __tablename__ = "evidence_legal_hold_revision"
     hold_id: Mapped[str] = _id()
@@ -823,6 +964,21 @@ class LegalHold(Base):
     placed_by: Mapped[str] = mapped_column(String(36))
     placed_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
     released_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class LegalHoldEvent(Base):
+    __tablename__ = "evidence_legal_hold_event"
+    event_id: Mapped[str] = _id()
+    hold_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))  # HOLD_PLACED, HOLD_RELEASED, BASELINE
+    status: Mapped[str] = mapped_column(String(32))      # ACTIVE, RELEASED
+    authority: Mapped[str] = mapped_column(String(200))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str] = mapped_column(Text)
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
 
 
 class EvidencePackage(Base):
