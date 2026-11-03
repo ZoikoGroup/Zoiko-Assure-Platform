@@ -241,8 +241,8 @@ jobs:
           ZA_CI_OWNER_PASSWORD="$owner_pw" docker exec -i --env ZA_CI_OWNER_PASSWORD "$PG_CONTAINER" \
             psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
             < "$GITHUB_WORKSPACE/.github/scripts/ci_postgres_bootstrap.sql"
-          # The variables tests/conftest.py reads. The runtime role assure_app is created by the backend's own
-          # bootstrap with app_pw, as in a real start-up.
+          # The variables tests/conftest.py reads. The runtime role assure_app is created with app_pw by
+          # `python -m app.migrate upgrade`, as in a real deployment (the API itself never creates it).
           host="127.0.0.1:5432"
           {
             echo "ZA_TEST_DATABASE_ADMIN_URL=postgresql+psycopg://assure:${owner_pw}@${host}/assure_test"
@@ -279,6 +279,20 @@ jobs:
               print(f"{db}: PostgreSQL {version} reachable as {user} (NOSUPERUSER)")
           PY
 
+      # The migration tool exactly as the deploy step runs it (docs/database-migrations.md), on the empty RLS
+      # database: detect EMPTY, build to head, repeat (must change nothing), then verify head revision, no drift from
+      # the models and RLS on every tenant table. The RLS proofs below then run against this migrated database;
+      # tests/test_migrations.py covers adoption, refusal, failure rollback and downgrade in throwaway schemas.
+      - name: Migrations on a fresh database (status, upgrade, repeat, check)
+        run: |
+          export DATABASE_ADMIN_URL="$ZA_RLS_TEST_DATABASE_ADMIN_URL" DATABASE_URL="$ZA_RLS_TEST_DATABASE_URL"
+          rc=0; python -m app.migrate status || rc=$?
+          if [ "$rc" -ne 1 ]; then echo "::error title=Migrations::expected an empty database (status exit 1), got exit $rc"; exit 1; fi
+          python -m app.migrate upgrade
+          python -m app.migrate upgrade
+          python -m app.migrate status
+          python -m app.migrate check
+
       # Dedicated, fail-fast RLS proof on its own fresh database. pytest exits 0 when tests skip, so the gate below
       # is what fails the job if the RLS tests did not actually execute.
       - name: RLS tests (tests/test_rls.py must execute)
@@ -308,7 +322,7 @@ jobs:
           python -m pytest tests -ra --tb=short -p no:cacheprovider
           --junitxml="$RUNNER_TEMP/reports/backend-postgres.xml"
 
-      - name: Full-suite gate (no skips, RLS and bootstrap proofs included)
+      - name: Full-suite gate (no skips; RLS, runtime-role, migration, immutability, snapshot-determinism, rule-integrity, tenant-security, session-security and role-registry/read-authorization proofs included)
         if: ${{ !cancelled() && (steps.full.outcome == 'success' || steps.full.outcome == 'failure') }}
         run: >-
           python ../.github/scripts/junit_gate.py
@@ -317,6 +331,17 @@ jobs:
           --no-skips
           --require test_rls=5
           --require test_pg_bootstrap=3
+          --require test_migrations=16
+          --require test_immutability=7
+          --require test_snapshot_determinism=4
+          --require test_rule_integrity=19
+          --require test_tenant_security=28
+          --require test_auth_session_security=10
+          --require test_role_registry=16
+          --require test_governance_events=10
+          --require test_governance_projections=8
+          --require test_request_hardening=15
+          --require test_read_authorization_matrix=2
           --redact-env ZA_TEST_DATABASE_URL
           --redact-env ZA_TEST_DATABASE_ADMIN_URL
           --summary-json "$RUNNER_TEMP/reports/backend-postgres-summary.json"

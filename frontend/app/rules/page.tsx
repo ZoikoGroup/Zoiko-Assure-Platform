@@ -22,7 +22,7 @@ export default function Rules() {
       <ErrorBox error={drafts.error || versions.error} />
       <div className="space-y-5">
         <Card title="Drafts">
-          <Table head={["Obligation", "Mode", "Revision", "Status", "Change class", "Author", "Updated"]} empty={drafts.data?.length === 0}>
+          <Table head={["Obligation", "Mode", "Revision", "Status", "Change class", "Author", "Updated"]} empty={drafts.data?.length === 0} loading={!drafts.data && !drafts.error}>
             {drafts.data?.map((d) => (
               <tr key={d.draft_id}>
                 <td className="td"><A href={`/rules/${d.draft_id}`}>{d.obligation_definition}</A></td>
@@ -37,7 +37,7 @@ export default function Rules() {
           </Table>
         </Card>
         <Card title="Published rule versions" subtitle="Immutable. Superseded versions remain resolvable for historical reconstruction.">
-          <Table head={["Obligation", "Version", "Coverage mode", "Validity", "AST hash", "Schema / operators", "Release", "Superseded by"]}>
+          <Table head={["Obligation", "Version", "Coverage mode", "Validity", "AST hash", "Schema / operators", "Release", "Superseded by"]} loading={!versions.data && !versions.error}>
             {versions.data?.map((v) => (
               <tr key={v.rule_version_id}>
                 <td className="td mono text-xs">{v.obligation_definition}</td>

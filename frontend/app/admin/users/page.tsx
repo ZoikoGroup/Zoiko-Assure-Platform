@@ -68,7 +68,7 @@ function Directory() {
     <Card title={tenant ? `People and agents in ${me?.tenant_name ?? "your organisation"}` : "Zoiko staff accounts"}
       subtitle="Only HUMAN and EXTERNAL_AUDITOR actors can sign in. Agents and services act only through the authority granted to them.">
       <ErrorBox error={error} />
-      <Table head={["Actor", "Type", "Roles", "Authority basis"]} empty={data?.length === 0}>
+      <Table head={["Actor", "Type", "Roles", "Authority basis"]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((a) => (
           <tr key={a.actor_id}>
             <td className="td"><div className="font-medium text-slate-900">{a.display_name}</div><div className="mono text-[11px] text-slate-500">{a.email ?? a.actor_id}</div></td>

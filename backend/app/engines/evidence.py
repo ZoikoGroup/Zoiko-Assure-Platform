@@ -121,12 +121,10 @@ def capture_evidence(db: Session, *, tenant_id: str, entity_id: str, content: by
         raise
 
 
-def lifecycle(db: Session, art: EvidenceArtifact) -> str:
-    events = [e.event_type for e in db.execute(select(EvidenceLedgerEvent).where(
-        EvidenceLedgerEvent.tenant_id == art.tenant_id, EvidenceLedgerEvent.evidence_id == art.evidence_id)
-        .order_by(EvidenceLedgerEvent.ledger_seq)).scalars()]
+def _fold_lifecycle(event_types) -> str:
+    """An artifact's lifecycle from its ledger event types in ledger order."""
     state = "ACTIVE"
-    for t in events:
+    for t in event_types:
         if t == "SUPERSEDED":
             state = "SUPERSEDED"
         elif t == "INVALIDATED":
@@ -136,9 +134,26 @@ def lifecycle(db: Session, art: EvidenceArtifact) -> str:
     return state
 
 
-def condition(db: Session, art: EvidenceArtifact, at: datetime | None = None) -> str:
+def lifecycle(db: Session, art: EvidenceArtifact) -> str:
+    return _fold_lifecycle(db.execute(select(EvidenceLedgerEvent.event_type).where(
+        EvidenceLedgerEvent.tenant_id == art.tenant_id, EvidenceLedgerEvent.evidence_id == art.evidence_id)
+        .order_by(EvidenceLedgerEvent.ledger_seq)).scalars())
+
+
+def lifecycles(db: Session, tenant_id: str, arts: list) -> dict[str, str]:
+    """lifecycle() for a tenant's artifacts (or rows with their evidence_id) from one read of its ledger, for list
+    views (one query, not one per artifact)."""
+    events: dict[str, list[str]] = {}
+    for evidence_id, event_type in db.execute(select(EvidenceLedgerEvent.evidence_id, EvidenceLedgerEvent.event_type)
+                                              .where(EvidenceLedgerEvent.tenant_id == tenant_id)
+                                              .order_by(EvidenceLedgerEvent.ledger_seq)):
+        events.setdefault(evidence_id, []).append(event_type)
+    return {a.evidence_id: _fold_lifecycle(events.get(a.evidence_id, ())) for a in arts}
+
+
+def condition_from(art, lc: str, at: datetime | None = None) -> str:
+    """condition() for an artifact (or a row with its valid_until) whose lifecycle is already known."""
     at = ensure_utc(at) or datetime.now(timezone.utc)
-    lc = lifecycle(db, art)
     if lc == "ERASED":
         return "ERASED"
     if lc == "INVALIDATED":
@@ -148,9 +163,19 @@ def condition(db: Session, art: EvidenceArtifact, at: datetime | None = None) ->
     return "CURRENT"
 
 
+def condition(db: Session, art: EvidenceArtifact, at: datetime | None = None) -> str:
+    return condition_from(art, lifecycle(db, art), at)
+
+
 def active_hold(db: Session, art: EvidenceArtifact) -> LegalHold | None:
     return db.execute(select(LegalHold).where(LegalHold.evidence_id == art.evidence_id,
                                               LegalHold.status == "ACTIVE")).scalars().first()
+
+
+def held_evidence_ids(db: Session, tenant_id: str) -> set[str]:
+    """The tenant's artifacts that active_hold() would find a hold for, in one query (list views)."""
+    return set(db.execute(select(LegalHold.evidence_id).where(LegalHold.tenant_id == tenant_id,
+                                                              LegalHold.status == "ACTIVE")).scalars())
 
 
 def verify_evidence(db: Session, art: EvidenceArtifact, actor_id: str) -> dict:
@@ -272,7 +297,10 @@ def merkle_root_and_proofs(leaves: list[str]) -> tuple[str, list[list[dict]]]:
     return level[0][0], proofs
 
 
-def create_checkpoint(db: Session) -> LedgerCheckpoint | None:
+def create_checkpoint(db: Session, *, tenant_id: str | None = None) -> LedgerCheckpoint | None:
+    """`tenant_id`: the scope the checkpoint is taken in. None = the whole cell (system scope); a package build passes its
+    own tenant, whose head is all it can see under RLS, and the event is recorded under that tenant (migration 0005: a
+    tenant scope cannot write no-tenant outbox rows)."""
     heads = db.execute(select(TenantLedgerHead)).scalars().all()
     changed = [h for h in heads if h.current_seq > (h.last_checkpointed_seq or 0)]
     if not changed:
@@ -308,7 +336,7 @@ def create_checkpoint(db: Session) -> LedgerCheckpoint | None:
         h.last_checkpointed_seq = h.current_seq
         h.last_checkpointed_hash = h.current_event_hash
     emit(db, event_type="evidence.chain_checkpointed", aggregate_type="LedgerCheckpoint", aggregate_id=cp_id,
-         payload={"leaf_count": len(leaves), "merkle_root": root, "tsa_status": tsa_status})
+         tenant_id=tenant_id, payload={"leaf_count": len(leaves), "merkle_root": root, "tsa_status": tsa_status})
     db.flush()
     return cp
 
@@ -324,7 +352,7 @@ def build_package(db: Session, *, tenant_id: str, entity_id: str, period_from: d
                   evidence: list[EvidenceArtifact], snapshots: list[dict], evaluations: list[dict], ipe: list[dict],
                   include_payloads: bool, actor_id: str, record_cutoff_seq: int) -> EvidencePackage:
     """Signed, offline-verifiable assurance package (ZA-EVD-001 §17)."""
-    cp = create_checkpoint(db) or db.execute(select(LedgerCheckpoint).order_by(LedgerCheckpoint.created_at.desc())).scalars().first()
+    cp = create_checkpoint(db, tenant_id=tenant_id) or db.execute(select(LedgerCheckpoint).order_by(LedgerCheckpoint.created_at.desc())).scalars().first()
     if cp is None:
         raise HTTPException(409, "No ledger checkpoint available")
     leaf = next((l for l in cp.leaves if l["tenant_id"] == tenant_id), None)

@@ -23,7 +23,7 @@ from .models import (Actor, AuthorityGrant, AIAssetVersion, Cell, Compensation, 
                      ExceptionRecord, ExtractionContractVersion, FactDefinition, FrameworkMapping, Instrument,
                      IPEPolicyVersion, LegalEntity, MappingContractVersion, ObligationDefinition, ObligationOccurrence,
                      Provision, RegulatorySource, RequirementVersion, RuleDraft, RuleVersion, SetVersion, Subject, Tenant,
-                     TestDefinition, TestRun)
+                     TestDefinition, TestRun, new_id)
 from .platform import canonical_json, next_record_seq, sha256_hex
 
 
@@ -347,11 +347,12 @@ def seed(db: Session) -> None:
         canon = rules.canonicalize(ast)
         sh = {s: sets[s]["hash"] for s in rep["set_refs"]}
         seq = next_record_seq(db)
+        cr_id = new_id()  # both rows written once with final values: published catalogue is immutable (migration 0004)
         rv = RuleVersion(obligation_definition_id=o.obligation_definition_id, version=1, valid_from=vf, coverage_mode="ENCODED",
                          rule_schema_version=rules.SCHEMA_VERSION, operator_set_version=rules.OPERATOR_SET_VERSION,
                          canonical_ast=canon, ast_hash=rules.ast_hash(canon, sh), required_facts=rep["required_facts"],
                          set_refs=[{"set_version_id": k, "sha256": v} for k, v in sh.items()], source_mappings=sm,
-                         golden_vectors=vectors, status="PUBLISHED", content_release_id="pending", draft_id=d.draft_id, record_seq=seq)
+                         golden_vectors=vectors, status="PUBLISHED", content_release_id=cr_id, draft_id=d.draft_id, record_seq=seq)
         db.add(rv)
         db.flush()
         manifest = json.loads(canonical_json({"label": label, "rule_versions": [{"rule_version_id": rv.rule_version_id,
@@ -360,13 +361,13 @@ def seed(db: Session) -> None:
                                               "reviewers": {"author": "actor-encoder", "peer": "actor-content-analyst",
                                                             "legal": "actor-content-legal"}, "change_class": "EXECUTABLE_OUTCOME"}))
         mb = canonical_json(manifest)
-        cr = ContentRelease(label=label, manifest=manifest, manifest_hash=sha256_hex(mb), signature=keys.sign(mb),
+        cr = ContentRelease(content_release_id=cr_id, label=label, manifest=manifest, manifest_hash=sha256_hex(mb),
+                            signature=keys.sign(mb),
                             signer_key_id=keys.signer_key_id(), changelog=f"Initial encoded release: {o.title}",
                             shadow_summary={"subjects_evaluated": 0, "note": "No prior customer state"},
                             released_by="actor-release", cell_received_seq=seq)
         db.add(cr)
         db.flush()
-        rv.content_release_id = cr.content_release_id
         d.status = "PUBLISHED"
         return rv
 
@@ -621,4 +622,9 @@ def seed(db: Session) -> None:
         asr.compute_snapshot(db, tenant_id=t.tenant_id, obligation_lineage_id=lin, period_from=dt("2026-07-01"),
                              period_to=dt("2026-10-01"), record_cutoff_seq=None, perspective="RECONSTRUCTED_NOW", actor_id="actor-audit")
     evd.create_checkpoint(db)
+    # The fixture's people hold their roles through the role registry (Stage 4b), recorded last so that every record
+    # sequence number above is the same as before the registry existed.
+    from .iam import provision_roles
+    for a in A.values():
+        provision_roles(db, a, list(a.roles or []), source="SEED", reason="Synthetic Customer Zero fixture (demo mode)")
     db.commit()

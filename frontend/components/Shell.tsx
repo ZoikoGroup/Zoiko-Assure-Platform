@@ -46,9 +46,7 @@ function Frame({ children }: { children: React.ReactNode }) {
   useEffect(() => setMobile(false), [path]);
 
   if (path === "/login") return <>{children}</>;
-  if (!ready || !me) {
-    return <div role="status" className="flex min-h-screen items-center justify-center text-[13px] text-slate-500">Checking your session…</div>;
-  }
+  if (!ready || !me) return <ShellSkeleton narrow={collapsed} />;
   if (me.must_change_password) return <ForcedPasswordChange />;
 
   return (
@@ -64,6 +62,31 @@ function Frame({ children }: { children: React.ReactNode }) {
       <div className={`flex min-h-screen flex-col transition-[padding] duration-200 ${collapsed ? "lg:pl-16" : "lg:pl-[232px]"}`}>
         <Header path={path} onMenu={() => setMobile(true)} />
         <main id="main" key={me.actor_id} className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-5 sm:px-6">{children}</main>
+      </div>
+    </div>
+  );
+}
+
+/** Shown while a full page load checks the session: the shell's frame (sidebar, header, page area) appears at once in
+ *  the same geometry as the real shell instead of a blank screen. It holds no identity, role, organisation or
+ *  navigation data; those render only after the server has confirmed the session. */
+function ShellSkeleton({ narrow }: { narrow: boolean }) {
+  return (
+    <div className="min-h-screen">
+      <p role="status" className="sr-only">Checking your session…</p>
+      <aside aria-hidden className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-slate-200 bg-white lg:flex ${narrow ? "w-16" : "w-[232px]"}`}>
+        <div className={`flex h-14 shrink-0 items-center border-b border-slate-200 ${narrow ? "justify-center" : "pl-4 pr-2"}`}><Logo mark={narrow} /></div>
+        <div className={`space-y-2.5 py-4 ${narrow ? "px-3" : "px-5"}`}>
+          {Array.from({ length: 9 }, (_, i) => <div key={i} className="skeleton h-4" style={{ width: narrow ? "100%" : `${84 - (i % 3) * 16}%` }} />)}
+        </div>
+      </aside>
+      <div aria-hidden className={`flex min-h-screen flex-col ${narrow ? "lg:pl-16" : "lg:pl-[232px]"}`}>
+        <div className="h-14 shrink-0 border-b border-slate-200 bg-white/95" />
+        <div className="mx-auto w-full max-w-[1440px] flex-1 space-y-3 px-4 py-5 sm:px-6">
+          <div className="skeleton h-6 w-64" />
+          <div className="skeleton h-3.5 w-[min(36rem,90%)]" />
+          <div className="skeleton mt-4 h-40 w-full" />
+        </div>
       </div>
     </div>
   );
@@ -210,7 +233,8 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
   }, []);
   useEffect(() => {
     if (!me?.tenant_id) return;
-    api("/dashboard").then((d) => setAlerts({ issues: d.open_issues.total, facts: d.open_fact_requests })).catch(() => {});
+    // Only the two counts, not the full /dashboard aggregation: this runs on every full page load.
+    api("/dashboard/attention").then((d) => setAlerts({ issues: d.open_issues, facts: d.open_fact_requests })).catch(() => {});
   }, [me]);
 
   const meta = routeMeta(path);
@@ -254,7 +278,6 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
         <div className="hidden min-w-0 max-w-[240px] md:flex"><WorkContext /></div>
 
         {watermark("hidden md:flex")}
-
         <Dropdown label={pending ? `Notifications, ${pending} open item(s)` : "Notifications"} menuClassName="w-72"
           buttonClassName="relative inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
           button={<><Bell size={16} aria-hidden />{pending > 0 && <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-brand-500" aria-hidden />}</>}>

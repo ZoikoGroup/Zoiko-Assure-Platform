@@ -18,10 +18,28 @@ from sqlalchemy.orm import Session
 from .. import codes
 from ..models import (ConnectorDefinition, ConnectorInstallation, ExtractionContractVersion, IPEAnomaly, IPEEvaluation,
                       IPEPolicyVersion, MappingContractVersion, PopulationManifest, SourceRun, TestDefinition, TestRun)
-from ..platform import canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
+from ..platform import audit, canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
+from ..security import Requirement
 from . import evidence as evd
 
 V, F, I, NR = "VERIFIED", "FAILED", "INCONCLUSIVE", "NOT_REQUIRED"
+REEVALUATE_IPE = Requirement(("reevaluate_ipe",), human=True)
+
+
+def bound_evaluation(db: Session, run: SourceRun | None) -> IPEEvaluation | None:
+    """The IPE result that belongs to a SourceRun: its first evaluation under the IPEPolicyVersion the run was executed
+    with (ZA-IPE-001: the unit of IPE is one SourceRun under an exact IPEPolicyVersion, and the IPEEvaluation is
+    immutable; ZA-EVD-001: a re-evaluation needs a new run).
+
+    Every reader that relies on a run's IPE result uses this, never "the newest evaluation", so a later evaluation —
+    or one under another, weaker policy — cannot replace it. The bound evaluation is written in the same transaction
+    as the run and its evidence (execute_source_run), so it exists at every record cutoff at which that evidence is
+    visible."""
+    if run is None:
+        return None
+    return db.execute(select(IPEEvaluation).where(IPEEvaluation.source_run_id == run.source_run_id,
+                                                  IPEEvaluation.ipe_policy_version_id == run.ipe_policy_version_id)
+                      .order_by(IPEEvaluation.created_at, IPEEvaluation.ipe_evaluation_id)).scalars().first()
 
 
 def schema_fingerprint(fields) -> str:
@@ -296,11 +314,26 @@ def evaluate_criterion(crit: dict, records: list[dict]) -> tuple[str, str]:
     return ("PASS" if len(bad) < len(records) else "FAIL"), "ANY quantifier"
 
 
-def reevaluate(db: Session, run: SourceRun, policy: IPEPolicyVersion) -> IPEEvaluation:
-    """Re-evaluate under an explicit policy: new immutable evaluation; history preserved (IPE-INV-11)."""
-    prev = db.execute(select(IPEEvaluation).where(IPEEvaluation.source_run_id == run.source_run_id)
-                      .order_by(IPEEvaluation.created_at.desc())).scalars().first()
-    checks = [c for c in prev.checks if (c["dimension"] == "COMPLETENESS" and c["check_id"] in policy.required_completeness_checks)
+def reevaluate(ctx, run: SourceRun, ipe_policy_version_id: str | None = None) -> IPEEvaluation:
+    """Re-derive a run's IPE result under the policy the run was executed with, recorded as a new immutable evaluation.
+
+    The policy is fixed by the SourceRun (ZA-IPE-001 §14); a caller cannot substitute another one, because a weaker
+    policy drops the failing checks. Proof under a different policy needs a new run. The run's bound evaluation is
+    preserved and stays the one assurance uses (`bound_evaluation`). Authorization is checked here as well as on the
+    route, so internal callers cannot bypass it."""
+    ctx.check(REEVALUATE_IPE)
+    db = ctx.db
+    if ipe_policy_version_id is not None and ipe_policy_version_id != run.ipe_policy_version_id:
+        raise HTTPException(409, {"error": "IPE_POLICY_NOT_BOUND",
+                                  "message": "A source run is evaluated only under the IPE policy it was executed with; "
+                                             "proof under a different policy needs a new source run.",
+                                  "bound_ipe_policy_version_id": run.ipe_policy_version_id})
+    policy = db.get(IPEPolicyVersion, run.ipe_policy_version_id)
+    base = bound_evaluation(db, run)
+    if policy is None or base is None:
+        raise HTTPException(409, {"error": "IPE_BOUND_EVALUATION_MISSING",
+                                  "message": "This source run has no evaluation under its own IPE policy to re-derive."})
+    checks = [c for c in base.checks if (c["dimension"] == "COMPLETENESS" and c["check_id"] in policy.required_completeness_checks)
               or (c["dimension"] == "ACCURACY" and c["check_id"] in policy.required_accuracy_checks)]
     comp = derive_subresult([c for c in checks if c["dimension"] == "COMPLETENESS"], policy.completeness_required)
     acc = derive_subresult([c for c in checks if c["dimension"] == "ACCURACY"], policy.accuracy_required)
@@ -311,4 +344,8 @@ def reevaluate(db: Session, run: SourceRun, policy: IPEPolicyVersion) -> IPEEval
                        engine_version=codes.IPE_ENGINE_VERSION)
     db.add(ev)
     db.flush()
+    audit(db, action="ipe.reevaluated", object_type="SourceRun", object_id=run.source_run_id, actor=ctx.actor,
+          tenant_id=run.tenant_id, prior=base.overall_result, new=ev.overall_result,
+          reason=f"Re-derived under bound IPE policy {policy.ipe_policy_version_id} as evaluation {ev.ipe_evaluation_id}; "
+                 f"bound evaluation {base.ipe_evaluation_id} unchanged")
     return ev

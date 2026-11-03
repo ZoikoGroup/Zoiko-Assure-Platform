@@ -14,7 +14,7 @@ export function RequirementList({ onOpen }: { onOpen: (id: string) => void }) {
     <Card title="Requirement versions" subtitle="AI-proposed requirements stay REVIEW_REQUIRED until a qualified human legal reviewer verifies them (INV-09)." bodyClassName="">
       <ErrorBox error={error} />
       {!data && !error ? <LoadingSkeleton rows={4} /> : (
-        <Table head={["Requirement", "Instrument", "Origin", "Lifecycle", "Valid from", ""]} empty={reqs.length === 0}>
+        <Table head={["Requirement", "Instrument", "Origin", "Lifecycle", "Valid from", ""]} empty={!!data && reqs.length === 0}>
           {reqs.map((r) => (
             <tr key={r.requirement_version_id}>
               <td className="td"><div className="font-medium text-slate-900">{r.title}</div><div className="mono text-[11px] text-slate-500">{r.requirement_key} · {r.locator}</div></td>

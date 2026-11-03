@@ -115,7 +115,8 @@ export function useApi<T = any>(path: string | null, deps: unknown[] = []) {
   const { actorId } = useActor();
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
-  const [loading, setLoading] = useState(false);
+  // Loading from the first render when a request will be made, so the frame before the effect runs is not shown as empty.
+  const [loading, setLoading] = useState(!!path && !!actorId);
   const load = useCallback(async () => {
     if (!path || !actorId) return;
     setLoading(true);

@@ -29,8 +29,8 @@ export default function Evidence() {
       <Card actions={<>
         <input aria-label="Search evidence by title or source" className="input w-56 py-1 text-xs" placeholder="Search title / source" value={q} onChange={(e) => setQ(e.target.value)} />
         <select aria-label="Filter by condition" className="input w-36 py-1 text-xs" value={cond} onChange={(e) => setCond(e.target.value)}>{["ALL", "CURRENT", "STALE", "INVALID", "ERASED", "CONFLICTING"].map((x) => <option key={x}>{x}</option>)}</select>
-      </>} title={`${rows.length} artifact(s)`}>
-        <Table head={["Title", "Origin / provenance", "Coverage", "Condition", "Lifecycle", "IPE", "Ledger", "Hold"]} empty={rows.length === 0}>
+      </>} title={`${data ? rows.length : "…"} artifact(s)`}>
+        <Table head={["Title", "Origin / provenance", "Coverage", "Condition", "Lifecycle", "IPE", "Ledger", "Hold"]} empty={!!data && rows.length === 0} loading={!data && !error}>
           {rows.map((e) => (
             <tr key={e.evidence_id}>
               <td className="td"><A href={`/evidence/${e.evidence_id}`}>{e.title}</A><div className="mono text-[11px] text-slate-500">{e.source_system ?? e.content_type} · {e.size_bytes} B</div></td>

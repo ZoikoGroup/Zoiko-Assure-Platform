@@ -8,6 +8,7 @@ from pathlib import Path
 _tmp = tempfile.mkdtemp(prefix="za-test-")
 os.environ["ZA_DATA_DIR"] = _tmp
 os.environ["ZA_DEV_IDENTITY_HEADER"] = "1"  # tests simulate agents/services via the dev header
+os.environ["ZA_ENVIRONMENT"] = "test"       # the only environments where that header is allowed (app/security.py)
 os.environ["ZA_SKIP_DOTENV"] = "1"          # never touch the real database configured in backend/.env
 os.environ["ZA_DEMO_MODE"] = "1"            # tests run on the synthetic Customer Zero fixture
 os.environ["ZA_DEMO_PASSWORD"] = secrets.token_urlsafe(18)  # per-session test password; none is built into the app
@@ -29,6 +30,11 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 @pytest.fixture(scope="session")
 def client():
+    from app.db import IS_POSTGRES
+    if IS_POSTGRES:  # as a deployment does: migrate and provision first, then start the API (start-up changes nothing)
+        from app.migrate import provision_data, upgrade
+        upgrade()
+        provision_data()
     from app.main import app
     with TestClient(app) as c:
         _reset_test_credentials()
@@ -52,3 +58,26 @@ def _reset_test_credentials():
 
 def H(actor):
     return {"X-Actor-Id": actor}
+
+
+def add_principal(db, **fields):
+    """A test principal whose roles (fields["roles"]) are granted the way the application grants them since Stage 4b:
+    recorded organisation-/platform-wide assignments in the role registry, not the org_actor.roles cache."""
+    from app.iam import provision_roles
+    from app.models import Actor
+    roles = list(fields.pop("roles", []) or [])
+    a = Actor(roles=[], **fields)
+    db.add(a)
+    db.flush()
+    provision_roles(db, a, roles, source="TEST", reason="test principal")
+    return a
+
+
+def stamp(conn, tenant=None, *, actor=None, session=None, flags=()):
+    """Sign this transaction's database context exactly as the API does (PostgreSQL, migration 0007). Setting
+    app.tenant_id or app.system directly grants nothing any more; see tests/test_tenant_security.py."""
+    from sqlalchemy import text
+    from app.db import context_string
+    nonce = conn.execute(text("SELECT assure_context_nonce()")).scalar_one()
+    conn.execute(text("SELECT set_config('app.context', :c, true)"),
+                 {"c": context_string(nonce, tenant=tenant, actor=actor, session=session, flags=flags)})

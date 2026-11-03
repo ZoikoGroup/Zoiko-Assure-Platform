@@ -29,13 +29,13 @@ def test_cross_tenant_and_content_staff_isolation(client):
 
 
 def test_bitemporal_correction_preserves_as_known_then(client):
-    wm_before = client.get("/api/watermark").json()["record_seq"]
+    wm_before = client.get("/api/watermark", headers=H("actor-cco")).json()["record_seq"]  # signed-in only (I-10)
     r = client.post("/api/subjects/subj-entity-uk/facts", headers=H("actor-analyst"), json={
         "fact_key": "entity.established_in_eu", "value": True, "valid_from": "2025-01-01T00:00:00Z",
         "change_kind": "RETROACTIVE_CORRECTION", "reason": "Test correction"})
     assert r.status_code == 200
     odef = next(o for o in client.get("/api/catalog/obligation-definitions", headers=H("actor-cco")).json() if o["key"] == "DORA_ICT_RISK_FRAMEWORK")
-    wm_after = client.get("/api/watermark").json()["record_seq"]
+    wm_after = client.get("/api/watermark", headers=H("actor-cco")).json()["record_seq"]
     cmp = client.get("/api/history/compare", headers=H("actor-cco"), params={
         "subject_id": "subj-entity-uk", "obligation_definition_id": odef["obligation_definition_id"],
         "valid_at": "2026-07-01T00:00:00Z", "left_seq": wm_before, "right_seq": wm_after}).json()
@@ -122,7 +122,18 @@ def test_agents_cannot_sign_in_and_lockout(client):
     for _ in range(5):
         client.post("/api/auth/login", json={"email": "actor-gc@zoiko.example", "password": "nope"})
     locked = client.post("/api/auth/login", json={"email": "actor-gc@zoiko.example", "password": DEMO_PASSWORD})
-    assert locked.status_code == 423
+    # The correct password is refused while locked, with the same answer an unknown account gets (ZA-IAM-001 §03:
+    # generic errors, no account enumeration); the reason is recorded in the security audit only.
+    unknown = client.post("/api/auth/login", json={"email": "nobody-at-all@zoiko.example", "password": DEMO_PASSWORD})
+    assert locked.status_code == unknown.status_code == 401 and locked.json() == unknown.json()
+    from sqlalchemy import select
+    from app.db import AdminSession
+    from app.models import AuditEvent
+    with AdminSession() as db:
+        reasons = [(e.reason, e.new_state) for e in db.execute(select(AuditEvent).where(
+            AuditEvent.action == "auth.login_failed", AuditEvent.object_id == "actor-gc")
+            .order_by(AuditEvent.record_seq.desc()).limit(2)).scalars()]
+    assert reasons == [("LOCKED", None), ("BAD_PASSWORD", "LOCKED")]
 
 
 def test_change_password_revokes_other_sessions(client):
@@ -156,3 +167,36 @@ def test_clients_cannot_choose_provenance_or_cell_and_no_demo_password_is_expose
     monkeypatch.setattr(integration, "DEV_HEADER", False)
     assert client.post("/api/ipe/source-runs", headers=H("actor-owner"),
                        json={"installation_id": "x", "ipe_policy_version_id": "y", "payload": {}}).status_code == 403
+
+
+# ---------------------------------------------------------------- list views read in bulk
+def test_header_attention_counts_are_the_dashboard_counts(client):
+    dash = client.get("/api/dashboard", headers=H("actor-cco")).json()
+    r = client.get("/api/dashboard/attention", headers=H("actor-cco"))
+    assert r.status_code == 200
+    assert r.json() == {"open_issues": dash["open_issues"]["total"], "open_fact_requests": dash["open_fact_requests"]}
+    assert client.get("/api/dashboard/attention").status_code == 401
+    assert client.get("/api/dashboard/attention", headers=H("actor-content-analyst")).status_code == 403  # no tenant data
+
+
+def test_list_views_read_in_bulk_match_the_single_item_reads(client):
+    """/evidence and /applicability/evaluations read lifecycles, legal holds and current determinations for all rows at
+    once; every row must still carry what the per-item engine reads return."""
+    from app.db import AdminSession
+    from app.engines import applicability as appl
+    from app.engines import evidence as evd
+    from app.models import EvidenceArtifact
+    evidence = client.get("/api/evidence", headers=H("actor-cco")).json()
+    if not any(row["legal_hold"] for row in evidence):  # cover a held artifact even when this test runs on its own
+        client.post(f"/api/evidence/{evidence[0]['evidence_id']}/hold", headers=H("actor-gc"), json={"reason": "litigation"})
+        evidence = client.get("/api/evidence", headers=H("actor-cco")).json()
+    evaluations = client.get("/api/applicability/evaluations", headers=H("actor-cco")).json()
+    assert evidence and evaluations and any(row["legal_hold"] for row in evidence)
+    with AdminSession() as db:
+        for row in evidence:
+            art = db.get(EvidenceArtifact, row["evidence_id"])
+            assert (row["lifecycle"], row["condition"], row["legal_hold"]) == (
+                evd.lifecycle(db, art), evd.condition(db, art), bool(evd.active_hold(db, art)))
+        for row in evaluations:
+            det = appl.current_determination(db, row["tenant_id"], row["subject_id"], row["obligation_definition_id"])
+            assert (row["current_determination"] or {}).get("revision_id") == (det.revision_id if det else None)

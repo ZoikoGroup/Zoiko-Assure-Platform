@@ -1,15 +1,48 @@
--- Zoiko Assure — PostgreSQL row-level security (ZA-ARCH-001 §5, INV-14).
--- Applied automatically on every API start-up by app/pg_bootstrap.py using the OWNER role
--- (DATABASE_ADMIN_URL); idempotent. The API connects as the non-owner role `assure_app`
--- (DATABASE_URL), so these policies always apply to request traffic.
---
--- Each transaction is stamped by app/db.py with:
---     app.tenant_id = <caller's tenant>   ('' for content/platform staff -> no tenant rows)
---     app.system    = 'on' only inside documented cell-wide platform jobs (app/security.py:system_scope)
--- The owner role is not subject to RLS (no FORCE) so migrations and demo seeding work.
--- org_actor is intentionally not RLS-protected: sign-in must resolve an identity before a tenant is known.
+"""Row-level security, runtime-role grants and append-only triggers: the SQL the API used to apply at every start-up.
 
-CREATE OR REPLACE FUNCTION assure_current_tenant() RETURNS text
+Revision ID: 0002
+Revises: 0001
+Create Date: 2026-10-27
+
+This is the former ``backend/db/postgres_rls.sql``, moved here unchanged (statements below the original header). It
+runs through a raw DBAPI cursor, as the old start-up did, so ``%`` in PL/pgSQL stays literal. Behaviour is the same
+as before Stage 1: 41 ``tenant_isolation`` policies (ENABLE, not FORCE), the ``assure_system()`` scope, the
+SELECT/INSERT/UPDATE/DELETE grant to ``assure_app`` and the two append-only triggers. Changing any of that is Stage 2
+of ``docs/backend-architecture-roadmap.md`` and happens in later revisions.
+
+One addition, needed for migration correctness only: the runtime role gets no privilege on ``alembic_version``. On a
+fresh database that table exists before the ``GRANT ... ON ALL TABLES`` below runs; on a database adopted from the old
+start-up it did not. Revoking makes both identical, and the API role cannot read or alter the migration state.
+
+Downgrade removes the policies, functions, triggers and runtime grants, so tenant isolation is OFF afterwards. It
+exists for disposable databases and rehearsals; production recovery is forward (docs/database-migrations.md).
+"""
+from __future__ import annotations
+
+import re
+
+from alembic import op
+
+revision = "0002"
+down_revision = "0001"
+branch_labels = None
+depends_on = None
+
+RUNTIME_ROLE = "assure_app"  # the policies below name this role; DATABASE_URL must use it
+
+# The former db/postgres_rls.sql, from its first statement on. Its original header said:
+# Zoiko Assure — PostgreSQL row-level security (ZA-ARCH-001 §5, INV-14).
+# Applied automatically on every API start-up by app/pg_bootstrap.py using the OWNER role
+# (DATABASE_ADMIN_URL); idempotent. The API connects as the non-owner role `assure_app`
+# (DATABASE_URL), so these policies always apply to request traffic.
+# 
+# Each transaction is stamped by app/db.py with:
+# app.tenant_id = <caller's tenant>   ('' for content/platform staff -> no tenant rows)
+# app.system    = 'on' only inside documented cell-wide platform jobs (app/security.py:system_scope)
+# The owner role is not subject to RLS (no FORCE) so migrations and demo seeding work.
+# org_actor is intentionally not RLS-protected: sign-in must resolve an identity before a tenant is known.
+#
+RLS_SQL = r"""CREATE OR REPLACE FUNCTION assure_current_tenant() RETURNS text
   LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('app.tenant_id', true), '') $$;
 CREATE OR REPLACE FUNCTION assure_system() RETURNS boolean
   LANGUAGE sql STABLE AS $$ SELECT coalesce(current_setting('app.system', true), 'off') = 'on' $$;
@@ -284,3 +317,39 @@ CREATE TRIGGER append_only BEFORE UPDATE OR DELETE ON platform_audit_event
 GRANT USAGE ON SCHEMA public TO assure_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO assure_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO assure_app;
+"""
+
+POLICY_TABLES = re.findall(r"ALTER TABLE (\w+) ENABLE ROW LEVEL SECURITY", RLS_SQL)
+TRIGGER_TABLES = re.findall(r"BEFORE UPDATE OR DELETE ON (\w+)", RLS_SQL)
+
+
+def _schema() -> str:
+    return op.get_context().version_table_schema or "public"
+
+
+def _execute(sql: str) -> None:
+    if op.get_context().as_sql:  # `--sql` review output
+        op.execute(sql)
+        return
+    with op.get_bind().connection.cursor() as cur:  # raw DBAPI cursor: no parameter parsing
+        cur.execute(sql)
+
+
+def upgrade() -> None:
+    schema = _schema()
+    # Identical bytes for the real schema; only the throwaway schemas of the migration tests are substituted.
+    _execute(RLS_SQL if schema == "public" else RLS_SQL.replace("SCHEMA public", f'SCHEMA "{schema}"'))
+    _execute(f'REVOKE ALL ON TABLE "{schema}".alembic_version FROM {RUNTIME_ROLE}')
+
+
+def downgrade() -> None:
+    schema = _schema()
+    stmts = [f"DROP TRIGGER IF EXISTS append_only ON {t}" for t in TRIGGER_TABLES]
+    stmts.append("DROP FUNCTION IF EXISTS assure_forbid_mutation()")
+    for t in POLICY_TABLES:
+        stmts += [f"DROP POLICY IF EXISTS tenant_isolation ON {t}", f"ALTER TABLE {t} DISABLE ROW LEVEL SECURITY"]
+    stmts += ["DROP FUNCTION IF EXISTS assure_current_tenant()", "DROP FUNCTION IF EXISTS assure_system()",
+              f'REVOKE SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "{schema}" FROM {RUNTIME_ROLE}',
+              f'REVOKE USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "{schema}" FROM {RUNTIME_ROLE}',
+              f'REVOKE USAGE ON SCHEMA "{schema}" FROM {RUNTIME_ROLE}']
+    _execute("".join(f"{s};\n" for s in stmts))

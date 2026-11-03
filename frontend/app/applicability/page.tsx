@@ -25,7 +25,7 @@ export default function Applicability() {
         <select aria-label="Filter by state" className="input w-36 py-1 text-xs" value={filter} onChange={(e) => setFilter(e.target.value)}>
           {["ALL", "PROPOSED", "IN_REVIEW", "ADOPTED", "REJECTED", "FLAGGED"].map((x) => <option key={x}>{x}</option>)}
         </select>} title="Determinations (current revision)">
-        <Table head={["Subject", "Obligation", "Outcome", "State", "Valid from", "Flags", ""]} empty={queue.length === 0}>
+        <Table head={["Subject", "Obligation", "Outcome", "State", "Valid from", "Flags", ""]} empty={!!dets.data && queue.length === 0} loading={!dets.data && !dets.error}>
           {queue.map((d) => (
             <tr key={d.lineage_id}>
               <td className="td font-medium">{d.subject}</td>

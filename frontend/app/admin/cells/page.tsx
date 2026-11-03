@@ -3,7 +3,7 @@
 import { useId, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { useCan } from "@/lib/roles";
-import { Badge, Card, ErrorBox, KV, Modal, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
+import { Badge, Card, ErrorBox, KV, LoadingSkeleton, Modal, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 export default function CellsAndResidency() {
   return (
@@ -26,6 +26,7 @@ function Tenancy() {
   return (
     <div className="space-y-4">
       <ErrorBox error={error} />
+      {!data && !error && <Card><LoadingSkeleton rows={4} /></Card>}
       {data && (
         <>
           <Card title={data.tenant?.legal_name} subtitle="Tenant" actions={<button className="btn-primary" disabled={!can("manage_tenant")} title={why("manage_tenant")} onClick={() => setOpen(true)}>Register legal entity</button>}>

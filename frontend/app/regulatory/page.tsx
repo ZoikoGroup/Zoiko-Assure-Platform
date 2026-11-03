@@ -29,7 +29,7 @@ function Inbox() {
       <ErrorBox error={error} />
       <Card title="Regulatory sources" subtitle="Fingerprinted on ingest. REFERENCE_ONLY rights withhold text but retain locator and fingerprint."
         actions={<button className="btn-primary" disabled={!can("content_author")} title={why("content_author")} onClick={() => setIngest(true)}>Ingest source</button>}>
-        <Table head={["Title", "Authority / jurisdiction", "Rights", "Lifecycle", "Fingerprint", "Fetched", ""]} empty={data?.length === 0}>
+        <Table head={["Title", "Authority / jurisdiction", "Rights", "Lifecycle", "Fingerprint", "Fetched", ""]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((s) => (
             <tr key={s.source_id}>
               <td className="td"><div className="font-medium text-navy-900">{s.title}</div><div className="mono text-[11px] text-slate-500">{s.locator}</div></td>

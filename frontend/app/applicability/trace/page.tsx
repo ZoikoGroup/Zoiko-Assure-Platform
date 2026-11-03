@@ -23,7 +23,7 @@ export default function ApplicabilityTrace() {
       <PageHeader spec="WF-DOM-03 · ZA-APP-001 §7" title="Applicability Trace"
         subtitle="Every evaluation is an immutable record bound to a frozen input bundle, rule version and record cutoff. Open one to see each predicate, the exact fact revision it used, and the tri-valued result." />
       <ErrorBox error={evals.error} />
-      <Card title={`${rows.length} evaluation(s)`} actions={<>
+      <Card title={`${evals.data ? rows.length : "…"} evaluation(s)`} actions={<>
         <select aria-label="Filter by subject" className="input w-44 py-1 text-xs" value={subject} onChange={(e) => setSubject(e.target.value)}>
           <option value="">All subjects</option>{subjects.map((s) => <option key={s}>{s}</option>)}
         </select>
@@ -34,7 +34,7 @@ export default function ApplicabilityTrace() {
           <option value="">All outcomes</option>{OUTCOMES.map((o) => <option key={o}>{o}</option>)}
         </select>
       </>}>
-        <Table head={["Subject", "Obligation", "Outcome", "Current determination", "Effective at", "Cutoff", "Rule", "Trigger", "Missing facts"]} empty={evals.data !== null && rows.length === 0}>
+        <Table head={["Subject", "Obligation", "Outcome", "Current determination", "Effective at", "Cutoff", "Rule", "Trigger", "Missing facts"]} empty={evals.data !== null && rows.length === 0} loading={!evals.data && !evals.error}>
           {rows.map((e) => (
             <tr key={e.evaluation_id}>
               <td className="td">{e.subject.display_name}</td>

@@ -5,7 +5,7 @@ import { api, useApi } from "@/lib/api";
 import { useAuth } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ErrorBox, KV, Modal, Notice, PageHeader, PermissionNote, Table, TabPanel, Tabs, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, KV, LoadingSkeleton, Modal, Notice, PageHeader, PermissionNote, Table, TabPanel, Tabs, useAction } from "@/components/ui";
 
 export default function Connectors() {
   const [tab, setTab] = useState("Connector registry");
@@ -33,16 +33,18 @@ export default function Connectors() {
 function Registry() {
   const { data, error, reload } = useApi<any[]>("/connectors");
   const [cert, setCert] = useState<any>(null);
+  // The certification registry is shared by every organisation; only Zoiko certification staff may change it.
   const { can, why } = useCan();
   return (
     <>
       <p className="mb-3 text-[13px] text-slate-500">Release availability, certification and runtime health are separate dimensions.</p>
       <ErrorBox error={error} />
       <div className="space-y-4">
+        {!data && !error && <Card><LoadingSkeleton rows={4} /></Card>}
         {data?.map((c) => (
           <Card key={c.connector_id} title={c.name} subtitle={`${c.provider} · ${c.source_class} · build ${c.build_version}`}
             actions={<><Badge code={c.release_availability} /><Badge code={c.certification} /><Badge code={c.runtime_health} />
-              <button className="btn-ghost" disabled={!can("manage_connectors")} title={why("manage_connectors")} onClick={() => setCert(c)}>Certification</button></>}>
+              <button className="btn-ghost" disabled={!can("certify_connectors")} title={why("certify_connectors")} onClick={() => setCert(c)}>Certification</button></>}>
             <div className="grid gap-4 lg:grid-cols-3">
               <div>
                 <div className="label">Certification matrix</div>
@@ -104,7 +106,7 @@ function Outbox() {
   return (
     <Card subtitle="Domain events are written in the same transaction as the state change (transactional outbox).">
       <ErrorBox error={error} />
-      <Table head={["Seq", "Event", "Aggregate", "Schema / dictionary", "Payload", "Available"]}>
+      <Table head={["Seq", "Event", "Aggregate", "Schema / dictionary", "Payload", "Available"]} loading={!data && !error}>
         {data?.map((e) => (
           <tr key={e.event_id} className="align-top">
             <td className="td mono text-xs">#{e.record_seq}</td><td className="td mono text-xs font-semibold">{e.event_type}</td>

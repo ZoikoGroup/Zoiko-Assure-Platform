@@ -344,14 +344,16 @@ export function TabPanel({ id, value, children }: { id: string; value: string; c
 }
 
 /* ================================================================ tables */
-export function Table({ head, children, empty }: { head: string[]; children: ReactNode; empty?: boolean }) {
+/** `loading` shows placeholder rows until the first response arrives, so a list that is still loading is never shown
+ *  as an empty one ("Nothing here yet") or as a bare header. */
+export function Table({ head, children, empty, loading }: { head: string[]; children: ReactNode; empty?: boolean; loading?: boolean }) {
   return (
     <div className="scroll-thin overflow-x-auto">
       <table className="min-w-full border-separate border-spacing-0">
         <thead><tr>{head.map((h, i) => <th key={`${h}-${i}`} className="th border-b border-slate-200">{h}</th>)}</tr></thead>
         <tbody className="[&>tr:hover]:bg-slate-50/70 [&>tr>td]:border-b [&>tr>td]:border-slate-100">{children}</tbody>
       </table>
-      {empty && <EmptyState title="Nothing here yet" compact />}
+      {loading ? <LoadingSkeleton rows={4} /> : empty && <EmptyState title="Nothing here yet" compact />}
     </div>
   );
 }

@@ -26,7 +26,7 @@ function Audit() {
   return (
     <Card subtitle="Privileged and governance actions with prior and new state. Downloads are audited too.">
       <ErrorBox error={error} />
-      <Table head={["Seq", "Action", "Actor", "Object", "Transition", "Reason", "At"]} empty={data?.length === 0}>
+      <Table head={["Seq", "Action", "Actor", "Object", "Transition", "Reason", "At"]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((e) => (
           <tr key={e.id}>
             <td className="td mono text-xs">#{e.record_seq ?? "—"}</td><td className="td mono text-xs">{e.action}</td>

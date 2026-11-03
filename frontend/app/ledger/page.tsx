@@ -3,7 +3,7 @@
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ErrorBox, Hash, KV, LiveRegion, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, Hash, KV, LiveRegion, LoadingSkeleton, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
 
 export default function Ledger() {
   const { data: d, error, reload } = useApi<any>("/ledger");
@@ -24,6 +24,7 @@ export default function Ledger() {
       <LiveRegion>{v.result && <div className="mb-4"><Notice tone={v.result.result === "VERIFIED" ? "good" : "warn"}>Chain verification <b>{v.result.result}</b>: {v.result.events_checked} events checked through #{v.result.head_seq}{v.result.first_failing_seq ? `; first failure at #${v.result.first_failing_seq}` : ""}.
         {v.result.result === "FAILED" && " A CRITICAL integrity incident was opened."} This checks the hash links between this tenant&apos;s ledger events; it does not re-check evidence payloads or their condition.</Notice></div>}</LiveRegion>
       <LiveRegion>{c.result && <div className="mb-4"><Notice tone="good">{c.result.message ?? `Checkpoint ${c.result.checkpoint_id?.slice(0, 8)} created with ${c.result.leaf_count} leaves · TSA ${c.result.tsa_status}`}</Notice></div>}</LiveRegion>
+      {!d && !error && <Card><LoadingSkeleton rows={4} /></Card>}
       {d && (
         <div className="space-y-4">
           <Card title="Tenant ledger head">

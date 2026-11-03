@@ -9,22 +9,23 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 from ..engines import keys
-from ..models import (AIAssetVersion, ApplicabilityEvaluation, AuthorityGrant, ObligationDefinition, ObligationInstance,
-                      PolicyDecisionReceipt, Subject)
+from ..models import (AIAssetVersion, ApplicabilityEvaluation, AuthorityGrant, LegalEntity, ObligationDefinition,
+                      ObligationInstance, PolicyDecisionReceipt, Subject)
 from ..platform import canonical_json, digest, emit, ensure_utc, to_dict
-from ..security import Ctx, get_ctx
+from ..security import READ, Ctx, authorize, entity_of
 
 router = APIRouter(prefix="/ai")
+AGENT_SUBJECT = entity_of(Subject, "agent_subject_id", "agent")  # Stage 4: the agent subject's legal entity
 POLICY_VERSION = "za-agent-pdp:1.0"
 AUTHORITY = ["A0", "A1", "A2", "A3", "A4"]  # OBSERVE, RECOMMEND, PREPARE, EXECUTE_REVERSIBLE, MATERIAL (excluded)
 
 
 @router.get("/assets")
-def assets(ctx: Ctx = Depends(get_ctx)):
+def assets(ctx: Ctx = Depends(authorize(*READ))):
     out = []
     for s in ctx.db.execute(select(Subject).where(Subject.tenant_id == ctx.tenant, Subject.subject_type == "AI_ASSET")).scalars():
         d = to_dict(s)
@@ -45,6 +46,7 @@ def assets(ctx: Ctx = Depends(get_ctx)):
 
 
 class AssetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     entity_id: str
     display_name: str
     asset_kind: str
@@ -57,8 +59,8 @@ class AssetIn(BaseModel):
 
 
 @router.post("/assets")
-def register(body: AssetIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("manage_ai")
+def register(body: AssetIn, ctx: Ctx = Depends(authorize("manage_ai"))):
+    ctx.scoped(ctx.db.get(LegalEntity, body.entity_id), "entity")  # the asset's entity must belong to this organisation
     s = Subject(tenant_id=ctx.tenant, entity_id=body.entity_id, subject_type="AI_ASSET", display_name=body.display_name)
     ctx.db.add(s)
     ctx.db.flush()
@@ -73,6 +75,7 @@ def register(body: AssetIn, ctx: Ctx = Depends(get_ctx)):
 
 
 class VersionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     version_label: str
     purpose: str
     provider: str
@@ -82,9 +85,8 @@ class VersionIn(BaseModel):
 
 
 @router.post("/assets/{subject_id}/versions")
-def new_version(subject_id: str, body: VersionIn, ctx: Ctx = Depends(get_ctx)):
+def new_version(subject_id: str, body: VersionIn, ctx: Ctx = Depends(authorize("manage_ai"))):
     """AgBOM change may trigger reclassification -> emits re-evaluation signal."""
-    ctx.require("manage_ai")
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "asset")
     prev = ctx.db.execute(select(AIAssetVersion).where(AIAssetVersion.asset_subject_id == subject_id)
                           .order_by(AIAssetVersion.created_at.desc())).scalars().first()
@@ -100,6 +102,7 @@ def new_version(subject_id: str, body: VersionIn, ctx: Ctx = Depends(get_ctx)):
 
 
 class GrantIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     agent_subject_id: str
     action_class: str
     authority_level: str
@@ -110,10 +113,8 @@ class GrantIn(BaseModel):
 
 
 @router.post("/grants")
-def grant(body: GrantIn, ctx: Ctx = Depends(get_ctx)):
+def grant(body: GrantIn, ctx: Ctx = Depends(authorize("grant_authority", human=True))):
     """Authority is per tuple agent x action x scope x reversibility x expiry x grantor (FR-AI-004)."""
-    ctx.require_human("Authority grant")
-    ctx.require("grant_authority")
     ctx.scoped(ctx.db.get(Subject, body.agent_subject_id), "agent")
     if body.authority_level not in AUTHORITY:
         raise HTTPException(422, "authority_level must be A0..A4")
@@ -132,8 +133,7 @@ def grant(body: GrantIn, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/grants/{grant_id}/revoke")
-def revoke(grant_id: str, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("grant_authority")
+def revoke(grant_id: str, ctx: Ctx = Depends(authorize("grant_authority", human=True))):
     g = ctx.scoped(ctx.db.get(AuthorityGrant, grant_id), "grant")
     g.status = "REVOKED"
     ctx.db.commit()
@@ -141,6 +141,7 @@ def revoke(grant_id: str, ctx: Ctx = Depends(get_ctx)):
 
 
 class DecisionReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     agent_subject_id: str
     action_class: str
     scope: str
@@ -149,6 +150,7 @@ class DecisionReq(BaseModel):
 
 
 def _decide(ctx: Ctx, req: DecisionReq) -> PolicyDecisionReceipt:
+    ctx.scoped(ctx.db.get(Subject, req.agent_subject_id), "agent")  # receipts only for this organisation's agents
     now = datetime.now(timezone.utc)
     grants = ctx.db.execute(select(AuthorityGrant).where(AuthorityGrant.tenant_id == ctx.tenant,
                                                          AuthorityGrant.agent_subject_id == req.agent_subject_id,
@@ -174,7 +176,7 @@ def _decide(ctx: Ctx, req: DecisionReq) -> PolicyDecisionReceipt:
 
 
 @router.post("/decisions")
-def decide(req: DecisionReq, ctx: Ctx = Depends(get_ctx)):
+def decide(req: DecisionReq, ctx: Ctx = Depends(authorize("request_policy_decision"))):
     """Deterministic PDP (p99 target <=150ms; no model dependency)."""
     r = _decide(ctx, req)
     ctx.db.commit()
@@ -182,7 +184,7 @@ def decide(req: DecisionReq, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/acs/evaluate")
-def acs_adapter(body: dict, ctx: Ctx = Depends(get_ctx)):
+def acs_adapter(body: dict, ctx: Ctx = Depends(authorize("request_policy_decision"))):
     """OWASP ACS-compatible adapter: external schema mapped onto the stable internal decision contract."""
     try:
         req = DecisionReq(agent_subject_id=body["agent"]["id"], action_class=body["action"]["type"],
@@ -196,7 +198,7 @@ def acs_adapter(body: dict, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/policy-bundle/{agent_subject_id}")
-def bundle(agent_subject_id: str, ctx: Ctx = Depends(get_ctx)):
+def bundle(agent_subject_id: str, ctx: Ctx = Depends(authorize(*READ, entity=AGENT_SUBJECT))):
     """Signed, short-validity local policy bundle so an Assure outage is never an uncontrolled fail-open."""
     ctx.scoped(ctx.db.get(Subject, agent_subject_id), "agent")
     now = datetime.now(timezone.utc)

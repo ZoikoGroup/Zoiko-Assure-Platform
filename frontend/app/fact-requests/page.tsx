@@ -20,7 +20,7 @@ export default function FactRequests() {
       <ErrorBox error={error} />
       <LiveRegion>{msg && <div className="mb-4"><Notice tone="good">{msg}</Notice></div>}</LiveRegion>
       <Card>
-        <Table head={["Subject", "Fact", "Reason", "Owner role", "Due", "Status", "Linked evaluations", ""]} empty={data?.length === 0}>
+        <Table head={["Subject", "Fact", "Reason", "Owner role", "Due", "Status", "Linked evaluations", ""]} empty={data?.length === 0} loading={!data && !error}>
           {data?.map((r) => {
             return (
               <tr key={r.request_id}>

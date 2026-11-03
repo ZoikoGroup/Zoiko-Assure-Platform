@@ -16,8 +16,8 @@ def pg(client):  # client fixture ensures bootstrap + seed have run
 
 
 def _scoped(conn, tenant, system="off"):
-    conn.execute(text("SELECT set_config('app.tenant_id', :t, true), set_config('app.system', :s, true)"),
-                 {"t": tenant, "s": system})
+    from conftest import stamp
+    stamp(conn, tenant or None, flags={"system"} if system == "on" else ())  # the API's signed context (0007)
 
 
 def test_runtime_role_is_not_owner_and_cannot_bypass_rls(pg):
@@ -58,10 +58,12 @@ def test_cross_tenant_write_is_rejected(pg):
 
 
 def test_ledger_is_append_only_even_for_its_tenant(pg):
+    # Refused by the runtime role's privileges (migration 0003); the append-only trigger behind them also stops the
+    # owner role (tests/test_immutability.py).
     from sqlalchemy.exc import InternalError, ProgrammingError
     with pg.connect() as c:
         tx = c.begin()
         _scoped(c, "tenant-zoiko-group")
-        with pytest.raises((InternalError, ProgrammingError), match="append-only"):
+        with pytest.raises((InternalError, ProgrammingError), match="permission denied for table evidence_ledger_event"):
             c.execute(text("UPDATE evidence_ledger_event SET reason = 'tampered'"))
         tx.rollback()

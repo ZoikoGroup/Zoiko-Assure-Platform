@@ -6,10 +6,10 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 from .. import codes
-from ..db import CELL_ID, get_db
+from ..db import CELL_ID
 from ..models import (Actor, AuditEvent, Cell, LegalEntity, OutboxEvent, Subject, Tenant)
 from ..platform import current_watermark, emit, to_dict
-from ..security import Ctx, get_ctx
+from ..security import CONTENT_READERS, DOSSIER_READ, PLATFORM_READERS, READ, Ctx, authenticated, authorize
 
 router = APIRouter()
 
@@ -25,7 +25,7 @@ def dictionary():
 
 
 @router.get("/actors")
-def actors(ctx: Ctx = Depends(get_ctx)):
+def actors(ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS, *PLATFORM_READERS))):
     """Actor directory for the caller's tenant (content staff see content-operations staff only)."""
     db = ctx.db
     out = []
@@ -39,32 +39,38 @@ def actors(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/me")
-def me(ctx: Ctx = Depends(get_ctx)):
+def me(ctx: Ctx = Depends(authenticated())):
+    from ..iam import assignment_view, wide_roles
     d = to_dict(ctx.actor)
+    d["roles"] = wide_roles(ctx.grants())  # from the role registry, not the org_actor.roles cache
     d["permissions"] = sorted(ctx.perms())
+    d["role_assignments"] = [assignment_view(a) for a in ctx.grants()]
     return d
 
 
 @router.get("/watermark")
-def watermark(db=Depends(get_db)):
-    return current_watermark(db)
+def watermark(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+    # Finding I-10: the cell's record-sequence counter is an activity-volume signal; signed-in readers only.
+    return current_watermark(ctx.db)
 
 
 @router.get("/outbox")
-def outbox(limit: int = 100, ctx: Ctx = Depends(get_ctx)):
-    q = select(OutboxEvent).where(OutboxEvent.tenant_id.in_([ctx.tenant]) | OutboxEvent.tenant_id.is_(None))
+def outbox(limit: int = 100, ctx: Ctx = Depends(authorize(*READ))):
+    # The caller's organisation only. Cell-wide platform events (tenant_id NULL), including SECURITY_CRITICAL ones such
+    # as security.content_signature_failed, are not customer-visible (ZA-EVT-001 §19); RLS enforces the same (0005).
+    q = select(OutboxEvent).where(OutboxEvent.tenant_id == ctx.tenant)
     return [to_dict(e) for e in ctx.db.execute(q.order_by(OutboxEvent.record_seq.desc()).limit(limit)).scalars()]
 
 
 @router.get("/audit")
-def audit_log(limit: int = 100, ctx: Ctx = Depends(get_ctx)):
+def audit_log(limit: int = 100, ctx: Ctx = Depends(authorize(*READ))):
     q = select(AuditEvent).where(AuditEvent.tenant_id == ctx.tenant).order_by(AuditEvent.record_seq.desc()).limit(limit)
     return [to_dict(e) for e in ctx.db.execute(q).scalars()]
 
 
 # ------------------------------------------------------------------ org / tenancy (ZA-TEN-001 baseline)
 @router.get("/org/tenant")
-def tenant(ctx: Ctx = Depends(get_ctx)):
+def tenant(ctx: Ctx = Depends(authorize(*READ))):
     t = ctx.db.get(Tenant, ctx.tenant)
     ents = ctx.db.execute(select(LegalEntity).where(LegalEntity.tenant_id == ctx.tenant)).scalars().all()
     cells = {c.cell_id: to_dict(c) for c in ctx.db.execute(select(Cell)).scalars()}
@@ -72,7 +78,7 @@ def tenant(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/org/subjects")
-def subjects(subject_type: str | None = None, ctx: Ctx = Depends(get_ctx)):
+def subjects(subject_type: str | None = None, ctx: Ctx = Depends(authorize(*READ))):
     q = select(Subject).where(Subject.tenant_id == ctx.tenant)
     if subject_type:
         q = q.where(Subject.subject_type == subject_type)
@@ -80,6 +86,7 @@ def subjects(subject_type: str | None = None, ctx: Ctx = Depends(get_ctx)):
 
 
 class SubjectIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     entity_id: str
     subject_type: str
     display_name: str
@@ -90,11 +97,12 @@ SUBJECT_TYPES = {"BUSINESS_UNIT", "REGULATED_ACTIVITY", "PRODUCT_SERVICE", "ENVI
 
 
 @router.post("/org/subjects")
-def create_subject(body: SubjectIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("manage_facts")
+def create_subject(body: SubjectIn, ctx: Ctx = Depends(authorize("manage_facts"))):
     if body.subject_type not in SUBJECT_TYPES:
         raise HTTPException(422, f"subject_type must be one of {sorted(SUBJECT_TYPES)}")
     ent = ctx.scoped(ctx.db.get(LegalEntity, body.entity_id), "entity")
+    if body.parent_subject_id:  # a client-supplied parent must be one of this organisation's subjects
+        ctx.scoped(ctx.db.get(Subject, body.parent_subject_id), "parent subject")
     s = Subject(tenant_id=ctx.tenant, entity_id=ent.entity_id, subject_type=body.subject_type,
                 display_name=body.display_name, parent_subject_id=body.parent_subject_id or ent.subject_id)
     ctx.db.add(s)
@@ -114,8 +122,7 @@ class EntityIn(BaseModel):
 
 
 @router.post("/org/entities")
-def create_entity(body: EntityIn, ctx: Ctx = Depends(get_ctx)):
-    ctx.require("manage_tenant")
+def create_entity(body: EntityIn, ctx: Ctx = Depends(authorize("manage_tenant"))):
     if not ctx.db.get(Cell, CELL_ID):  # the server's own cell must be provisioned before entities are placed in it
         raise HTTPException(409, "This cell is not provisioned")
     e = LegalEntity(tenant_id=ctx.tenant, legal_name=body.legal_name, country=body.country,

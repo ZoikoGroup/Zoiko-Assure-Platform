@@ -34,7 +34,7 @@ function Catalogue() {
     <div className="space-y-4">
       <ErrorBox error={error} />
       <Card title="Instruments & coverage mode" subtitle="MONITORING_ONLY instruments are tracked for change but carry no executable applicability rules.">
-        <Table head={["Instrument", "Jurisdiction", "Coverage", "Requirements", "Obligation definitions"]}>
+        <Table head={["Instrument", "Jurisdiction", "Coverage", "Requirements", "Obligation definitions"]} loading={!data && !error}>
           {data?.map((i) => (
             <tr key={i.instrument_id}>
               <td className="td"><div className="font-medium">{i.title}</div><div className="mono text-[11px] text-slate-500">{i.identifier}</div></td>

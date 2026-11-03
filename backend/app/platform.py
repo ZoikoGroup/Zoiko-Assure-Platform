@@ -89,8 +89,10 @@ def emit(db: Session, *, event_type: str, aggregate_type: str, aggregate_id: str
 def audit(db: Session, *, action: str, object_type: str, object_id: str, actor=None,
           tenant_id: str | None = None, prior: str | None = None, new: str | None = None,
           reason: str | None = None, record_seq: int | None = None) -> None:
-    db.add(AuditEvent(tenant_id=tenant_id, actor_id=getattr(actor, "actor_id", None),
-                      actor_type=getattr(actor, "actor_type", None), action=action,
+    act_id = getattr(actor, "actor_id", actor if isinstance(actor, str) else None)
+    act_type = getattr(actor, "actor_type", None)
+    db.add(AuditEvent(tenant_id=tenant_id, actor_id=act_id,
+                      actor_type=act_type, action=action,
                       object_type=object_type, object_id=object_id, prior_state=prior, new_state=new,
                       reason=reason, record_seq=record_seq if record_seq is not None else next_record_seq(db)))
 

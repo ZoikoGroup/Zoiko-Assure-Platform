@@ -22,7 +22,7 @@ function Releases() {
   return (
     <Card title="Signed content releases" subtitle="Each release manifest is canonicalised, hashed and Ed25519-signed; verification is independent of the database.">
       <ErrorBox error={error || a.error} />
-      <Table head={["Label", "Published", "Manifest hash", "Signer", "Impact", "Verification"]} empty={data?.length === 0}>
+      <Table head={["Label", "Published", "Manifest hash", "Signer", "Impact", "Verification"]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((r) => (
           <tr key={r.content_release_id} className="align-top">
             <td className="td"><div className="font-medium">{r.label}</div><div className="text-[11px] text-slate-500">{r.changelog}</div>
