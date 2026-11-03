@@ -2,13 +2,13 @@
 
 import Link, { useLinkStatus } from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Bell, Building, ChevronDown, HelpCircle, KeyRound, Loader2, LogOut, Menu, PanelLeftClose, PanelLeftOpen, ShieldCheck, UserCog } from "lucide-react";
+import { Bell, Building, ChevronDown, HelpCircle, KeyRound, Loader2, LogOut, Menu, Palette, PanelLeftClose, PanelLeftOpen, ShieldCheck, UserCog } from "lucide-react";
 import { api } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
-import { jumpTargets, navFor, routeMeta } from "./nav";
+import { isStandalone, jumpTargets, navFor, orgNav, orgSection, routeMeta } from "./nav";
 import {
   Breadcrumb, Drawer, Dropdown, DropdownItem, ErrorBox, Field, IconButton, Modal, PageTitleProvider, SearchInput, ToastProvider,
   Tooltip, useAction, usePageTitle, useToast,
@@ -16,6 +16,16 @@ import {
 
 const initials = (n?: string) => (n ?? "?").replace(/\(.*\)/, "").trim().split(/\s+/).slice(0, 2).map((x) => x[0]).join("").toUpperCase();
 const shortName = (n?: string) => (n ?? "").replace(/\s*\(.*\)/, "");
+
+/** Open work for the alerts menu, and the entity count for the organisation sidebar's scope (from /dashboard). */
+type OpenWork = { issues: number; facts: number; entities: number };
+
+/* A page that shows synthetic demonstration figures raises the header's "Synthetic demo data" badge while mounted. */
+const SyntheticCtx = createContext<(on: boolean) => void>(() => {});
+export function useSyntheticDataBadge() {
+  const set = useContext(SyntheticCtx);
+  useEffect(() => { set(true); return () => set(false); }, [set]);
+}
 
 export default function Shell({ children }: { children: React.ReactNode }) {
   return (
@@ -32,6 +42,8 @@ function Frame({ children }: { children: React.ReactNode }) {
   const { me, ready } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
+  const [synthetic, setSynthetic] = useState(false);
+  const [work, setWork] = useState<OpenWork | null>(null);
   const { title } = usePageTitle();
 
   // Each screen gets its own document title (WCAG 2.4.2): the page heading, with its section for detail records, or the
@@ -44,26 +56,43 @@ function Frame({ children }: { children: React.ReactNode }) {
   useEffect(() => { try { setCollapsed(localStorage.getItem("za-nav-collapsed") === "1"); } catch {} }, []);
   const toggle = () => { const v = !collapsed; setCollapsed(v); try { localStorage.setItem("za-nav-collapsed", v ? "1" : "0"); } catch {} };
   useEffect(() => setMobile(false), [path]);
+  useEffect(() => {
+    setWork(null);
+    if (!me?.tenant_id) return;
+    // Only the two counts (/dashboard/attention), not the full /dashboard aggregation: this runs on every full page
+    // load. The organisation sidebar's entity count comes from the organisation record, the same legal entities.
+    Promise.all([api("/dashboard/attention"), api("/org/tenant")])
+      .then(([a, t]) => setWork({ issues: a.open_issues, facts: a.open_fact_requests, entities: t.entities.length })).catch(() => {});
+  }, [me]);
 
   if (path === "/login") return <>{children}</>;
   if (!ready || !me) return <ShellSkeleton narrow={collapsed} />;
   if (me.must_change_password) return <ForcedPasswordChange />;
+  if (isStandalone(path)) return <>{children}</>;
 
+  // Customer-organisation users work in the Organization Workspace chrome (dark sidebar, ORG_NAV); Zoiko staff keep theirs.
+  const org = personaOf(me) === "tenant";
   return (
-    <div className="min-h-screen">
-      <a href="#main" className="sr-only z-[80] rounded-md bg-navy-700 px-3 py-2 text-white focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
-      <aside aria-label="Primary navigation"
-        className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-slate-200 bg-white transition-[width] duration-200 lg:flex ${collapsed ? "w-16" : "w-[232px]"}`}>
-        <SidebarBody narrow={collapsed} path={path} onToggle={toggle} />
-      </aside>
-      <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[260px]">
-        <div className="-m-4 flex h-[calc(100vh-49px)] flex-col"><SidebarBody narrow={false} path={path} showContext /></div>
-      </Drawer>
-      <div className={`flex min-h-screen flex-col transition-[padding] duration-200 ${collapsed ? "lg:pl-16" : "lg:pl-[232px]"}`}>
-        <Header path={path} onMenu={() => setMobile(true)} />
-        <main id="main" key={me.actor_id} className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-5 sm:px-6">{children}</main>
+    <SyntheticCtx.Provider value={setSynthetic}>
+      <div className={`min-h-screen ${org ? "bg-slate-100" : ""}`}>
+        <a href="#main" className="sr-only z-[80] rounded-md bg-navy-700 px-3 py-2 text-white focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
+        <aside aria-label="Primary navigation"
+          className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r transition-[width] duration-200 lg:flex
+            ${org ? "border-navy-950 bg-navy-900" : "border-slate-200 bg-white"} ${collapsed ? "w-16" : org ? "w-[220px]" : "w-[232px]"}`}>
+          {org ? <OrgSidebar narrow={collapsed} path={path} onToggle={toggle} entities={work?.entities} />
+            : <SidebarBody narrow={collapsed} path={path} onToggle={toggle} />}
+        </aside>
+        <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[260px]">
+          <div className={`-m-4 flex h-[calc(100vh-49px)] flex-col ${org ? "bg-navy-900" : ""}`}>
+            {org ? <OrgSidebar narrow={false} path={path} entities={work?.entities} /> : <SidebarBody narrow={false} path={path} showContext />}
+          </div>
+        </Drawer>
+        <div className={`flex min-h-screen flex-col transition-[padding] duration-200 ${collapsed ? "lg:pl-16" : org ? "lg:pl-[220px]" : "lg:pl-[232px]"}`}>
+          <Header path={path} org={org} synthetic={synthetic} alerts={work} onMenu={() => setMobile(true)} />
+          <main id="main" key={me.actor_id} className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-5 sm:px-6">{children}</main>
+        </div>
       </div>
-    </div>
+    </SyntheticCtx.Provider>
   );
 }
 
@@ -92,8 +121,9 @@ function ShellSkeleton({ narrow }: { narrow: boolean }) {
   );
 }
 
-export function Logo({ mark = false, width = 140 }: { mark?: boolean; width?: number }) {
+export function Logo({ mark = false, width = 140, onDark = false }: { mark?: boolean; width?: number; onDark?: boolean }) {
   // logo.png is a 1000px square with the wordmark centred; logo-mark.jpg is a 1000px square with the app icon centred.
+  // logo-on-dark.png is logo.png with the navy recoloured white, for dark surfaces; same geometry.
   // `width` scales the wordmark crop proportionally (140px is the sidebar size).
   const s = width / 140;
   return mark ? (
@@ -101,7 +131,7 @@ export function Logo({ mark = false, width = 140 }: { mark?: boolean; width?: nu
       style={{ backgroundImage: "url(/logo-mark.jpg)", backgroundSize: "90px 90px", backgroundPosition: "-29px -29px", backgroundRepeat: "no-repeat" }} />
   ) : (
     <span role="img" aria-label="Zoiko Assure" className="block"
-      style={{ width, height: 43 * s, backgroundImage: "url(/logo.png)", backgroundSize: `${228 * s}px ${228 * s}px`,
+      style={{ width, height: 43 * s, backgroundImage: `url(${onDark ? "/logo-on-dark.png" : "/logo.png"})`, backgroundSize: `${228 * s}px ${228 * s}px`,
         backgroundPosition: `${-44 * s}px ${-91 * s}px`, backgroundRepeat: "no-repeat" }} />
   );
 }
@@ -128,14 +158,25 @@ function WorkContext() {
 
 /** A sidebar item's icon, swapped for a spinner while that item's navigation is pending, so the click is acknowledged
  *  at once even when the next page takes a moment (prefetched routes in a production build skip the pending state). */
-function NavIcon({ icon: Icon, active }: { icon: LucideIcon; active: boolean }) {
+function NavIcon({ icon: Icon, active, dark = false }: { icon: LucideIcon; active: boolean; dark?: boolean }) {
   const { pending } = useLinkStatus();
   return pending ? (
     <>
-      <Loader2 size={16} aria-hidden className="text-navy-600 motion-safe:animate-spin" />
+      <Loader2 size={16} aria-hidden className={`${dark ? "text-teal-300" : "text-navy-600"} motion-safe:animate-spin`} />
       <span className="sr-only">Loading</span>
     </>
-  ) : <Icon size={16} aria-hidden className={active ? "text-navy-700" : "text-slate-500"} />;
+  ) : <Icon size={16} aria-hidden className={active ? (dark ? "text-teal-300" : "text-navy-700") : (dark ? "text-slate-400" : "text-slate-500")} />;
+}
+
+/** The organisation sidebar's labels have no icons, so a pending navigation shows a spinner after the label instead. */
+function NavPending() {
+  const { pending } = useLinkStatus();
+  return pending ? (
+    <>
+      <Loader2 size={14} aria-hidden className="ml-auto shrink-0 text-teal-300 motion-safe:animate-spin" />
+      <span className="sr-only">Loading</span>
+    </>
+  ) : null;
 }
 
 /** Account menu: the organisation this account belongs to (or, for Zoiko staff, that it belongs to none). */
@@ -216,14 +257,125 @@ function SidebarBody({ narrow, path, onToggle, showContext }: { narrow: boolean;
   );
 }
 
-function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
+const ORG_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300";
+
+/** The Organization Workspace sidebar: dark navy, grouped as ORG_NAV. A section's other screens are listed beneath it
+ *  while one of them is open; collapsed, every item is an icon with a tooltip. The footer names the organisation and how
+ *  many legal entities the server returned for it. */
+function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; path: string; onToggle?: () => void; entities?: number }) {
+  const { me } = useAuth();
+  const current = routeMeta(path)?.item.href;
+  const navRef = useRef<HTMLElement>(null);
+  useEffect(() => { navRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "nearest" }); }, [current]);
+  const scope = entities === undefined ? null : `${entities} ${entities === 1 ? "entity" : "entities"} • policy checked`;
+  const scopeTitle = `Organization ${me?.tenant_name ?? ""}. The server authorizes every request against your roles and this organization's boundary; ${scope ? `it returned ${entities} legal ${entities === 1 ? "entity" : "entities"}.` : "entities are loading."}`;
+
+  const link = (href: string, label: string, icon: LucideIcon, sub: boolean, highlighted: boolean) => {
+    const here = href === current;
+    const el = (
+      <Link href={href} aria-current={here ? "page" : undefined} aria-label={narrow ? label : undefined}
+        className={`flex items-center rounded-md transition-colors ${ORG_FOCUS}
+          ${narrow ? `${sub ? "h-8" : "h-9"} w-10 justify-center` : sub ? "h-8 gap-2 px-2.5 text-[13px]" : "h-9 gap-2 px-3 text-[14px]"}
+          ${highlighted ? "bg-teal-400/15 font-medium text-teal-300" : sub && here ? "font-medium text-white" : `${sub ? "text-slate-300" : "text-slate-200"} hover:bg-white/[0.06] hover:text-white`}`}>
+        {narrow ? <NavIcon icon={icon} active={highlighted || here} dark /> : <><span className="truncate">{label}</span><NavPending /></>}
+      </Link>
+    );
+    return narrow ? <Tooltip content={label} side="right">{el}</Tooltip> : el;
+  };
+
+  return (
+    <>
+      <div className={`shrink-0 ${narrow ? "flex flex-col items-center gap-2 pt-4" : "px-[18px] pt-6"}`}>
+        <div className={narrow ? "contents" : "flex items-start justify-between gap-2"}>
+          <Link href="/" aria-label="Overview" className={`rounded ${ORG_FOCUS}`}><Logo mark={narrow} width={110} onDark /></Link>
+          {onToggle && (
+            <button type="button" onClick={onToggle} aria-label={narrow ? "Expand sidebar" : "Collapse sidebar"} title={narrow ? "Expand sidebar" : "Collapse sidebar"}
+              className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-white ${narrow ? "" : "-mr-2 -mt-1"} ${ORG_FOCUS}`}>
+              {narrow ? <PanelLeftOpen size={16} aria-hidden /> : <PanelLeftClose size={16} aria-hidden />}
+            </button>
+          )}
+        </div>
+        {!narrow && (
+          <div className="mt-3">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.04em] text-slate-200">Organization workspace</div>
+            <div className="mt-1.5 text-[9px] font-medium uppercase tracking-[0.08em] text-slate-400">Governance • Assurance</div>
+          </div>
+        )}
+      </div>
+
+      <nav ref={navRef} className={`flex-1 overflow-y-auto overflow-x-hidden pb-4 ${narrow ? "no-scrollbar px-3 pt-2" : "scroll-thin px-[11px] pt-3"}`}>
+        {orgNav().map((g, gi) => {
+          const headingId = `org-nav-group-${gi}`;
+          return (
+            <div key={g.group} role="group" aria-labelledby={narrow ? undefined : headingId} aria-label={narrow ? g.group : undefined} className={narrow ? "" : "pt-6 first:pt-3"}>
+              {narrow ? (gi > 0 && <div className="mx-1 my-2 border-t border-white/10" />) : (
+                <div id={headingId} className="pb-2 text-[11px] font-semibold uppercase leading-4 tracking-widest text-slate-400">{g.group}</div>
+              )}
+              {g.items.map((item) => {
+                const open = item.href === current || item.sub.some((s) => s.href === current);
+                return (
+                  <div key={item.href}>
+                    {link(item.href, item.label, item.icon, false, open)}
+                    {open && item.sub.length > 0 && (
+                      <ul aria-label={`${item.label} screens`} className={narrow ? "mt-px rounded-md bg-white/[0.04]" : "mb-1 ml-[22px] mt-0.5 border-l border-white/10 pl-2"}>
+                        {item.sub.map((s) => <li key={s.href} className="mb-px">{link(s.href, s.label, s.icon, true, false)}</li>)}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+      </nav>
+
+      <div className={`shrink-0 border-t border-white/10 ${narrow ? "flex justify-center py-3" : "px-[18px] py-3.5"}`}>
+        {narrow ? (
+          <span title={scopeTitle} className="flex h-8 w-8 items-center justify-center rounded-md bg-white/[0.06] text-slate-300">
+            <Building size={15} aria-hidden /><span className="sr-only">{scopeTitle}</span>
+          </span>
+        ) : (
+          <div title={scopeTitle} className="min-w-0">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Entity scope</div>
+            <div className="mt-1 truncate text-[12px] font-medium text-slate-100">{me?.tenant_name}</div>
+            <div className="mt-0.5 text-[12px] text-slate-300">{scope ?? "Checking entity scope…"}</div>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/** Organisation header breadcrumb ("ZOIKO ASSURE / ORGANIZATION"). Below xl only the current page is shown. */
+function OrgBreadcrumb({ items }: { items: { label: string; href?: string }[] }) {
+  return (
+    <nav aria-label="Breadcrumb" className="min-w-0">
+      <ol className="flex min-w-0 items-center gap-1.5 text-[13px] font-semibold uppercase tracking-[0.03em] text-slate-600">
+        {items.map((c, i) => {
+          const last = i === items.length - 1;
+          return (
+            <li key={`${c.label}-${i}`} className={`min-w-0 items-center gap-1.5 ${last ? "flex" : "hidden shrink-0 xl:flex"}`}>
+              {i > 0 && <span aria-hidden className={`text-slate-400 ${last ? "hidden xl:inline" : ""}`}>/</span>}
+              {last ? <span aria-current="page" className="truncate">{c.label}</span>
+                : c.href ? <Link href={c.href} className="rounded hover:text-navy-700">{c.label}</Link>
+                : <span>{c.label}</span>}
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
+  );
+}
+
+function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: boolean; synthetic: boolean; alerts: OpenWork | null; onMenu: () => void }) {
   const { me, logout } = useAuth();
   const router = useRouter();
   const { title } = usePageTitle();
   const [wm, setWm] = useState<{ cell_id: string; record_seq: number } | null>(null);
-  const [alerts, setAlerts] = useState<{ issues: number; facts: number } | null>(null);
   const [q, setQ] = useState("");
   const [pw, setPw] = useState(false);
+  const [mac, setMac] = useState(false);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const t = () => api("/watermark").then(setWm).catch(() => setWm(null));
@@ -231,17 +383,33 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
     const h = setInterval(t, 10000);
     return () => clearInterval(h);
   }, []);
+  // Organisation header: "/" (when not typing) or ⌘K / Ctrl+K moves focus to the search, unless a dialog is open.
   useEffect(() => {
-    if (!me?.tenant_id) return;
-    // Only the two counts, not the full /dashboard aggregation: this runs on every full page load.
-    api("/dashboard/attention").then((d) => setAlerts({ issues: d.open_issues, facts: d.open_fact_requests })).catch(() => {});
-  }, [me]);
+    if (!org) return;
+    setMac(/Mac|iPhone|iPad/.test(navigator.userAgent));
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      const typing = !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+      const combo = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k";
+      const slash = e.key === "/" && !typing && !e.metaKey && !e.ctrlKey && !e.altKey;
+      const input = searchRef.current;
+      if (!(combo || slash) || !input?.offsetParent || document.querySelector('[aria-modal="true"]')) return;
+      e.preventDefault();
+      input.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [org]);
 
   const meta = routeMeta(path);
   const crumbs = meta
     ? [...(meta.group !== meta.item.label ? [{ label: meta.group }] : []), { label: meta.item.label, href: meta.item.href },
       ...(meta.isDetail && title ? [{ label: title }] : [])]
     : [{ label: "Zoiko Assure" }];
+  const section = org ? orgSection(path) : null;
+  const orgCrumbs = path === "/" ? [{ label: "Zoiko Assure" }, { label: "Organization" }]
+    : [{ label: "Zoiko Assure", href: "/" }, ...(section ? [{ label: section.group }] : []),
+      ...(meta ? [{ label: meta.item.label, href: meta.item.href }] : []), ...(meta?.isDetail && title ? [{ label: title }] : [])];
   const hits = useMemo(() => (q ? jumpTargets(personaOf(me)).filter((i) => `${i.label} ${i.group}`.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, me]);
   const pending = (alerts?.issues ?? 0) + (alerts?.facts ?? 0);
   // Record watermark: always visible ("derived projection watermark is always visible", Vol. 1 NFRs). Phones show it
@@ -253,6 +421,114 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
     </span>
   );
 
+  const onSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" && hits[0]) { router.push(hits[0].href); setQ(""); }
+    if (e.key === "Escape") setQ("");
+  };
+  const hitList = hits.length > 0 && (
+    <ul aria-label="Matching pages" className="absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
+      {hits.map(({ href, label, group }) => (
+        <li key={href}>
+          <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-2 px-3 py-1.5 text-[13px] text-slate-700 hover:bg-slate-50">
+            {label}<span className="text-[11px] text-slate-500">{group}</span>
+          </Link>
+        </li>
+      ))}
+    </ul>
+  );
+  const alertItems = (close: () => void) => (
+    <>
+      <div className="border-b border-slate-100 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Needs attention</div>
+      {!me?.tenant_id ? <p className="px-3 py-3 text-[13px] text-slate-500">Notifications cover customer-organisation work, so Zoiko staff accounts have none.</p>
+        : !alerts ? <p className="px-3 py-3 text-[13px] text-slate-500">No notifications.</p>
+        : pending === 0 ? <p className="px-3 py-3 text-[13px] text-slate-500">Nothing open right now.</p> : (
+          <>
+            {alerts.issues > 0 && <DropdownItem href="/governance" onClick={close}>{alerts.issues} open issue(s)</DropdownItem>}
+            {alerts.facts > 0 && <DropdownItem href="/fact-requests" onClick={close}>{alerts.facts} open fact request(s)</DropdownItem>}
+          </>
+        )}
+    </>
+  );
+  const dot = pending > 0 && <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-brand-500" aria-hidden />;
+  const accountMenu = (
+    <Dropdown label="Account menu" menuClassName="w-72"
+      buttonClassName="flex items-center gap-2 rounded-md py-1 pl-1 pr-1.5 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
+      button={<>
+        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-navy-700 text-[11px] font-semibold text-white">{initials(me?.display_name)}</span>
+        <span className={`hidden text-left ${org ? "2xl:block" : "sm:block"}`}>
+          <span className="block max-w-[160px] truncate text-[12px] font-medium text-slate-900">{shortName(me?.display_name)}</span>
+          <span className="block max-w-[160px] truncate text-[11px] text-slate-500">{me?.roles[0] ? roleLabel(me.roles[0]) : ""}</span>
+        </span>
+        <ChevronDown size={14} aria-hidden className="text-slate-400" />
+      </>}>
+      {(close) => (
+        <>
+          <div className="border-b border-slate-100 px-3 py-2.5">
+            <div className="text-[13px] font-medium text-slate-900">{me?.display_name}</div>
+            <div className="text-[12px] text-slate-500">{me?.email}</div>
+            <ul className="mt-1.5 space-y-0.5" aria-label="Your roles">
+              {me?.roles.map((r) => <li key={r} className="flex items-center justify-between gap-2 text-[12px] text-slate-700">{roleLabel(r)}<span className="mono text-[11px] text-slate-500">{r}</span></li>)}
+            </ul>
+          </div>
+          <AccountContext />
+          <DropdownItem icon={UserCog} href="/admin/users" onClick={close}>My access & permissions</DropdownItem>
+          <DropdownItem icon={KeyRound} onClick={() => { close(); setPw(true); }}>Change password</DropdownItem>
+          <DropdownItem icon={HelpCircle} href="/admin/dictionary" onClick={close}>Controlled dictionary</DropdownItem>
+          <DropdownItem icon={Palette} href="/design-system" onClick={close}>Design system &amp; UI kit</DropdownItem>
+          <div className="my-1 border-t border-slate-100" />
+          <DropdownItem icon={LogOut} danger onClick={logout}>Sign out</DropdownItem>
+        </>
+      )}
+    </Dropdown>
+  );
+
+  // Organization Workspace header: breadcrumb and synthetic-data badge, then search, Alerts, Help and the account menu.
+  // The search jumps to the screens this account may open (navigation, not record search), so it says "pages".
+  // Phones put the badge on the second line, beside the record watermark, so the breadcrumb keeps its room.
+  if (org) {
+    const badge = (placement: string) => synthetic && (
+      <span title="This page includes synthetic demonstration figures, each marked SYNTHETIC. Unmarked figures are read from your organization's records."
+        className={`${placement} shrink-0 items-center whitespace-nowrap rounded-full border border-slate-200 bg-slate-100 px-2.5 py-[3px] text-[10px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-600 md:text-[11px]`}>
+        Synthetic<span className="hidden lg:inline">&nbsp;demo data</span>
+      </span>
+    );
+    return (
+      <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4 sm:px-6">
+        <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="lg:hidden" />
+        <div className="min-w-0 flex-1 overflow-x-clip">
+          <div className="flex min-w-0 items-center gap-3"><OrgBreadcrumb items={orgCrumbs} />{badge("hidden md:inline-flex")}</div>
+          <div className="mt-0.5 flex items-center gap-2 md:hidden">{watermark("flex w-fit")}{badge("inline-flex")}</div>
+        </div>
+
+        <div className="flex min-w-0 items-center gap-1 sm:gap-2">
+          <div className="relative hidden shrink-0 md:block">
+            <input ref={searchRef} type="search" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onSearchKey}
+              placeholder="Search authorized pages" aria-label="Search authorized pages" aria-keyshortcuts="/ Control+K Meta+K"
+              className={`w-52 rounded-md border border-transparent bg-transparent py-1.5 pl-2.5 pr-2.5 text-[14px] text-slate-900 transition-colors placeholder:text-slate-500 hover:border-slate-200 focus:border-navy-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-navy-100 xl:w-72 ${q ? "" : "xl:pr-16"}`} />
+            {!q && <kbd aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 font-sans text-[13px] text-slate-500 xl:block">/ {mac ? "⌘K" : "Ctrl K"}</kbd>}
+            {hitList}
+          </div>
+
+          <Dropdown label={pending ? `Alerts, ${pending} open item(s)` : "Alerts"} menuClassName="w-72"
+            buttonClassName="relative inline-flex h-8 min-w-8 items-center justify-center rounded-md px-2 text-[14px] font-medium text-slate-800 hover:bg-slate-100 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
+            button={<><Bell size={16} aria-hidden className="sm:hidden" /><span className="hidden sm:inline">Alerts</span>{dot}</>}>
+            {alertItems}
+          </Dropdown>
+
+          <Link href="/admin/dictionary" title="Help: the controlled dictionary of statuses and terms"
+            className="hidden h-8 items-center rounded-md px-2 text-[14px] font-medium text-slate-800 hover:bg-slate-100 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 xl:inline-flex">
+            Help
+          </Link>
+
+          {watermark("hidden md:flex")}
+
+          {accountMenu}
+        </div>
+        {pw && <ChangePassword onClose={() => setPw(false)} />}
+      </header>
+    );
+  }
+
   return (
     <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-white/95 px-4 backdrop-blur sm:px-6">
       <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="lg:hidden" />
@@ -261,18 +537,8 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
       <div className="flex min-w-0 items-center gap-2">
         <div className="relative hidden shrink-0 md:block">
           <SearchInput value={q} onChange={(e) => setQ(e.target.value)} placeholder="Jump to…" aria-label="Jump to page" inputClassName="w-52 py-1"
-            onKeyDown={(e) => { if (e.key === "Enter" && hits[0]) { router.push(hits[0].href); setQ(""); } if (e.key === "Escape") setQ(""); }} />
-          {hits.length > 0 && (
-            <ul aria-label="Matching pages" className="absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
-              {hits.map(({ href, label, group }) => (
-                <li key={href}>
-                  <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-2 px-3 py-1.5 text-[13px] text-slate-700 hover:bg-slate-50">
-                    {label}<span className="text-[11px] text-slate-500">{group}</span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          )}
+            onKeyDown={onSearchKey} />
+          {hitList}
         </div>
 
         <div className="hidden min-w-0 max-w-[240px] md:flex"><WorkContext /></div>
@@ -280,50 +546,11 @@ function Header({ path, onMenu }: { path: string; onMenu: () => void }) {
         {watermark("hidden md:flex")}
         <Dropdown label={pending ? `Notifications, ${pending} open item(s)` : "Notifications"} menuClassName="w-72"
           buttonClassName="relative inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
-          button={<><Bell size={16} aria-hidden />{pending > 0 && <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-brand-500" aria-hidden />}</>}>
-          {(close) => (
-            <>
-              <div className="border-b border-slate-100 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Needs attention</div>
-              {!me?.tenant_id ? <p className="px-3 py-3 text-[13px] text-slate-500">Notifications cover customer-organisation work, so Zoiko staff accounts have none.</p>
-                : !alerts ? <p className="px-3 py-3 text-[13px] text-slate-500">No notifications.</p>
-                : pending === 0 ? <p className="px-3 py-3 text-[13px] text-slate-500">Nothing open right now.</p> : (
-                  <>
-                    {alerts.issues > 0 && <DropdownItem href="/governance" onClick={close}>{alerts.issues} open issue(s)</DropdownItem>}
-                    {alerts.facts > 0 && <DropdownItem href="/fact-requests" onClick={close}>{alerts.facts} open fact request(s)</DropdownItem>}
-                  </>
-                )}
-            </>
-          )}
+          button={<><Bell size={16} aria-hidden />{dot}</>}>
+          {alertItems}
         </Dropdown>
 
-        <Dropdown label="Account menu" menuClassName="w-72"
-          buttonClassName="flex items-center gap-2 rounded-md py-1 pl-1 pr-1.5 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
-          button={<>
-            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-navy-700 text-[11px] font-semibold text-white">{initials(me?.display_name)}</span>
-            <span className="hidden text-left sm:block">
-              <span className="block max-w-[160px] truncate text-[12px] font-medium text-slate-900">{shortName(me?.display_name)}</span>
-              <span className="block max-w-[160px] truncate text-[11px] text-slate-500">{me?.roles[0] ? roleLabel(me.roles[0]) : ""}</span>
-            </span>
-            <ChevronDown size={14} aria-hidden className="text-slate-400" />
-          </>}>
-          {(close) => (
-            <>
-              <div className="border-b border-slate-100 px-3 py-2.5">
-                <div className="text-[13px] font-medium text-slate-900">{me?.display_name}</div>
-                <div className="text-[12px] text-slate-500">{me?.email}</div>
-                <ul className="mt-1.5 space-y-0.5" aria-label="Your roles">
-                  {me?.roles.map((r) => <li key={r} className="flex items-center justify-between gap-2 text-[12px] text-slate-700">{roleLabel(r)}<span className="mono text-[11px] text-slate-500">{r}</span></li>)}
-                </ul>
-              </div>
-              <AccountContext />
-              <DropdownItem icon={UserCog} href="/admin/users" onClick={close}>My access & permissions</DropdownItem>
-              <DropdownItem icon={KeyRound} onClick={() => { close(); setPw(true); }}>Change password</DropdownItem>
-              <DropdownItem icon={HelpCircle} href="/admin/dictionary" onClick={close}>Controlled dictionary</DropdownItem>
-              <div className="my-1 border-t border-slate-100" />
-              <DropdownItem icon={LogOut} danger onClick={logout}>Sign out</DropdownItem>
-            </>
-          )}
-        </Dropdown>
+        {accountMenu}
       </div>
       {pw && <ChangePassword onClose={() => setPw(false)} />}
     </header>

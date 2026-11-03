@@ -1,4 +1,6 @@
 @import "tailwindcss";
+/* Unified Design System foundation tokens (semantic colours, typography, spacing, radii, elevation). */
+@import "./design-tokens.css";
 
 /* Zoiko Assure brand tokens — derived from the logo (navy #154A6C, orange #D9822B, slate #5F6B70).
    Navy is the primary enterprise colour; orange is a controlled accent only. Surfaces stay neutral. */
