@@ -49,14 +49,14 @@ function Tenancy() {
       <Modal open={open} onClose={() => setOpen(false)} title="Register legal entity">
         <ErrorBox error={a.error} />
         <div className="grid gap-3 sm:grid-cols-2">
-          <p className="text-xs text-slate-600 sm:col-span-2">The home cell is assigned by the server; it cannot be chosen here.</p>
-          {(["legal_name", "country", "registration_ref"] as const).map((k) => {
+          <p className="text-xs text-slate-600 sm:col-span-2">The home cell is assigned by the server; it cannot be chosen here. The registration is recorded in your organisation&apos;s audit trail.</p>
+          {([["legal_name", "Legal name", 200], ["country", "Country (ISO 3166 alpha-2, e.g. GB)", 2], ["registration_ref", "Registration reference", 100]] as const).map(([k, label, max]) => {
             const req = k !== "registration_ref";
-            return <div key={k}><label className="label" htmlFor={`${fid}-${k}`}>{k.replace(/_/g, " ")}{req && " (required)"}</label><input id={`${fid}-${k}`} required={req} className="input" value={f[k]} onChange={(e) => setF({ ...f, [k]: e.target.value })} /></div>;
+            return <div key={k}><label className="label" htmlFor={`${fid}-${k}`}>{label}{req && " (required)"}</label><input id={`${fid}-${k}`} required={req} maxLength={max} className={`input ${k === "country" ? "uppercase" : ""}`} value={f[k]} onChange={(e) => setF({ ...f, [k]: e.target.value })} /></div>;
           })}
         </div>
-        <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={!f.legal_name || !f.country || a.busy} onClick={() => a.run(async () => {
-          await api("/org/entities", { method: "POST", json: { ...f, registration_ref: f.registration_ref || null } }); setOpen(false); reload();
+        <div className="mt-4 flex justify-end"><button className="btn-primary" disabled={f.legal_name.trim().length < 2 || !/^[A-Za-z]{2}$/.test(f.country.trim()) || a.busy} onClick={() => a.run(async () => {
+          await api("/org/entities", { method: "POST", json: { legal_name: f.legal_name.trim(), country: f.country.trim().toUpperCase(), registration_ref: f.registration_ref.trim() || null } }); setOpen(false); reload();
         })}>Register</button></div>
       </Modal>
     </div>

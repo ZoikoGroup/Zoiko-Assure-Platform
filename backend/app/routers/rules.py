@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from .. import codes
 from ..engines import applicability as appl
-from ..engines import keys, rules
+from ..engines import catalog, keys, rules
 from ..models import (ApplicabilityEvaluation, ContentRelease, ObligationDefinition, RuleDraft, RuleVersion, Subject,
                       new_id, utcnow)
 from ..platform import audit, canonical_json, emit, next_record_seq, sha256_hex, to_dict
@@ -259,6 +259,11 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
     if missing_sets:
         raise HTTPException(409, {"error": "SET_VERSION_MISSING", "set_version_id": missing_sets[0],
                                   "message": f"Referenced SetVersion {missing_sets[0]} not found"})
+    # INV-06 / INV-09 / FR-REG-001/002 release gate, before anything is written: every provision this release binds
+    # belongs to a VERIFIED or PUBLISHED requirement version grounded in an intact source snapshot (app/engines/catalog.py).
+    # The definition is row-locked first, the same lock link edits take, so the binding signed below is the committed
+    # link set and no link edit can commit alongside this publication (DAT-REQ-012).
+    binding = catalog.release_binding(ctx.db, catalog.lock_definition(ctx.db, d.obligation_definition_id))
     set_hashes = {s: sets[s]["hash"] for s in rep["set_refs"]}
     canon = rules.canonicalize(rep["compiled_ast"])
     h = rules.ast_hash(canon, set_hashes)
@@ -284,7 +289,10 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
                 "set_refs": rv.set_refs, "golden_vector_result": {"total": vr["total"], "passed": vr["passed"]},
                 "reviewers": {"author": d.author_id, "peer": d.peer_reviewer_id, "legal": d.legal_reviewer_id},
                 "change_class": d.change_class, "supersedes": prev.rule_version_id if prev else None,
-                "rollback_parent": prev.content_release_id if prev else None}
+                "rollback_parent": prev.content_release_id if prev else None,
+                # ZA-RUL-001 §02: the release is the signed package of the RequirementVersion(s) it rests on, each with
+                # the exact source snapshot fingerprint and the provisions linked (FR-REG-001).
+                "requirement_versions": binding}
     import json
     manifest = json.loads(canonical_json(manifest))
     mb = canonical_json(manifest)
@@ -295,6 +303,7 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
                         correction_of_release_id=prev.content_release_id if (prev and d.change_class == "CORRECTION") else None)
     ctx.db.add(cr)
     ctx.db.flush()
+    requirements = catalog.publish_bound(ctx, binding, content_release_id=cr_id, record_seq=seq)
     d.status = "PUBLISHED"
     emit(ctx.db, event_type="content_release.published", aggregate_type="ContentRelease", aggregate_id=cr.content_release_id,
          record_seq=seq, payload={"manifest_hash": cr.manifest_hash, "rule_version_id": rv.rule_version_id, "label": body.label})
@@ -323,7 +332,8 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
             except HTTPException:
                 pass
     ctx.db.commit()
-    return {"content_release": to_dict(cr), "rule_version": to_dict(rv), "impact_reevaluations": reevaluated}
+    return {"content_release": to_dict(cr), "rule_version": to_dict(rv), "impact_reevaluations": reevaluated,
+            "requirement_versions": requirements}
 
 
 @router.get("/versions")

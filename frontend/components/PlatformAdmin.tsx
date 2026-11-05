@@ -4,15 +4,28 @@ import { useState } from "react";
 import { Building2, Plus } from "lucide-react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
-import { A, Badge, Card, EmptyState, ErrorBox, Field, LoadingSkeleton, MetricCard, Modal, Notice, PageHeader, Table, useAction } from "./ui";
+import { A, Badge, Card, EmptyState, ErrorBox, Field, LoadingSkeleton, MetricCard, Modal, Notice, PageHeader, SearchInput, Select, Table, useAction } from "./ui";
 
 /* Super Admin dashboard (platform principal, ZA-TEN-001 / ZA-IAM-001). The backend returns organisation-registry
-   metadata only; customer evidence, facts and assurance are not reachable from this role (INV-14, IAM-REQ-030). */
+   metadata only; customer evidence, facts and assurance are not reachable from this role (INV-14, IAM-REQ-024). */
+
+const STATUSES = [{ value: "", label: "Any status" }, { value: "ACTIVE", label: "ACTIVE" }, { value: "SUSPENDED", label: "SUSPENDED" }];
 
 export function SuperAdminDashboard() {
+  // The headline counts read the whole registry; the table applies the server-side filters (GET
+  // /platform/organisations?status=&q=). The search text is sent only when submitted.
   const orgs = useApi<any[]>("/platform/organisations");
+  const [text, setText] = useState("");
+  const [q, setQ] = useState("");
+  const [status, setStatus] = useState("");
+  const qs = new URLSearchParams();
+  if (q) qs.set("q", q);
+  if (status) qs.set("status", status);
+  const query = qs.toString();
+  const filtered = useApi<any[]>(query ? `/platform/organisations?${query}` : null);
   const [open, setOpen] = useState(false);
   const list = orgs.data ?? [];
+  const shown = query ? filtered.data ?? [] : list;
   const active = list.filter((o) => o.status === "ACTIVE").length;
   return (
     <>
@@ -29,11 +42,24 @@ export function SuperAdminDashboard() {
       </div>
       <div className="mt-4">
         <Card title="Customer organisations" subtitle="Open an organisation to edit it, change its status or appoint an Organisation Admin.">
-          {orgs.loading && !orgs.data ? <LoadingSkeleton rows={4} /> : list.length === 0 ? (
+          {list.length > 0 && (
+            <form className="mb-3 flex flex-wrap items-end gap-2" role="search" aria-label="Filter organisations"
+              onSubmit={(e) => { e.preventDefault(); setQ(text.trim()); }}>
+              <SearchInput aria-label="Organisation name" placeholder="Organisation name" maxLength={100} value={text}
+                onChange={(e) => setText(e.target.value)} className="min-w-[220px] flex-1" />
+              <Select aria-label="Status" value={status} onChange={(e) => setStatus(e.target.value)} options={STATUSES} />
+              <button type="submit" className="btn-ghost">Search</button>
+              {query && <button type="button" className="btn-ghost" onClick={() => { setText(""); setQ(""); setStatus(""); }}>Clear</button>}
+            </form>
+          )}
+          <ErrorBox error={filtered.error} />
+          {(orgs.loading && !orgs.data) || (query && filtered.loading && !filtered.data) ? <LoadingSkeleton rows={4} /> : list.length === 0 ? (
             <EmptyState icon={Building2} title="No organisations yet" description="Create the first customer organisation to get started." />
+          ) : shown.length === 0 ? (
+            <EmptyState icon={Building2} title="No organisations match" description="Change the name search or the status filter." />
           ) : (
             <Table head={["Organisation", "Status", "Legal entities", "Cell · tier", "Organisation Admin", "Created"]}>
-              {list.map((o) => (
+              {shown.map((o) => (
                 <tr key={o.tenant_id}>
                   <td className="td"><A href={`/organisations/${o.tenant_id}`}>{o.legal_name}</A><div className="mono text-[11px] text-slate-500">{o.tenant_id}</div></td>
                   <td className="td"><Badge code={o.status} /></td>
@@ -48,7 +74,7 @@ export function SuperAdminDashboard() {
           )}
         </Card>
       </div>
-      {open && <CreateOrganisation onClose={() => setOpen(false)} onCreated={() => orgs.reload()} />}
+      {open && <CreateOrganisation onClose={() => setOpen(false)} onCreated={() => { orgs.reload(); if (query) filtered.reload(); }} />}
     </>
   );
 }

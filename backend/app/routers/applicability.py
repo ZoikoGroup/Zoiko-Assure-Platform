@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 from ..engines import applicability as appl
+from ..engines import catalog
 from ..engines.facts import assert_fact, assertion_value, resolve_fact
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, DeterminationChallenge,
                       FactAssertion, FactConflict, FactDefinition, FactRequest, ObligationDefinition, RuleVersion, Subject)
@@ -192,6 +193,10 @@ def get_evaluation(evaluation_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_REA
         AdoptionAttestation.target_revision_id.in_([x["revision_id"] for x in d["determination_history"]] or ["-"]))).scalars()]
     with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):
         d["replay"] = _replay(ctx, e)
+    # The exact RuleVersion this evaluation ran, traced to the requirement versions, provisions and source snapshots it
+    # rests on and to how each required fact maps to source content (DOM §1 canonical chain; ZA-RUL-001 §02/§08).
+    rule = ctx.db.get(RuleVersion, e.rule_version_id)
+    d["regulatory_provenance"] = catalog.trace_rule_version(ctx.db, rule) if rule else None
     return d
 
 

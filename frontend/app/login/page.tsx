@@ -31,7 +31,7 @@ const CHAIN = ["Source", "Applicability", "Obligation", "Control", "Evidence", "
  *  from the server's sign-in response; this only routes, and the backend authorises every request. */
 function destination(me: Me): string {
   const next = safeNextPath(new URLSearchParams(window.location.search).get("next"), window.location.origin);
-  return canOpen(personaOf(me), new URL(next, window.location.origin).pathname) ? next : "/";
+  return canOpen(personaOf(me), new URL(next, window.location.origin).pathname, me.permissions) ? next : "/";
 }
 
 /** Fixed wording for every outcome; the server's text is never shown. A wrong password or unknown account (401) and a

@@ -25,7 +25,7 @@ export default function RetentionAndLegalHolds() {
         </Card>
         <Card title="Retention policies">
           <EmptyState compact icon={Lock} title="Retention policies are not yet enabled"
-            description="Assure does not yet model retention policies (PRI-REQ-006), so no retention schedule is applied or shown here. Each evidence record keeps its own validity window." />
+            description="Assure does not yet model retention policies (RetentionPolicyVersion, PRI-REQ-018–020), so no retention schedule is applied or shown here. Each evidence record keeps its own validity window." />
         </Card>
       </div>
     </>

@@ -99,6 +99,20 @@ POST_BASELINE_TABLES = {
     "assurance_obligation_occurrence_event": "0008",
     "iam_role_assignment": "0009",
     "iam_role_assignment_event": "0009",
+    "ai_authority_grant_event": "0011",
+    "integration_connector_certification_event": "0012",
+}
+# Constraints that revisions after the baseline added to tables the old start-up created (dropped from the legacy schema).
+POST_BASELINE_CONSTRAINTS = {
+    ("ai_authority_grant", "ck_ai_authority_grant_level"): "0011",
+    ("evidence_source_run", "fk_source_run_extraction_contract"): "0013",
+    ("evidence_source_run", "fk_source_run_mapping_contract"): "0013",
+    ("integration_extraction_contract_version", "uq_extraction_contract_connector_version"): "0013",
+    ("integration_extraction_contract_version", "fk_extraction_contract_connector"): "0013",
+    ("integration_extraction_contract_version", "ck_extraction_contract_certification"): "0013",
+    ("integration_mapping_contract_version", "uq_mapping_contract_connector_version"): "0013",
+    ("integration_mapping_contract_version", "fk_mapping_contract_connector"): "0013",
+    ("integration_mapping_contract_version", "ck_mapping_contract_certification"): "0013",
 }
 
 
@@ -116,6 +130,8 @@ def _legacy_startup(pg, schema):
             c.exec_driver_sql(f'DROP TABLE IF EXISTS "{schema}".{table} CASCADE')
         for table, column in POST_BASELINE_COLUMNS:
             c.exec_driver_sql(f'ALTER TABLE "{schema}".{table} DROP COLUMN {column}')
+        for table, constraint in POST_BASELINE_CONSTRAINTS:
+            c.exec_driver_sql(f'ALTER TABLE "{schema}".{table} DROP CONSTRAINT {constraint}')
         with c.connection.cursor() as cur:
             cur.execute(rls.replace("SCHEMA public", f'SCHEMA "{schema}"'))
 

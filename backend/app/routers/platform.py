@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import func, select
 
@@ -145,20 +145,32 @@ class StatusIn(BaseModel):
 
 
 @router.get("/organisations")
-def list_organisations(ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
+def list_organisations(status: Literal["ACTIVE", "SUSPENDED"] | None = None,
+                       q: str | None = Query(None, min_length=1, max_length=100),
+                       ctx: Ctx = Depends(SUPER_ADMIN_ONLY)):
+    """The organisation registry. Allowlisted, typed filters (API-REQ-023): `status` and `q`, a case-insensitive
+    substring of the organisation's legal name. Without filters the response is unchanged."""
     db = ctx.db
+    query = select(Tenant)
+    if status:
+        query = query.where(Tenant.status == status)
+    if q and q.strip():
+        query = query.where(func.lower(Tenant.legal_name).contains(q.strip().lower(), autoescape=True))
     with system_scope(db, "Super Admin organisation registry: org_tenant / org_legal_entity metadata only"):
-        tenants = db.execute(select(Tenant).order_by(Tenant.created_at)).scalars().all()
-        entities = db.execute(select(LegalEntity)).scalars().all()
-        admins = _admins(db, [t.tenant_id for t in tenants])  # Organisation Admin names and emails only
+        tenants = db.execute(query.order_by(Tenant.created_at)).scalars().all()
+        ids = [t.tenant_id for t in tenants]
+        entities = db.execute(select(LegalEntity).where(LegalEntity.tenant_id.in_(ids))).scalars().all() if ids else []
+        admins = _admins(db, ids)  # Organisation Admin names and emails only
     cells = {c.cell_id: c for c in db.execute(select(Cell)).scalars()}
     by_tenant: dict[str, list[LegalEntity]] = {}
     for e in entities:
         by_tenant.setdefault(e.tenant_id, []).append(e)
     out = [_view(t, by_tenant.get(t.tenant_id, []), admins[t.tenant_id], cells) for t in tenants]
-    # The one cross-organisation read (system_scope) is a platform record of its own (IAM-REQ-037, SEC-REQ-045).
+    # The one cross-organisation read (system_scope) is a platform record of its own (IAM-REQ-037, SEC-REQ-045). The
+    # search text itself is not recorded (ZA-API-001 §11: search text is not embedded in logs by default).
+    applied = ", ".join(x for x in (status and f"status={status}", q and "name search") if x)
     audit(db, action="platform.organisation_registry_read", object_type="OrganisationRegistry", object_id=CELL_ID,
-          actor=ctx.actor, reason=f"{len(tenants)} organisation(s) listed")
+          actor=ctx.actor, reason=f"{len(tenants)} organisation(s) listed" + (f" (filters: {applied})" if applied else ""))
     db.commit()
     return out
 

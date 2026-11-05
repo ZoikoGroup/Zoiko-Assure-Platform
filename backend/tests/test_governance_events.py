@@ -284,17 +284,21 @@ def test_exception_lifecycle_events_and_projection(client):
 def test_compensation_lifecycle_events_and_projection(client):
     """Compensation proposal, decision, and event projection."""
     from app.db import AdminSession
-    from app.models import ObligationInstance
+    from app.models import ObligationDefinition, ObligationInstance
 
     with AdminSession() as db:
-        obl = db.query(ObligationInstance).filter_by(tenant_id=TENANT, record_to_seq=None).first()
+        # ZA-STA-001 §09 (audit finding F-03): the primary must be a CONTROL leaf of the obligation's expression and every
+        # compensating control a catalogue control definition, so the probe uses the seeded DORA obligation and controls.
+        dora = db.query(ObligationDefinition).filter_by(key="DORA_ICT_RISK_FRAMEWORK").one()
+        obl = db.query(ObligationInstance).filter_by(tenant_id=TENANT, record_to_seq=None,
+                                                     obligation_definition_id=dora.obligation_definition_id).first()
         lineage_id = obl.lineage_id
 
     # 1. Propose compensation
     comp_payload = {
         "obligation_lineage_id": lineage_id,
-        "primary_control_key": "SEC-01",
-        "compensating_control_keys": ["SEC-02", "SEC-03"],
+        "primary_control_key": "C_MFA_PHISHING_RESISTANT",
+        "compensating_control_keys": ["C_DEVICE_ATTESTATION", "C_PRIVILEGED_NETWORK_RESTRICTION"],
         "equivalence_rationale": "Secondary hardware tokens provide equivalent multifactor assurance.",
         "valid_from": "2026-11-01T00:00:00Z",
     }

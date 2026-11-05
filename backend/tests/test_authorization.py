@@ -112,6 +112,9 @@ READ_ONLY_CHECKS = {("POST", "/api/obligations/{lineage}/preview"), ("POST", "/a
                     ("POST", "/api/ledger/verify"), ("POST", "/api/packages/{package_id}/verify")}
 CONTENT_AUTHOR_ROUTES = {
     ("POST", "/api/catalog/sources"), ("POST", "/api/catalog/sources/{source_id}/extract"),
+    ("POST", "/api/catalog/sources/{source_id}/classify"), ("POST", "/api/catalog/requirements"),
+    ("POST", "/api/catalog/obligation-definitions"), ("POST", "/api/catalog/obligation-definitions/{odef_id}/links"),
+    ("POST", "/api/catalog/obligation-definitions/{odef_id}/links/{provision_id}/remove"),
     ("PUT", "/api/catalog/provisions/{provision_id}"), ("POST", "/api/rules/drafts"), ("PUT", "/api/rules/drafts/{draft_id}"),
     ("POST", "/api/rules/drafts/{draft_id}/validate"), ("POST", "/api/rules/drafts/{draft_id}/test"),
     ("POST", "/api/rules/drafts/{draft_id}/sandbox"), ("POST", "/api/rules/drafts/{draft_id}/submit-review"),

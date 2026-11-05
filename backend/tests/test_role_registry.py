@@ -438,7 +438,8 @@ def test_cross_tenant_reads_fail_on_every_identifier_route(client, principals):
     from app.main import ROUTERS
     from app.security import operations
     ids = _ids(client)
-    global_params = {"rv_id", "draft_id", "release_id", "tenant_id"}  # Zoiko content / platform registry, not tenant data
+    # Zoiko content / platform registry, not tenant data (source_id, odef_id: global catalogue records, 4 Nov 2026)
+    global_params = {"rv_id", "draft_id", "release_id", "tenant_id", "source_id", "odef_id"}
     before, checked, leaked = db_fingerprint(), 0, []
     for op in operations(ROUTERS):
         params = set(re.findall(r"\{([^}]+)\}", op.path))

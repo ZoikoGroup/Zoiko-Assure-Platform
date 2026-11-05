@@ -193,3 +193,21 @@ def set_certification(connector_id: str, body: CertIn,
                                    runtime_health=body.runtime_health, reason=body.reason)
     ctx.db.commit()
     return to_dict(c)
+
+
+class ContractCertIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
+    certification: str
+    reason: str
+
+
+@router.post("/connectors/{connector_id}/contracts/{kind}/{version_id}/certification")
+def set_contract_certification(connector_id: str, kind: str, version_id: str, body: ContractCertIn,
+                               ctx: Ctx = Depends(authorize("certify_connectors", human=True, platform=True))):
+    """Version-level certification (IPE-REQ-028/029; migration 0013): certify, suspend or revoke one exact extraction or
+    mapping contract version (`kind` = extraction | mapping). Zoiko platform staff only; see app/engines/connectors.py.
+    Recorded and audited; its effect on source runs is an open decision (docs/connector-version-certification-design.md)."""
+    v = registry.set_contract_certification(ctx, connector_id, kind, version_id, certification=body.certification,
+                                            reason=body.reason)
+    ctx.db.commit()
+    return to_dict(v)

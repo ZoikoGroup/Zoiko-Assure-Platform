@@ -9,9 +9,10 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
+from ..engines import governance as gov
 from ..engines import keys
 from ..models import (AIAssetVersion, ApplicabilityEvaluation, AuthorityGrant, LegalEntity, ObligationDefinition,
                       ObligationInstance, PolicyDecisionReceipt, Subject)
@@ -103,13 +104,15 @@ def new_version(subject_id: str, body: VersionIn, ctx: Ctx = Depends(authorize("
 
 class GrantIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    agent_subject_id: str
-    action_class: str
-    authority_level: str
-    scope: str
-    reversibility: str
+    # API-REQ-033 (field length limits; DAT-REQ-039 review R039-04): the limits are the columns' own sizes, so an
+    # oversized value is a 422 here instead of a database error (500).
+    agent_subject_id: str = Field(max_length=36)
+    action_class: str = Field(max_length=120)
+    authority_level: str = Field(max_length=8)
+    scope: str = Field(max_length=200)
+    reversibility: str = Field(max_length=64)
     expires_in_days: int = 90
-    fail_mode: str = "FAIL_CLOSED"
+    fail_mode: str = Field(default="FAIL_CLOSED", max_length=16)
 
 
 @router.post("/grants")
@@ -120,31 +123,38 @@ def grant(body: GrantIn, ctx: Ctx = Depends(authorize("grant_authority", human=T
         raise HTTPException(422, "authority_level must be A0..A4")
     if body.authority_level == "A4":
         raise HTTPException(422, "A4 material autonomy is excluded from initial production scope")
-    g = AuthorityGrant(tenant_id=ctx.tenant, agent_subject_id=body.agent_subject_id, action_class=body.action_class,
-                       authority_level=body.authority_level, scope=body.scope, reversibility=body.reversibility,
-                       expires_at=datetime.now(timezone.utc) + timedelta(days=body.expires_in_days),
-                       granted_by=ctx.actor.actor_id, fail_mode=body.fail_mode)
-    ctx.db.add(g)
-    ctx.db.flush()
-    emit(ctx.db, event_type="agent.grant_issued", aggregate_type="AuthorityGrant", aggregate_id=g.grant_id, tenant_id=ctx.tenant,
-         actor=ctx.actor_ref(), payload={"action_class": body.action_class, "authority": body.authority_level})
+    # Stage 3c (migration 0011): projection, ISSUED event, audit record and outbox event commit together.
+    g, _ = gov.issue_authority_grant(
+        ctx.db, tenant_id=ctx.tenant, agent_subject_id=body.agent_subject_id, action_class=body.action_class,
+        authority_level=body.authority_level, scope=body.scope, reversibility=body.reversibility,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=body.expires_in_days), fail_mode=body.fail_mode,
+        actor=ctx.actor, actor_ref=ctx.actor_ref())
     ctx.db.commit()
     return to_dict(g)
 
 
+class RevokeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
+    reason: str | None = None
+
+
 @router.post("/grants/{grant_id}/revoke")
-def revoke(grant_id: str, ctx: Ctx = Depends(authorize("grant_authority", human=True))):
-    g = ctx.scoped(ctx.db.get(AuthorityGrant, grant_id), "grant")
-    g.status = "REVOKED"
+def revoke(grant_id: str, body: RevokeIn | None = None,
+           ctx: Ctx = Depends(authorize("grant_authority", human=True))):
+    """Revocation takes effect for the next decision (IAM-REQ-015). The body is optional, so existing clients that send
+    none keep working; a repeated revocation returns the revoked grant and records nothing new."""
+    ctx.scoped(ctx.db.get(AuthorityGrant, grant_id), "grant")  # another organisation's grant: 404, as if absent
+    g, _ = gov.revoke_authority_grant(ctx.db, tenant_id=ctx.tenant, grant_id=grant_id, actor=ctx.actor,
+                                      actor_ref=ctx.actor_ref(), reason=body.reason if body else None)
     ctx.db.commit()
     return to_dict(g)
 
 
 class DecisionReq(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    agent_subject_id: str
-    action_class: str
-    scope: str
+    agent_subject_id: str = Field(max_length=36)   # API-REQ-033: the receipt columns' sizes (R039-04)
+    action_class: str = Field(max_length=120)
+    scope: str = Field(max_length=200)
     requested_authority: str = "A2"
     nonce: str | None = None
 
@@ -152,10 +162,14 @@ class DecisionReq(BaseModel):
 def _decide(ctx: Ctx, req: DecisionReq) -> PolicyDecisionReceipt:
     ctx.scoped(ctx.db.get(Subject, req.agent_subject_id), "agent")  # receipts only for this organisation's agents
     now = datetime.now(timezone.utc)
+    # IAM-REQ-036 / IAM-REQ-015 (DAT-REQ-039 review R039-01): the grants are read under a share lock held until this
+    # decision commits, so a concurrent revocation waits for it, and a decision that waits for a revocation re-reads the
+    # row and no longer finds it ACTIVE. No PERMIT can commit after the revocation of the grant it cites.
     grants = ctx.db.execute(select(AuthorityGrant).where(AuthorityGrant.tenant_id == ctx.tenant,
                                                          AuthorityGrant.agent_subject_id == req.agent_subject_id,
                                                          AuthorityGrant.action_class == req.action_class,
-                                                         AuthorityGrant.status == "ACTIVE")).scalars().all()
+                                                         AuthorityGrant.status == "ACTIVE")
+                            .with_for_update(read=True)).scalars().all()
     match = next((g for g in grants if ensure_utc(g.expires_at) > now and g.scope == req.scope
                   and AUTHORITY.index(g.authority_level) >= AUTHORITY.index(req.requested_authority)), None)
     obls = [o.lineage_id for o in ctx.db.execute(select(ObligationInstance).where(
