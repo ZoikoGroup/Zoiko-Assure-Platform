@@ -21,6 +21,7 @@ from ..models import (AdoptionAttestation, ApplicabilityDetermination, Applicabi
 from ..platform import audit, canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
 from . import rules
 from .facts import resolve_fact
+from .locks import xact_lock
 
 ATTESTATION_STATEMENT_V = "ATT-STMT-1.0"
 log = logging.getLogger(__name__)
@@ -365,10 +366,24 @@ def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, au
     """Customer adoption / rejection (FR-APP-004, INV-01, DOM-INV-03/04)."""
     ctx.require_human("Determination adoption")
     ctx.require("attest")
-    cur = db.execute(select(ApplicabilityDetermination).where(
-        ApplicabilityDetermination.tenant_id == ctx.tenant,
-        ApplicabilityDetermination.lineage_id == determination_lineage_id,
-        ApplicabilityDetermination.record_to_seq.is_(None))).scalars().first()
+
+    def current():
+        return db.execute(select(ApplicabilityDetermination).where(
+            ApplicabilityDetermination.tenant_id == ctx.tenant,
+            ApplicabilityDetermination.lineage_id == determination_lineage_id,
+            ApplicabilityDetermination.record_to_seq.is_(None))
+            .execution_options(populate_existing=True)).scalars().first()
+    cur = current()
+    if not cur:
+        raise HTTPException(404, "Determination not found")
+    # Audit finding F-05 (DOM §13: one obligation per adopted determination and canonical scope). Concurrent
+    # attestations of one subject + obligation definition are serialised by a database-held lock taken before anything
+    # is validated, then the determination is read again: a second ADOPT that waited sees the first one's committed
+    # revision and is refused (409) instead of creating a second obligation lineage. A partial unique index on current
+    # revisions would add a constraint-level guarantee; it is a schema change awaiting review
+    # (docs/backend-remediation-report.md), so none is created here.
+    xact_lock(db, "obligation", ctx.tenant, cur.subject_id, cur.obligation_definition_id)
+    cur = current()
     if not cur:
         raise HTTPException(404, "Determination not found")
     if cur.state not in ("PROPOSED", "IN_REVIEW") and not (cur.state == "ADOPTED" and cur.needs_review):
@@ -441,15 +456,31 @@ def _activate_obligation(db, det, att, subject, odef, seq, actor_id) -> Obligati
     lineage = cur.lineage_id if cur else new_id()
     if cur:
         cur.record_to_seq = seq
+    # Valid time of the new revision (audit finding F-06; DOM §9.2, TIM-REQ-007/008). Re-attesting an obligation that
+    # is still ADOPTED keeps its start. Re-adopting a CLOSED one must not reach back over the closure: it starts at the
+    # adopted determination's valid_from, and never before the closed revision's end, so the closed interval stays out
+    # of the active period. The closed revision itself stays in record-time history, unchanged.
+    if cur is None:
+        valid_from = det.valid_from
+    elif cur.lifecycle == "CLOSED":
+        valid_from = max(ensure_utc(det.valid_from), ensure_utc(cur.valid_to or cur.valid_from))
+    else:
+        valid_from = cur.valid_from
     oi = ObligationInstance(lineage_id=lineage, tenant_id=det.tenant_id, entity_id=subject.entity_id,
                             subject_id=subject.subject_id, obligation_definition_id=odef.obligation_definition_id,
                             determination_revision_id=det.revision_id, attestation_id=att.attestation_id,
                             owner_actor_id=actor_id, lifecycle="ADOPTED",
-                            valid_from=cur.valid_from if cur else det.valid_from, record_from_seq=seq)
+                            valid_from=valid_from, record_from_seq=seq)
     db.add(oi)
     has_expr = db.execute(select(SatisfactionExpressionVersion).where(
+        SatisfactionExpressionVersion.tenant_id == det.tenant_id,
         SatisfactionExpressionVersion.obligation_lineage_id == lineage)).scalars().first()
     if not has_expr and odef.satisfaction_template:
+        from .assurance import AssuranceConfigurationError, expression_problems
+        problems = expression_problems(odef.satisfaction_template)
+        if problems:  # STA §16: an invalid expression is blocked before production use, never stored as an obligation's
+            raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", "; ".join(problems[:5]),
+                                              obligation_definition=odef.key)
         db.add(SatisfactionExpressionVersion(tenant_id=det.tenant_id, obligation_lineage_id=lineage, version=1,
                                              ast=odef.satisfaction_template, ast_hash=digest(odef.satisfaction_template),
                                              rationale="Default template from ObligationDefinition " + odef.key,

@@ -9,7 +9,7 @@
 1. [How the schema is managed](#how-the-schema-is-managed)
 2. [Database states](#database-states)
 3. [Commands](#commands)
-4. [Procedures](#procedures): local development, new database, deployment
+4. [Procedures](#procedures): local development, [automatic migration of a disposable development database](#automatic-migration-of-a-disposable-development-database), new database, deployment
 5. [Rollback and forward recovery](#rollback-and-forward-recovery)
 6. [Writing a new migration](#writing-a-new-migration)
 7. [Troubleshooting](#troubleshooting)
@@ -46,6 +46,9 @@ The consequences:
 | Revision 0005 | `0005_platform_rows_platform_scope_only.py` | No-tenant (platform) rows of `platform_audit_event` and `platform_outbox_event` are visible and insertable only while a transaction carries no tenant scope, and no ordinary scope can update or delete them; tenants see and write only their own rows (Task 2 outbox remediation). `assure_system()` and the missing `FORCE` are unchanged (Task 1). Reversible |
 | Revision 0006 | `0006_auth_session_token_hash.py` | `auth_session.token_hash` (unique): sessions are found by the SHA-256 of an opaque random token, which is never stored. Sessions created before the upgrade can no longer be used (sign in again). Reversible |
 | Revision 0010 | `0010_governance_projection_guards.py` | The six Stage 3c state projections (exceptions, compensations, issues, legal holds, evidence conflicts, occurrences): the runtime role loses table-wide `UPDATE`/`DELETE` and keeps `UPDATE` on each table's lifecycle columns only; `immutable_columns` (all other columns, and `DELETE`) and `lifecycle_final` (terminal states frozen) triggers apply to every role. Privileges and triggers only, no data change. Reversible |
+| Revision 0011 | `0011_authority_grant_events.py` | Agent authority grants (Stage 3c): new append-only `ai_authority_grant_event` (FORCE RLS, tenant policy, runtime SELECT/INSERT only). `ai_authority_grant` keeps runtime `UPDATE` on `status` only, with `immutable_columns` and `lifecycle_final` (REVOKED is final) for every role. `ai_policy_decision_receipt` becomes append-only. CHECK: `authority_level` in A0–A4 (ZA-DOM-001; DAT-REQ-039 review R039-02). No backfill: existing grants have no recorded history. Reversible (downgrade drops post-migration grant history) |
+| Revision 0012 | `0012_connector_certification_history.py` | Global connector certification registry (Stage 3c). New append-only `integration_connector_certification_event`. RLS (FORCE) on the registry and its history: every runtime context may read the registry; updates, and history reads and inserts, are allowed only in a verified platform-principal context (0007 predicates; not system scope). The runtime role cannot INSERT registry rows (review R039-03). The runtime role may UPDATE only `certification` and `runtime_health`, and DELETE is refused for every role. No backfill. Reversible. Design: [connector-certification-history-design.md](connector-certification-history-design.md) |
+| Revision 0013 | `0013_contract_version_certification.py` | Version-level certification (D2). Extraction and mapping contract versions become certification subjects: `UNIQUE (connector_id, version)`, a foreign key to the connector, GLS certification codes only (CHECK), FORCE RLS as in 0012 (read all; update only as a verified platform principal), runtime UPDATE on `status` only, no INSERT (review R039-03), no DELETE. `evidence_source_run` references them by foreign key. The 0012 history gains `subject_type` / `subject_id` (expand only; existing rows default to the connector). No backfill. Downgrade refuses if contract-level history exists. Design: [connector-version-certification-design.md](connector-version-certification-design.md) |
 | Revision 0009 | `0009_scoped_role_registry.py` | Scoped role registry (Stage 4b): `iam_role_assignment` (explicit TENANT / LEGAL_ENTITY / PLATFORM scope, validity window; only the closure columns can change) and append-only `iam_role_assignment_event`, both FORCE RLS. Backfills every `org_actor.roles` entry as an assignment valid from the migration (no invented history); `org_actor.roles` becomes a cache. Reversible (downgrade drops entity-scoped assignments; the cache keeps organisation-wide roles) |
 | Baseline fingerprint | `backend/migrations/baseline_schema.json` | Normalised description of the schema at 0002. Used only to validate databases created before Stage 1 |
 | Version record | table `alembic_version` | One row: the current revision. The runtime role has no privilege on it |
@@ -132,6 +135,85 @@ Your existing development database (`assure` on `127.0.0.1:5433`) was created by
 4. **Start the backend as usual.** The start-up log names the schema revision.
 
 After a pull that adds a revision, `status` reports `BEHIND`. Back up, then run `upgrade` and `check` again.
+
+### Automatic migration of a disposable development database
+
+**Creating a migration** (writing a revision; see [Writing a new migration](#writing-a-new-migration)) is never automatic. **Executing** reviewed revisions can be automatic, but only on a local database you have explicitly approved as disposable. Everything else is migrated by a person with `python -m app.migrate upgrade`, after a backup.
+
+**How it works.** With `ZA_AUTO_MIGRATE` set, API start-up (`app/main.py`) runs `python -m app.devmigrate` as a separate operator process before its usual read-only checks. That child process:
+1. refuses unless every condition below holds, and changes nothing when it refuses;
+2. checks the database's identity and approval marker over a read-only connection;
+3. applies the pending revisions with the existing runner (`migrate.upgrade`: one transaction, the migration advisory lock, full rollback on failure);
+4. verifies the result (`status` must be current, and `check` must pass), then runs the same idempotent account bootstrap as `upgrade`.
+
+The API then performs its normal checks (head revision, least-privilege runtime role, context key). It starts only if they pass.
+
+The API process itself still never reads the migration credential (DAT-REQ-004; ZA-DAT-001 §13). Only the child does, as `python -m app.migrate` does.
+
+**All of these are required.** If any is missing, nothing is migrated:
+
+| Condition | Setting or check |
+|---|---|
+| Development environment | `ZA_ENVIRONMENT=development`, exactly. `production`, `staging`, `test`, unset or anything else is refused |
+| Opt-in | `ZA_AUTO_MIGRATE=true` (or `1`, `yes`) |
+| One identifiable target | `DATABASE_ADMIN_URL` and `DATABASE_URL` both PostgreSQL, on the same host, port and database |
+| Local only | Host `127.0.0.1`, `localhost` or `::1`; shared and remote databases are always refused |
+| Allowlisted | `ZA_AUTO_MIGRATE_DATABASES` lists `host:port/database` exactly (comma-separated) |
+| Not protected | The name `assure` (the canonical local database) is protected on every host; so is anything in `ZA_PROTECTED_DATABASES` (names or `host:port/database`) |
+| Identity and approval in the database | The server reports that database name, and the database's comment is the approval marker, which only its owner can set |
+
+**Approve a disposable database.** Do this once, as the database owner. Never do it for `assure`.
+
+```sql
+-- psql -h 127.0.0.1 -p 5433 -U assure -d postgres   (owner role; example name)
+CREATE DATABASE assure_dev_scratch OWNER assure;
+COMMENT ON DATABASE assure_dev_scratch IS 'zoiko-assure:auto-migrate-approved';
+```
+
+```ini
+# backend/.env: example values only, never real credentials
+ZA_ENVIRONMENT=development
+ZA_AUTO_MIGRATE=true
+ZA_AUTO_MIGRATE_DATABASES=127.0.0.1:5433/assure_dev_scratch
+DATABASE_ADMIN_URL=postgresql+psycopg://assure:<owner-password>@127.0.0.1:5433/assure_dev_scratch
+DATABASE_URL=postgresql+psycopg://assure_app:<runtime-password>@127.0.0.1:5433/assure_dev_scratch
+# optional: further databases never to migrate automatically
+# ZA_PROTECTED_DATABASES=assure_shared,127.0.0.1:5433/assure_demo
+```
+
+**What start-up does in each case:**
+
+| Situation | Start-up |
+|---|---|
+| `ZA_AUTO_MIGRATE` unset or false | Exactly as before: if revisions are pending, start-up stops with `Database schema is not at the revision this build requires` |
+| Enabled, approved database, revisions pending | The revisions are applied and verified, then the API starts. The log shows `AUTO-MIGRATE user@host:port/db: applied; before: …; after: …` |
+| Enabled, approved database, nothing pending | Starts normally (`nothing to apply`) |
+| Enabled, but the database is refused (protected, not allowlisted, no marker, wrong identity) | Warns `AUTO-MIGRATE REFUSED: <reason>`. Starts if the schema is already current; otherwise stops with the schema-version error plus the refusal reason |
+| Enabled while `ZA_ENVIRONMENT` is `production`, `staging`, unset or unknown | Refuses to start (`ZA_AUTO_MIGRATE is set but …`); no migration process is started and no migration credential is read |
+| A revision fails | The transaction rolls back, the database stays at its previous revision, and the API does not start (`automatic development migration failed: …`) |
+| Several processes start together | The migration advisory lock serialises them: one applies the revisions, the others find the database current |
+
+Logs name `user@host:port/database` only; URL passwords are removed from every message.
+
+**Disable it.** Remove `ZA_AUTO_MIGRATE`, or set it to `false`. To withdraw a database's approval, run `COMMENT ON DATABASE <name> IS NULL`.
+
+**Run it by hand.** `python -m app.devmigrate` (from `backend/`) applies the same checks without starting the API. Exit codes: 0 applied or nothing to do, 3 refused, 1 failed. `python -m app.migrate upgrade` remains the manual runner for every database.
+
+**Production, staging and protected databases.**
+- Production and staging are migrated only by the deployment workflow's migration step, after a backup (see [Deployment](#deployment)).
+- `assure` and any protected database are migrated only by a person, following [Local development: the first time after Stage 1](#local-development-the-first-time-after-stage-1).
+
+**After a failure.**
+1. Read the `AUTO-MIGRATE FAILED` line.
+2. Run `python -m app.migrate status`. The database is still at its previous revision, because the failed run rolled back completely.
+3. Fix the revision, in a new revision if it was ever applied anywhere else.
+4. Restart the API.
+
+Never stamp the database, skip a revision or downgrade to get past a failure. A disposable database can instead be dropped and re-created, which is a manual decision.
+
+**Limitations.**
+- Revisions are applied when the API process starts. With `uvicorn --reload`, a pulled revision is applied on the next worker start, since every reload starts a fresh worker.
+- The check takes about a second, plus `check` time when there is something to apply.
 
 ### A new, empty database
 

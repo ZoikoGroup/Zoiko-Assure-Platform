@@ -8,6 +8,7 @@ import { personaOf, useAuth } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
 import { SuperAdminDashboard } from "@/components/PlatformAdmin";
 import { useSyntheticDataBadge } from "@/components/Shell";
+import SCREEN_ACCESS from "@/lib/screen-access.json";
 import { ErrorBox, Notice, PageHeader, usePageTitle } from "@/components/ui";
 
 /* The Organization Command Center. A figure is read from the backend (dashboard projection, controls, IPE anomalies,
@@ -52,10 +53,35 @@ export default function Dashboard() {
   return <CommandCenter />;
 }
 
+/* Which of the Command Center's reads this person's roles are served (lib/screen-access.json, generated from the
+   backend guards). A read that would be refused is not made: every refusal is an audit record. */
+const holds = (perms: string[], mine?: readonly string[]) => perms.some((p) => mine?.includes(p));
+
 function CommandCenter() {
   const { me } = useAuth();
+  const reader = holds(SCREEN_ACCESS.panels.overview.perms, me?.permissions);
+  if (!reader) return <AccessAdminHome orgName={me?.tenant_name ?? ""} />;
+  return <CommandCenterView />;
+}
+
+/** A role administrator (e.g. TENANT_SECURITY_ADMIN) administers access, not the regulatory record (ZA-IAM-001 §08),
+ *  so the Command Center's figures are not served to it. Its home says so and points to its own screen. */
+function AccessAdminHome({ orgName }: { orgName: string }) {
+  const { setTitle } = usePageTitle();
+  useEffect(() => { setTitle(TITLE); return () => setTitle(""); }, [setTitle]);
+  return (
+    <>
+      <PageHeader kicker={orgName} title={TITLE} subtitle="Enterprise assurance | evidence-backed, entity-scoped" />
+      <Notice>Your roles administer who can access {orgName || "this organization"}, not its regulatory records, so there are no figures to show here.
+        Manage people, roles and sessions in <Link href="/admin/users" className="font-semibold text-teal-700 hover:underline">Team &amp; Access</Link>.</Notice>
+    </>
+  );
+}
+
+function CommandCenterView() {
+  const { me } = useAuth();
   const dash = useApi<any>("/dashboard");
-  const org = useApi<any>("/org/tenant");
+  const org = useApi<any>(holds(SCREEN_ACCESS.shell.entity_scope.perms, me?.permissions) ? "/org/tenant" : null);
   const controls = useApi<any[]>("/controls");
   const anomalies = useApi<any[]>("/ipe/anomalies");
   const { setTitle } = usePageTitle();
@@ -73,9 +99,13 @@ function CommandCenter() {
   const notCurrent = Object.entries(ev).filter(([k, v]) => v > 0 && k !== "CURRENT" && k !== "ERASED");  // erasure is a governed act, not a gap
   const openIpe = (anomalies.data ?? []).filter((a) => !a.disposition_code).length;
   const proposed = d?.determinations.PROPOSED ?? 0, inReview = d?.determinations.IN_REVIEW ?? 0;
+  // Recorded occurrences of adopted obligations with no fulfilment yet, and how many are past due (GET /dashboard).
+  const occ = d?.obligation_occurrences as { unfulfilled: number; overdue: number; rule: string } | undefined;
 
   const kpis: Kpi[] = [
-    { key: "obligations", label: "Obligations due / late", hint: "5 overdue", tone: "bad", href: "/obligations", value: 14, synthetic: true },
+    { key: "obligations", label: "Obligations due / late", tone: occ?.overdue ? "bad" : "warn", href: "/obligations",
+      value: occ?.unfulfilled, failed: !!dash.error, hint: occ ? `${occ.overdue} overdue` : "awaiting fulfilment",
+      detail: occ ? `Obligation occurrences awaiting fulfilment: ${occ.unfulfilled} · past due: ${occ.overdue}. ${occ.rule}` : undefined },
     { key: "controls", label: "Controls need action", tone: "warn", href: "/controls",
       value: controls.data ? ctlOff.length : undefined, failed: !!controls.error,
       hint: ctlOff.every((c) => ["FAILING", "NOT_EVALUATED"].includes(c.current_state.state)) ? "failed or untested" : "not operating",
@@ -108,7 +138,7 @@ function CommandCenter() {
       <section aria-label="Dashboard scope"
         className="mb-6 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         <span className="rounded-md bg-slate-100 px-2.5 py-1 text-[12px] font-semibold uppercase tracking-[0.03em] text-slate-700">Org / All authorized entities</span>
-        <span className="text-[14px] text-slate-600">Jurisdictions: {jurisdictions.length ? jurisdictions.join(" • ") : "…"}</span>
+        <span className="text-[14px] text-slate-600">Jurisdictions: {jurisdictions.length ? jurisdictions.join(" • ") : org.loading ? "…" : "—"}</span>
         <span aria-hidden className="hidden h-5 w-px bg-slate-200 sm:block" />
         <span title="Each live figure is the latest recorded position when this page was read, not a total over a period." className="text-[14px] text-slate-600">
           Reporting: Current position

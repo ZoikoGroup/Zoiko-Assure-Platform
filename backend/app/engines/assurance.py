@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -25,6 +26,99 @@ from ..models import (AssuranceSnapshot, Compensation, ControlDefinition, Contro
 from ..platform import digest, emit, ensure_utc, next_record_seq
 from . import evidence as evd
 from . import ipe
+
+log = logging.getLogger("zoiko.assurance")
+
+# ZA-STA-001 §03, "ControlTestPolicy aggregation v1" and "AutomationRequirement". CUSTOM_VERSIONED_POLICY is a v1 mode
+# that this evaluator does not implement ("only when expressed through the same constrained test-policy AST and approved
+# through Assurance governance"): it is refused explicitly rather than evaluated as another mode.
+AGGREGATION_MODES = ("ALL_REQUIRED", "K_OF_N_TESTS", "PRIMARY_PLUS_CORROBORATION")
+UNSUPPORTED_AGGREGATION_MODES = ("CUSTOM_VERSIONED_POLICY",)
+AUTOMATION_REQUIREMENTS = ("NONE", "PREFERRED", "REQUIRED")
+EXPRESSION_NODES = ("CONTROL", "ALL", "ANY", "K_OF_N", "COMPENSATION", "OPTIONAL_EVIDENCE", "OCCURRENCES")
+
+
+class AssuranceConfigurationError(HTTPException):
+    """A control test policy or SatisfactionExpression that cannot be evaluated. ZA-STA-001 §16: errors are not business
+    states, and an invalid SatisfactionExpression "is a release/configuration error and must be blocked before
+    production use"; STA-REQ-022. Raised instead of returning OPERATING, FAILING, NOT_PROVEN or any other state, so no
+    evaluation, snapshot or issue is written from it. HTTP 409 with a stable code, as for a missing expression."""
+
+    def __init__(self, code: str, message: str, **refs):
+        super().__init__(409, {"error": "ASSURANCE_CONFIGURATION_INVALID", "code": code, "message": message, **refs})
+        log.warning("assurance configuration invalid: %s %s %s", code, message, refs)  # identifiers only, no evidence
+
+
+def policy_problems(aggregation_mode, k_threshold, automation_requirement, tests) -> list[str]:
+    """Why a control test policy cannot be evaluated (empty list: it can). ``tests`` are (required, primary) pairs.
+    Shared by the API boundary (routers/assurance.py create_control) and the evaluator, so stored data that predates
+    the API check is refused at evaluation as well."""
+    out = []
+    if aggregation_mode in UNSUPPORTED_AGGREGATION_MODES:
+        out.append(f"aggregation_mode {aggregation_mode} is not supported by this evaluator (ZA-STA-001 §03 requires the "
+                   "constrained test-policy AST approved through Assurance governance)")
+    elif aggregation_mode not in AGGREGATION_MODES:
+        out.append(f"aggregation_mode must be one of {list(AGGREGATION_MODES)} (ZA-STA-001 §03)")
+    if automation_requirement not in AUTOMATION_REQUIREMENTS:
+        out.append(f"automation_requirement must be one of {list(AUTOMATION_REQUIREMENTS)} (ZA-STA-001 §03)")
+    required = [t for t in tests if t[0]]
+    if tests and not required:
+        out.append("a policy with tests needs at least one required test; optional tests alone cannot prove a control "
+                   "(STA-REQ-006)")
+    if aggregation_mode == "K_OF_N_TESTS":
+        k = k_threshold
+        if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= len(required):
+            out.append(f"K_OF_N_TESTS needs an integer k_threshold between 1 and the number of required tests "
+                       f"({len(required)}); got {k!r}")
+    elif k_threshold is not None:
+        out.append("k_threshold applies only to K_OF_N_TESTS")
+    if aggregation_mode == "PRIMARY_PLUS_CORROBORATION" and len([t for t in required if t[1]]) != 1:
+        out.append("PRIMARY_PLUS_CORROBORATION needs exactly one named primary test among the required tests "
+                   "(ZA-STA-001 §03: 'Named primary test must pass')")
+    return out
+
+
+def expression_problems(node, path: str = "$", count: list | None = None) -> list[str]:
+    """Structural validation of a SatisfactionExpression AST (STA-REQ-009/010/011, STA §09). Every ALL / ANY / K_OF_N
+    needs at least one binding child (OPTIONAL_EVIDENCE is not binding), K_OF_N needs 1 <= k <= binding children, and
+    COMPENSATION needs a primary, a non-empty compensating branch and a compensation_id. Control-key existence is
+    checked where keys are introduced (catalog.validate_template, governance.propose_compensation)."""
+    count = count if count is not None else [0]
+    count[0] += 1
+    if count[0] > 500:
+        return ["expression exceeds 500 nodes"]
+    if not isinstance(node, dict) or node.get("node_type") not in EXPRESSION_NODES:
+        return [f"{path}: node_type must be one of {list(EXPRESSION_NODES)}"]
+    nt, out = node["node_type"], []
+    if nt == "CONTROL":
+        if not isinstance(node.get("control_key"), str) or not node["control_key"]:
+            out.append(f"{path}: CONTROL needs a control_key")
+    elif nt in ("ALL", "ANY", "K_OF_N"):
+        kids = node.get("children")
+        if not isinstance(kids, list):
+            return [f"{path}: {nt} needs a children list"]
+        for i, c in enumerate(kids):
+            out += expression_problems(c, f"{path}.children[{i}]", count)
+        binding = [c for c in kids if isinstance(c, dict) and c.get("node_type") != "OPTIONAL_EVIDENCE"]
+        if not binding:
+            out.append(f"{path}: {nt} needs at least one binding child; an empty {nt} proves nothing")
+        if nt == "K_OF_N":
+            k = node.get("k")
+            if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= len(binding):
+                out.append(f"{path}: K_OF_N needs an integer k between 1 and {len(binding)}; got {k!r}")
+    elif nt == "COMPENSATION":
+        if not node.get("compensation_id"):
+            out.append(f"{path}: COMPENSATION needs a compensation_id")
+        for part in ("primary", "compensating"):
+            if not isinstance(node.get(part), dict):
+                out.append(f"{path}: COMPENSATION needs a {part} branch")
+            else:
+                out += expression_problems(node[part], f"{path}.{part}", count)
+        comp = node.get("compensating")
+        if isinstance(comp, dict) and comp.get("node_type") == "OPTIONAL_EVIDENCE":
+            out.append(f"{path}.compensating: a compensating branch must contain controls (ZA-STA-001 §09)")
+    return out
+
 
 SAT, UNSAT, UNK, REV = "SATISFIED", "UNSATISFIED", "UNKNOWN", "REVIEW"
 LEAF_MAP = {"OPERATING": SAT, "FAILING": UNSAT, "NOT_EVALUATED": UNK, "DEGRADED": UNK, "REQUIRES_REVIEW": REV}
@@ -113,6 +207,12 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
     # multi-test policies, an engine change STA-REQ-032 reserves to an ADR (roadmap §6, B1).
     tds = db.execute(select(TestDefinition).where(TestDefinition.tenant_id == ci.tenant_id,
                                                   TestDefinition.policy_version_id == policy.policy_version_id)).scalars().all()
+    problems = policy_problems(policy.aggregation_mode, policy.k_threshold, policy.automation_requirement,
+                               [(td.required, td.primary) for td in tds])
+    if problems:  # refused before any state is derived or an evaluation is stored (STA §16, STA-REQ-006/022)
+        raise AssuranceConfigurationError("CONTROL_TEST_POLICY_INVALID", "; ".join(problems),
+                                          control_implementation_id=ci.control_implementation_id,
+                                          policy_version_id=policy.policy_version_id)
     test_rows = []
     deps = {"control_implementation": ci.control_implementation_id, "policy": policy.policy_version_id, "runs": [], "evidence": []}
     for td in tds:
@@ -213,8 +313,17 @@ def _aggregate(policy: ControlTestPolicy, tests: list[dict]) -> tuple[str, str, 
     opt = [t for t in tests if not t["required"]]
     degraded = any(t["status"] == "FAIL" and t["degrades_on_fail"] for t in opt)
     mode = policy.aggregation_mode
+    # Defence in depth: evaluate_control validates the policy first; an unknown mode or out-of-range k never falls
+    # through to another mode or to a vacuous threshold.
+    if mode not in AGGREGATION_MODES:
+        raise AssuranceConfigurationError("CONTROL_TEST_POLICY_INVALID", f"unsupported aggregation_mode {mode!r}")
+    if not req:
+        raise AssuranceConfigurationError("CONTROL_TEST_POLICY_INVALID", "no required test in the policy")
     if mode == "K_OF_N_TESTS":
-        k = policy.k_threshold or len(req)
+        k = policy.k_threshold
+        if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= len(req):
+            raise AssuranceConfigurationError("CONTROL_TEST_POLICY_INVALID",
+                                              f"k_threshold {k!r} outside 1..{len(req)} required tests")
         ok = sum(t["status"] == "OK" for t in req)
         conflict = sum(t["status"] == "CONFLICT" for t in req)
         unknown = sum(t["status"] == "UNKNOWN" for t in req)
@@ -226,7 +335,10 @@ def _aggregate(policy: ControlTestPolicy, tests: list[dict]) -> tuple[str, str, 
             return "REQUIRES_REVIEW", "2:REQUIRES_REVIEW", reasons
         return "NOT_EVALUATED", "3:NOT_EVALUATED", reasons
     if mode == "PRIMARY_PLUS_CORROBORATION":
-        prim = [t for t in req if t["primary"]] or req[:1]
+        prim = [t for t in req if t["primary"]]
+        if len(prim) != 1:  # "Named primary test": never an implicit choice of the first required test
+            raise AssuranceConfigurationError("CONTROL_TEST_POLICY_INVALID",
+                                              "PRIMARY_PLUS_CORROBORATION needs exactly one named primary required test")
         if any(t["status"] == "FAIL" for t in prim):
             return "FAILING", "1:FAILING", reasons
         req = prim + [t for t in req if t not in prim]
@@ -301,18 +413,30 @@ def eval_expression(node: dict, leaf_fn, comp_fn, occ_fn) -> dict:
                 base["satisfied_via_compensation"] = True
         base.update(result=res, children=[p, c], compensation=cinfo)
         return base
-    kids = [k for k in node.get("children", [])]
+    if nt not in ("ALL", "ANY", "K_OF_N"):
+        raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", f"unsupported node type {nt!r}",
+                                          node_id=node.get("node_id"))
+    kids = node.get("children")
+    if not isinstance(kids, list):
+        raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", f"{nt} node has no children list",
+                                          node_id=node.get("node_id"))
     traces = [eval_expression(k, leaf_fn, comp_fn, occ_fn) for k in kids]
     vals = [t["result"] for t in traces if t["result"] != "NOT_BINDING"]
+    if not vals:  # an empty ALL/ANY/K_OF_N proves nothing; never vacuous truth (STA §09, §16)
+        raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", f"{nt} node has no binding children",
+                                          node_id=node.get("node_id"))
     if nt == "ALL":
         res = combine_all(vals)
     elif nt == "ANY":
         res = combine_any(vals)
-    elif nt == "K_OF_N":
-        res = combine_k(vals, node["k"])
-        base["k"] = node["k"]
     else:
-        raise HTTPException(500, f"Invalid SatisfactionExpression node {nt}")
+        k = node.get("k")
+        if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= len(vals):
+            raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID",
+                                              f"K_OF_N k {k!r} outside 1..{len(vals)} binding children",
+                                              node_id=node.get("node_id"))
+        res = combine_k(vals, k)
+        base["k"] = k
     base.update(result=res, children=traces)
     return base
 
@@ -392,6 +516,27 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
         .order_by(SatisfactionExpressionVersion.record_seq, SatisfactionExpressionVersion.expression_version_id)).scalars().all()
     if not exprs:
         raise HTTPException(409, "No SatisfactionExpressionVersion for obligation (configuration error)")
+    checked: set[str] = set()
+
+    def in_force(a, b):
+        """The SatisfactionExpressionVersion in force for [a, b): the highest version whose valid period covers the
+        segment, among versions recorded by the cutoff. No fallback to a version that was not in force (audit F-09;
+        STA-REQ-021, TIM-REQ-015): an applicable segment without one is a configuration error, not a state. The chosen
+        version is validated once (STA §16)."""
+        e = next((e for e in sorted(exprs, key=lambda e: -e.version)
+                  if ensure_utc(e.valid_from) <= a and (e.valid_to is None or ensure_utc(e.valid_to) >= b)), None)
+        if e is None:
+            raise AssuranceConfigurationError(
+                "NO_EXPRESSION_IN_FORCE", "No SatisfactionExpressionVersion is in force for an applicable segment",
+                obligation_lineage_id=obligation_lineage_id, segment=[a.isoformat(), b.isoformat()],
+                record_cutoff_seq=cutoff)
+        if e.expression_version_id not in checked:
+            problems = expression_problems(e.ast)
+            if problems:
+                raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", "; ".join(problems[:5]),
+                                                  expression_version_id=e.expression_version_id, version=e.version)
+            checked.add(e.expression_version_id)
+        return e
     active_ranges = [(ensure_utc(r.valid_from), ensure_utc(r.valid_to)) for r in revs if r.lifecycle == "ADOPTED"]
 
     # ---- boundary collection (ZA-TIM-001 §9)
@@ -434,6 +579,7 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                        .order_by(Compensation.record_seq, Compensation.compensation_id)).scalars().all()
     for c in comps:
         add(c.valid_from, c.valid_to)
+    comp_status = _compensation_status_at(db, tenant_id, comps, cutoff)
     exceptions = db.execute(select(ExceptionRecord).where(ExceptionRecord.tenant_id == tenant_id,
                                                           ExceptionRecord.record_seq <= cutoff,
                                                           or_(ExceptionRecord.target_id == obligation_lineage_id,
@@ -460,10 +606,7 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
         if not any(f <= a and (t is None or t >= b) for f, t in active_ranges):
             excluded.append({"segment_range": [a, b], "reason": "OBLIGATION_NOT_APPLICABLE"})
             continue
-        expr = next((e for e in sorted(exprs, key=lambda e: -e.version)
-                     if ensure_utc(e.valid_from) <= a and (e.valid_to is None or ensure_utc(e.valid_to) >= b)), None)
-        if not expr:
-            expr = sorted(exprs, key=lambda e: -e.version)[0]
+        expr = in_force(a, b)
         leaves = []
 
         def leaf_fn(key, a=a, b=b, leaves=leaves):
@@ -488,8 +631,9 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
             c = next((c for c in comps if c.compensation_id == cid), None)
             if c is None:
                 return False, {"compensation_id": cid, "valid": False, "reason": "COMPENSATION_UNRESOLVABLE"}
-            ok = c.status == "APPROVED" and ensure_utc(c.valid_from) <= a and (c.valid_to is None or ensure_utc(c.valid_to) >= b)
-            return ok, {"compensation_id": cid, "valid": ok, "status": c.status,
+            status, source = comp_status[cid]
+            ok = status == "APPROVED" and ensure_utc(c.valid_from) <= a and (c.valid_to is None or ensure_utc(c.valid_to) >= b)
+            return ok, {"compensation_id": cid, "valid": ok, "status": status, "status_source": source,
                         "reason": None if ok else "COMPENSATION_EXPIRED", "rationale": c.equivalence_rationale}
 
         def occ_fn(a=a, b=b):
@@ -573,6 +717,32 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
     return result
 
 
+def _compensation_status_at(db, tenant_id: str, comps, cutoff: int) -> dict:
+    """Each compensation's status as known at the record cutoff (audit F-08; STA-REQ-021, TIM-REQ-006).
+
+    The ``assurance_compensation_revision`` row is a projection whose ``status`` is updated in place (migration 0010
+    allows only ``status`` and ``approved_by``); its append-only history is ``assurance_compensation_event`` (0008).
+    A historical snapshot must use the status as of its cutoff, not today's: otherwise a later revocation would change
+    the result of an earlier record perspective. A compensation with no recorded history at all (created before 0008,
+    e.g. seeded rows) falls back to its projection status, labelled as such in the trace."""
+    from ..models import CompensationEvent
+    ids = [c.compensation_id for c in comps]
+    events = db.execute(select(CompensationEvent).where(CompensationEvent.tenant_id == tenant_id,
+                                                        CompensationEvent.compensation_id.in_(ids or ["-"]))
+                        .order_by(CompensationEvent.record_seq, CompensationEvent.event_id)).scalars().all()
+    out = {}
+    for c in comps:
+        own = [e for e in events if e.compensation_id == c.compensation_id]
+        known = [e for e in own if e.record_seq <= cutoff]
+        if known:
+            out[c.compensation_id] = (known[-1].to_status, "EVENT_HISTORY")
+        elif own:  # history exists but none of it was known at the cutoff: nothing was approved then
+            out[c.compensation_id] = ("PENDING_APPROVAL", "EVENT_HISTORY")
+        else:
+            out[c.compensation_id] = (c.status, "PROJECTION_NO_HISTORY")
+    return out
+
+
 def _explain(state, segments) -> str:
     n = len(segments)
     cnt = sum(1 for s in segments if s["assurance_state"] == state)
@@ -605,7 +775,8 @@ def _issue_hooks(db, tenant_id, snap: AssuranceSnapshot, odef: ObligationDefinit
         return
     title, itype, sev, pri = mapping[snap.state]
     key = f"{itype}:{snap.obligation_lineage_id}"
-    if db.execute(select(Issue).where(Issue.dedupe_key == key, Issue.state.notin_(["CLOSED", "CANCELLED"]))).scalars().first():
+    if db.execute(select(Issue).where(Issue.tenant_id == tenant_id, Issue.dedupe_key == key,
+                                      Issue.state.notin_(["CLOSED", "CANCELLED"]))).scalars().first():
         return
     iss = Issue(tenant_id=tenant_id, title=f"{title}: {odef.title}", issue_type=itype, severity=sev, priority=pri,
                 source_ref_type="AssuranceSnapshot", source_ref_id=snap.snapshot_id, dedupe_key=key)

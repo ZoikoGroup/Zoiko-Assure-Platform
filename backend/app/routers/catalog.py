@@ -1,26 +1,42 @@
-"""Regulatory catalogue & content operations (ZA-ARCH-001 §7, ZA-DOM-001 §4)."""
+"""Regulatory catalogue & content operations (ZA-ARCH-001 §7, ZA-DOM-001 §4, ZA-DAT-001 §05, ZA-GLS-001 §04).
+
+Sources, requirement versions and provisions follow the content lifecycle in app/engines/catalog.py; every lifecycle move
+and every provision edit is recorded (append-only audit). Traceability: source -> requirement versions -> provisions ->
+obligation definitions -> rule releases, and back (``/trace`` routes), with an end-to-end link check
+(``/traceability/validation``).
+"""
 from __future__ import annotations
 
 import re
 from datetime import date
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import and_, or_, select
 
-from .. import codes
-from ..engines import keys
-from ..models import (ApplicabilityEvaluation, ContentRelease, ControlDefinition, FactDefinition, FrameworkMapping,
-                      Instrument, ObligationDefinition, Provision, RegulatorySource, RequirementVersion, RuleVersion,
-                      SetVersion)
-from ..platform import audit, canonical_json, emit, next_record_seq, sha256_hex, to_dict
+from .. import codes, pagination
+from ..db import CELL_ID
+from ..engines import catalog as cat
+from ..engines import release_verification
+from ..models import (ApplicabilityEvaluation, AuditEvent, ContentRelease, ControlDefinition, FactDefinition,
+                      FrameworkMapping, Instrument, ObligationDefinition, Provision, RegulatorySource,
+                      RequirementVersion, RuleVersion, SetVersion)
+from ..platform import audit, canonical_json, current_watermark, emit, next_record_seq, sha256_hex, to_dict
 from ..security import CONTENT_READERS, DOSSIER_READ, Ctx, authorize
 
 router = APIRouter(prefix="/catalog")
 
+CATALOG_READ = (*DOSSIER_READ, *CONTENT_READERS)
+LIFECYCLES = Literal["DISCOVERED", "INGESTED", "CLASSIFIED", "AI_EXTRACTED", "REVIEW_REQUIRED", "VERIFIED", "PUBLISHED",
+                     "SUPERSEDED", "WITHDRAWN"]
+# Strict request models: unknown fields refused (API-REQ-014), surrounding whitespace removed, lengths = column sizes
+# (API-REQ-033).
+STRICT = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
 
 @router.get("/instruments")
-def instruments(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def instruments(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     out = []
     for i in ctx.db.execute(select(Instrument)).scalars():
         d = to_dict(i)
@@ -32,8 +48,9 @@ def instruments(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     return out
 
 
+# ---------------------------------------------------------------- sources
 @router.get("/sources")
-def sources(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def sources(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     rows = ctx.db.execute(select(RegulatorySource).order_by(RegulatorySource.fetched_at.desc())).scalars().all()
     out = []
     for s in rows:
@@ -46,113 +63,277 @@ def sources(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
 
 
 class SourceIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    authority: str
-    jurisdiction: str
-    source_type: str
-    title: str
-    locator: str
-    rights_class: str = "OFFICIAL_REUSE_PERMITTED"
-    raw_text: str
+    model_config = STRICT
+    authority: str = Field(min_length=2, max_length=200)
+    jurisdiction: str = Field(min_length=2, max_length=32)
+    source_type: str = Field(min_length=2, max_length=48)
+    title: str = Field(min_length=2, max_length=300)
+    locator: str = Field(min_length=1, max_length=500)  # the authoritative reference (DAT §05)
+    rights_class: str = Field(default="OFFICIAL_REUSE_PERMITTED", min_length=2, max_length=48)
+    raw_text: str = Field(min_length=1)  # the fingerprint is taken over it; an empty source proves nothing
     publication_date: date | None = None
     effective_date: date | None = None
-    instrument_identifier: str
+    # Optional (blank = none): without it the source stays INGESTED until classified (POST /sources/{id}/classify).
+    # A given identifier must name a registered instrument.
+    instrument_identifier: str | None = Field(default=None, max_length=120)
 
 
 @router.post("/sources")
 def ingest_source(body: SourceIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
-    seq = next_record_seq(ctx.db)
+    """Register one source snapshot (DOM §4.1 SourceSnapshot: content digest + rights basis). The same snapshot of the
+    same source is not registered twice; a changed text of the same source is a new snapshot (see /versions)."""
+    db = ctx.db
+    fp = sha256_hex(body.raw_text)
+    inst = cat.lock_instrument(db, body.instrument_identifier) if body.instrument_identifier else None
+    dup = cat.find_duplicate_snapshot(db, authority=body.authority, jurisdiction=body.jurisdiction, locator=body.locator,
+                                      fingerprint=fp)
+    if dup:
+        raise HTTPException(409, {"error": "DUPLICATE_SOURCE_SNAPSHOT", "source_id": dup.source_id,
+                                  "message": "This snapshot of this source is already registered."})
+    seq = next_record_seq(db)
     s = RegulatorySource(authority=body.authority, jurisdiction=body.jurisdiction, source_type=body.source_type,
-                         title=body.title, locator=body.locator, fingerprint=sha256_hex(body.raw_text),
+                         title=body.title, locator=body.locator, fingerprint=fp,
                          rights_class=body.rights_class, rights_record={"class": body.rights_class,
                                                                         "store": True, "display": body.rights_class != "REFERENCE_ONLY",
                                                                         "derive": True, "model_use": body.rights_class == "OFFICIAL_REUSE_PERMITTED"},
                          raw_text=body.raw_text, publication_date=body.publication_date,
                          effective_date=body.effective_date, lifecycle="INGESTED", record_seq=seq)
-    ctx.db.add(s)
-    ctx.db.flush()
-    inst = ctx.db.execute(select(Instrument).where(Instrument.identifier == body.instrument_identifier)).scalars().first()
+    db.add(s)
+    db.flush()
+    prior = [v for v in cat.source_versions(db, s) if v.source_id != s.source_id]
+    audit(db, action="source.ingest", object_type="RegulatorySource", object_id=s.source_id, actor=ctx.actor,
+          new="INGESTED", record_seq=seq,
+          reason=(f"Snapshot {len(prior) + 1} of {s.authority} {s.locator}; fingerprint {fp}"
+                  + (f"; previous snapshot {prior[-1].source_id}" if prior else ""))[:2000])
     if inst:
-        s.lifecycle = "CLASSIFIED"
-    emit(ctx.db, event_type="regulatory.source_ingested", aggregate_type="RegulatorySource", aggregate_id=s.source_id,
+        cat.classify(ctx, s, inst)
+    emit(db, event_type="regulatory.source_ingested", aggregate_type="RegulatorySource", aggregate_id=s.source_id,
          record_seq=seq, payload={"fingerprint": s.fingerprint, "jurisdiction": s.jurisdiction, "lifecycle": s.lifecycle})
-    audit(ctx.db, action="source.ingest", object_type="RegulatorySource", object_id=s.source_id, actor=ctx.actor, new=s.lifecycle)
+    db.commit()
+    return to_dict(s)
+
+
+@router.get("/sources/{source_id}")
+def source(source_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    s = ctx.db.get(RegulatorySource, source_id)
+    if s is None:
+        raise HTTPException(404, "source not found")
+    d = cat.source_view(s)
+    d["requirement_versions"] = [cat.requirement_ref(ctx.db, rv) for rv in ctx.db.execute(
+        select(RequirementVersion).where(RequirementVersion.source_id == source_id)
+        .order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq)).scalars()]
+    return d
+
+
+@router.get("/sources/{source_id}/versions")
+def source_versions(source_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Every snapshot of this source (same authority, jurisdiction and authoritative locator), oldest first, with
+    whether its fingerprint differs from the snapshot before it."""
+    s = ctx.db.get(RegulatorySource, source_id)
+    if s is None:
+        raise HTTPException(404, "source not found")
+    out, prev = [], None
+    for i, v in enumerate(cat.source_versions(ctx.db, s), start=1):
+        out.append({**cat.source_ref(v), "snapshot_number": i, "fetched_at": v.fetched_at,
+                    "fingerprint_changed": prev is not None and prev.fingerprint != v.fingerprint,
+                    "requirement_versions": ctx.db.query(RequirementVersion).filter(
+                        RequirementVersion.source_id == v.source_id).count()})
+        prev = v
+    return {"source_identity": {"authority": s.authority, "jurisdiction": s.jurisdiction, "locator": s.locator},
+            "snapshots": out}
+
+
+@router.get("/sources/{source_id}/trace")
+def source_trace(source_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Forward traceability: this snapshot -> requirement versions -> provisions -> obligation definitions -> rules."""
+    s = ctx.db.get(RegulatorySource, source_id)
+    if s is None:
+        raise HTTPException(404, "source not found")
+    return cat.trace_source(ctx.db, s)
+
+
+class ClassifyIn(BaseModel):
+    model_config = STRICT
+    instrument_identifier: str = Field(min_length=1, max_length=120)
+
+
+@router.post("/sources/{source_id}/classify")
+def classify_source(source_id: str, body: ClassifyIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
+    """INGESTED -> CLASSIFIED against a registered instrument (ZA-GLS-001 §04)."""
+    s = ctx.db.execute(select(RegulatorySource).where(RegulatorySource.source_id == source_id).with_for_update()).scalars().first()
+    if s is None:
+        raise HTTPException(404, "source not found")
+    cat.classify(ctx, s, cat.lock_instrument(ctx.db, body.instrument_identifier))
     ctx.db.commit()
     return to_dict(s)
 
 
-MODAL = re.compile(r"\b(shall|must|is required to|are required to|shall not|must not)\b", re.I)
+# ---------------------------------------------------------------- requirement versions
+# Longest alternatives first: "must not" was matched as "must", so a prohibition was proposed as MUST.
+MODAL = re.compile(r"\b(shall not|must not|is required to|are required to|shall|must)\b", re.I)
 
 
 class ExtractIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    instrument_identifier: str
-    requirement_key: str
-    requirement_title: str
-    locator: str
+    model_config = STRICT
+    instrument_identifier: str = Field(min_length=1, max_length=120)
+    requirement_key: str = Field(min_length=2, max_length=120)
+    requirement_title: str = Field(min_length=2, max_length=300)
+    locator: str = Field(min_length=1, max_length=195)  # proposals append "(n)"; the provision locator holds 200
     valid_from: date
 
 
 @router.post("/sources/{source_id}/extract")
 def extract(source_id: str, body: ExtractIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     """Governed extractor proposal (non-binding). Output is AI_EXTRACTED -> REVIEW_REQUIRED (INV-09)."""
-    s = ctx.db.get(RegulatorySource, source_id)
+    db = ctx.db
+    s = db.get(RegulatorySource, source_id)
     if not s:
         raise HTTPException(404, "source not found")
-    if not (s.rights_record or {}).get("derive", True):
-        raise HTTPException(409, "Rights record prohibits derivation")
-    inst = ctx.db.execute(select(Instrument).where(Instrument.identifier == body.instrument_identifier)).scalars().first()
-    if not inst:
-        raise HTTPException(404, "instrument not found")
-    seq = next_record_seq(ctx.db)
-    rv = RequirementVersion(requirement_key=body.requirement_key, instrument_id=inst.instrument_id, source_id=s.source_id,
-                            title=body.requirement_title, locator=body.locator, valid_from=body.valid_from,
-                            lifecycle="REVIEW_REQUIRED", origin="AI_PROPOSED", record_seq=seq)
-    ctx.db.add(rv)
-    ctx.db.flush()
-    sentences = [x.strip() for x in re.split(r"(?<=[.;])\s+", s.raw_text or "") if MODAL.search(x)]
-    props = []
-    for i, sent in enumerate(sentences[:20], start=1):
+    inst = cat.lock_instrument(db, body.instrument_identifier)
+    proposals = []
+    for i, sent in enumerate([x.strip() for x in re.split(r"(?<=[.;])\s+", s.raw_text or "") if MODAL.search(x)][:20], start=1):
         m = MODAL.search(sent)
-        modality = "MUST_NOT" if "not" in m.group(0).lower() else "MUST"
-        p = Provision(requirement_version_id=rv.requirement_version_id, locator=f"{body.locator}({i})",
-                      duty_bearer="TBD_BY_REVIEWER", modality=modality, action=sent[m.end():].strip()[:110] or "TBD",
-                      regulated_object="TBD_BY_REVIEWER", normalized_meaning=sent, semantic_origin="AI_PROPOSED",
-                      lifecycle="AI_EXTRACTED")
-        ctx.db.add(p)
-        props.append(p)
-    s.lifecycle = "REVIEW_REQUIRED"
-    ctx.db.flush()
-    emit(ctx.db, event_type="regulatory.extraction_proposed", aggregate_type="RequirementVersion",
-         aggregate_id=rv.requirement_version_id, record_seq=seq,
+        proposals.append({"locator": f"{body.locator}({i})", "duty_bearer": cat.UNREVIEWED,
+                          "modality": "MUST_NOT" if "not" in m.group(0).lower() else "MUST",
+                          "action": sent[m.end():].strip()[:110] or "TBD", "regulated_object": cat.UNREVIEWED,
+                          "normalized_meaning": sent})
+    rv, props = cat.create_version(ctx, source=s, instrument=inst, requirement_key=body.requirement_key,
+                                   title=body.requirement_title, locator=body.locator, summary=None,
+                                   valid_from=body.valid_from, valid_to=None, provisions=proposals, origin="AI_PROPOSED",
+                                   provision_origin="AI_PROPOSED", provision_lifecycle="AI_EXTRACTED")
+    emit(db, event_type="regulatory.extraction_proposed", aggregate_type="RequirementVersion",
+         aggregate_id=rv.requirement_version_id, record_seq=rv.record_seq,
          payload={"proposals": len(props), "extractor": "governed_extractor:modal-heuristic-v1", "binding": False})
-    ctx.db.commit()
+    db.commit()
     return {"requirement_version": to_dict(rv), "proposed_provisions": [to_dict(p) for p in props],
             "note": "Proposals are non-binding; a qualified human reviewer must VERIFY before any release."}
 
 
+class ProvisionIn(BaseModel):
+    model_config = STRICT
+    locator: str = Field(min_length=1, max_length=200)
+    duty_bearer: str = Field(min_length=2, max_length=64)
+    modality: str = Field(min_length=2, max_length=32)
+    action: str = Field(min_length=2, max_length=120)
+    regulated_object: str = Field(min_length=2, max_length=200)
+    timing: str | None = Field(default=None, max_length=120)
+    normalized_meaning: str = Field(min_length=2, max_length=4000)
+    evidence_expectation: str | None = Field(default=None, max_length=4000)
+
+
+class RequirementIn(BaseModel):
+    model_config = STRICT
+    source_id: str = Field(min_length=1, max_length=36)
+    instrument_identifier: str = Field(min_length=1, max_length=120)
+    requirement_key: str = Field(min_length=2, max_length=120)
+    title: str = Field(min_length=2, max_length=300)
+    locator: str = Field(min_length=1, max_length=200)  # the authoritative locator within the source
+    summary: str | None = Field(default=None, max_length=4000)
+    valid_from: date
+    valid_to: date | None = None
+    provisions: list[ProvisionIn] = Field(min_length=1, max_length=50)
+
+
+@router.post("/requirements", status_code=201)
+def create_requirement(body: RequirementIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
+    """A Zoiko-encoded requirement version with its atomic provisions, in REVIEW_REQUIRED (ZA-GLS-001 §04: "Content
+    analyst"). A new version of an existing requirement uses the same requirement_key under the same instrument; earlier
+    versions are never changed."""
+    db = ctx.db
+    s = db.get(RegulatorySource, body.source_id)
+    inst = cat.lock_instrument(db, body.instrument_identifier)
+    rv, props = cat.create_version(ctx, source=s, instrument=inst, requirement_key=body.requirement_key, title=body.title,
+                                   locator=body.locator, summary=body.summary, valid_from=body.valid_from,
+                                   valid_to=body.valid_to, provisions=[p.model_dump() for p in body.provisions],
+                                   origin="ZOIKO_ENCODED", provision_origin="ZOIKO_ENCODED",
+                                   provision_lifecycle="REVIEW_REQUIRED")
+    db.commit()
+    return {**to_dict(rv), "version_number": cat.version_number(db, rv), "provisions": [to_dict(p) for p in props]}
+
+
+REQ_PAGE_DEFAULT, REQ_PAGE_MAX = 50, 200
+
+
+@router.get("/requirements")
+def list_requirements(instrument: str | None = Query(None, min_length=1, max_length=120),
+                      requirement_key: str | None = Query(None, min_length=1, max_length=120),
+                      lifecycle: LIFECYCLES | None = None,
+                      origin: str | None = Query(None, min_length=2, max_length=32, pattern=r"^[A-Z][A-Z_]*$"),
+                      source_id: str | None = Query(None, min_length=1, max_length=36),
+                      jurisdiction: str | None = Query(None, min_length=2, max_length=32),
+                      valid_at: date | None = None,
+                      limit: int = Query(REQ_PAGE_DEFAULT, ge=1, le=REQ_PAGE_MAX),
+                      cursor: str | None = Query(None, min_length=1, max_length=2048),
+                      ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Requirement versions, filtered by allowlisted typed parameters (API-REQ-023) and cursor-paginated in a stable
+    order (requirement_key, record_seq, id) with the record watermark pinned on the first page (API-REQ-012)."""
+    db = ctx.db
+    filters = {"instrument": instrument, "requirement_key": requirement_key, "lifecycle": lifecycle, "origin": origin,
+               "source_id": source_id, "jurisdiction": jurisdiction, "valid_at": valid_at and valid_at.isoformat(),
+               "limit": limit, "sort": "requirement_key,record_seq,id"}
+    fp, scope = pagination.query_fingerprint(filters), "catalog-requirements"
+    q = select(RequirementVersion)
+    if instrument or jurisdiction:
+        q = q.join(Instrument, Instrument.instrument_id == RequirementVersion.instrument_id)
+        if instrument:
+            q = q.where(Instrument.identifier == instrument)
+        if jurisdiction:
+            q = q.where(Instrument.jurisdiction == jurisdiction)
+    for col, val in ((RequirementVersion.requirement_key, requirement_key), (RequirementVersion.lifecycle, lifecycle),
+                     (RequirementVersion.origin, origin), (RequirementVersion.source_id, source_id)):
+        if val:
+            q = q.where(col == val)
+    if valid_at:
+        q = q.where(RequirementVersion.valid_from <= valid_at,
+                    or_(RequirementVersion.valid_to.is_(None), RequirementVersion.valid_to > valid_at))
+    if cursor:
+        c = pagination.decode_cursor(cursor, scope=scope, query=fp)
+        pinned = c["watermark"]
+        try:
+            k, seq, rid = str(c["position"][0]), int(c["position"][1]), str(c["position"][2])
+        except (TypeError, ValueError, IndexError):
+            raise HTTPException(400, {"error": "invalid_cursor", "message": "The cursor is not valid."}) from None
+        q = q.where(or_(RequirementVersion.requirement_key > k,
+                        and_(RequirementVersion.requirement_key == k, RequirementVersion.record_seq > seq),
+                        and_(RequirementVersion.requirement_key == k, RequirementVersion.record_seq == seq,
+                             RequirementVersion.requirement_version_id > rid)))
+    else:
+        pinned = current_watermark(db)["record_seq"]
+    q = q.where(RequirementVersion.record_seq <= pinned)
+    rows = db.execute(q.order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq,
+                                 RequirementVersion.requirement_version_id).limit(limit + 1)).scalars().all()
+    more = len(rows) > limit
+    rows = rows[:limit]
+    items = []
+    for rv in rows:
+        d = cat.requirement_ref(db, rv)
+        src = db.get(RegulatorySource, rv.source_id)
+        d["source"] = {"source_id": rv.source_id, "fingerprint": src.fingerprint if src else None,
+                       "locator": src.locator if src else None, "lifecycle": src.lifecycle if src else None}
+        d["provision_count"] = db.query(Provision).filter(Provision.requirement_version_id == rv.requirement_version_id).count()
+        items.append(d)
+    last = rows[-1] if rows else None
+    nxt = (pagination.encode_cursor(scope=scope, query=fp, position=[last.requirement_key, last.record_seq,
+                                                                     last.requirement_version_id], watermark=pinned)
+           if more else None)
+    return pagination.page(items, next_cursor=nxt, limit=limit, watermark={"cell_id": CELL_ID, "record_seq": pinned})
+
+
 class ProvisionEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    duty_bearer: str
-    modality: str
-    action: str
-    regulated_object: str
-    timing: str | None = None
-    normalized_meaning: str
-    evidence_expectation: str | None = None
+    model_config = STRICT
+    duty_bearer: str = Field(min_length=2, max_length=64)
+    modality: str = Field(min_length=2, max_length=32)
+    action: str = Field(min_length=2, max_length=120)
+    regulated_object: str = Field(min_length=2, max_length=200)
+    timing: str | None = Field(default=None, max_length=120)
+    normalized_meaning: str = Field(min_length=2, max_length=4000)
+    evidence_expectation: str | None = Field(default=None, max_length=4000)
+    reason: str | None = Field(default=None, max_length=500)  # recorded with the edit
 
 
 @router.put("/provisions/{provision_id}")
 def edit_provision(provision_id: str, body: ProvisionEdit, ctx: Ctx = Depends(authorize("content_author", platform=True))):
-    p = ctx.db.get(Provision, provision_id)
-    if not p:
-        raise HTTPException(404)
-    if p.lifecycle in ("VERIFIED", "PUBLISHED"):
-        raise HTTPException(409, "Released/verified provisions are immutable; create a new version")
-    for k, v in body.model_dump().items():
-        setattr(p, k, v)
-    p.semantic_origin = "ZOIKO_ENCODED"
-    p.lifecycle = "REVIEW_REQUIRED"
+    p = cat.revise_provision(ctx, provision_id, body.model_dump(exclude={"reason"}), body.reason)
     ctx.db.commit()
     return to_dict(p)
 
@@ -160,27 +341,13 @@ def edit_provision(provision_id: str, body: ProvisionEdit, ctx: Ctx = Depends(au
 @router.post("/requirements/{rv_id}/verify")
 def verify_requirement(rv_id: str, ctx: Ctx = Depends(authorize("content_legal_review", human=True, platform=True))):
     """Qualified human legal review: REVIEW_REQUIRED -> VERIFIED (INV-09; AI cannot)."""
-    rv = ctx.db.get(RequirementVersion, rv_id)
-    if not rv:
-        raise HTTPException(404)
-    if rv.lifecycle != "REVIEW_REQUIRED":
-        raise HTTPException(409, f"Cannot verify from {rv.lifecycle}")
-    provs = ctx.db.execute(select(Provision).where(Provision.requirement_version_id == rv_id)).scalars().all()
-    if any(p.duty_bearer == "TBD_BY_REVIEWER" for p in provs):
-        raise HTTPException(409, "All proposed provisions must be reviewed/encoded (duty bearer etc.) before VERIFIED")
-    seq = next_record_seq(ctx.db)
-    rv.lifecycle = "VERIFIED"
-    rv.reviewed_by = ctx.actor.actor_id
-    for p in provs:
-        p.lifecycle = "VERIFIED"
-    audit(ctx.db, action="requirement.verify", object_type="RequirementVersion", object_id=rv_id, actor=ctx.actor,
-          prior="REVIEW_REQUIRED", new="VERIFIED", record_seq=seq)
+    rv = cat.verify(ctx, rv_id)
     ctx.db.commit()
     return to_dict(rv)
 
 
 @router.get("/requirements/{rv_id}")
-def requirement(rv_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def requirement(rv_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     rv = ctx.db.get(RequirementVersion, rv_id)
     if not rv:
         raise HTTPException(404)
@@ -188,11 +355,61 @@ def requirement(rv_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT
     d["provisions"] = [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.requirement_version_id == rv_id)).scalars()]
     src = ctx.db.get(RegulatorySource, rv.source_id)
     d["source"] = {k: v for k, v in to_dict(src).items() if k != "raw_text" or src.rights_class != "REFERENCE_ONLY"}
+    d["version_number"] = cat.version_number(ctx.db, rv)
+    d["versions_total"] = len(cat.versions_of(ctx.db, rv.requirement_key))
     return d
 
 
+HISTORY_OBJECTS = ("RequirementVersion", "Provision", "RegulatorySource")
+
+
+@router.get("/requirements/{rv_id}/history")
+def requirement_history(rv_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Every version of this requirement (same requirement_key), oldest first, each with the exact source snapshot it
+    rests on. Zoiko content staff also get the recorded lifecycle and edit history of those versions, their provisions
+    and sources (platform audit records are not visible to organisations)."""
+    db = ctx.db
+    rv = db.get(RequirementVersion, rv_id)
+    if rv is None:
+        raise HTTPException(404, "requirement version not found")
+    versions = cat.versions_of(db, rv.requirement_key)
+    out, object_ids = [], set()
+    for v in versions:
+        provs = db.execute(select(Provision).where(Provision.requirement_version_id == v.requirement_version_id)
+                           .order_by(Provision.locator, Provision.provision_id)).scalars().all()
+        object_ids |= {v.requirement_version_id, v.source_id, *(p.provision_id for p in provs)}
+        out.append({**cat.requirement_ref(db, v), "source": cat.source_ref(db.get(RegulatorySource, v.source_id)),
+                    "provisions": [cat.provision_ref(p) for p in provs]})
+    events = None
+    if ctx.actor.tenant_id is None:
+        events = [{"record_seq": e.record_seq, "recorded_at": e.recorded_at, "action": e.action,
+                   "object_type": e.object_type, "object_id": e.object_id, "actor_id": e.actor_id,
+                   "prior_state": e.prior_state, "new_state": e.new_state, "reason": e.reason}
+                  for e in db.execute(select(AuditEvent).where(
+                      AuditEvent.tenant_id.is_(None), AuditEvent.object_type.in_(HISTORY_OBJECTS),
+                      AuditEvent.object_id.in_(sorted(object_ids) or ["-"]))
+                      .order_by(AuditEvent.record_seq, AuditEvent.id)).scalars()]
+    return {"requirement_key": rv.requirement_key, "versions": out, "events": events}
+
+
+@router.get("/requirements/{rv_id}/trace")
+def requirement_trace(rv_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Reverse traceability to the exact source snapshot, forward to provisions, obligation definitions and rules."""
+    rv = ctx.db.get(RequirementVersion, rv_id)
+    if rv is None:
+        raise HTTPException(404, "requirement version not found")
+    return cat.trace_requirement(ctx.db, rv)
+
+
+@router.get("/traceability/validation")
+def traceability_validation(ctx: Ctx = Depends(authorize(*CONTENT_READERS))):
+    """Missing and broken links across the whole catalogue (content-operations tool; read-only)."""
+    return cat.validate(ctx.db)
+
+
+# ---------------------------------------------------------------- obligation definitions and other catalogue reads
 @router.get("/obligation-definitions")
-def odefs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def odefs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     out = []
     for o in ctx.db.execute(select(ObligationDefinition)).scalars():
         d = to_dict(o)
@@ -206,18 +423,109 @@ def odefs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     return out
 
 
+@router.get("/obligation-definitions/{odef_id}/trace")
+def odef_trace(odef_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Reverse traceability for an obligation definition: provisions -> requirement versions -> source snapshots, and
+    its current rule's binding, required facts and source-mapping coverage."""
+    o = ctx.db.get(ObligationDefinition, odef_id)
+    if o is None:
+        raise HTTPException(404, "obligation definition not found")
+    return cat.trace_obligation_definition(ctx.db, o)
+
+
+class LinkIn(BaseModel):
+    model_config = STRICT
+    requirement_version_id: str = Field(min_length=1, max_length=36)
+    provision_id: str = Field(min_length=1, max_length=36)
+
+
+class LinkAddIn(LinkIn):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class UnlinkIn(BaseModel):
+    model_config = STRICT
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class DefinitionIn(BaseModel):
+    # Server-owned fields (ID, release state, rule lineage) are not accepted (API-REQ-014); lengths = column sizes.
+    model_config = STRICT
+    key: str = Field(min_length=2, max_length=120)
+    title: str = Field(min_length=2, max_length=300)
+    instrument_identifier: str = Field(min_length=1, max_length=120)
+    subject_type: str = Field(min_length=2, max_length=40)
+    coverage_mode: str = Field(default="ENCODED", min_length=2, max_length=32)
+    schedule_kind: str = Field(default="CONTINUOUS", min_length=2, max_length=32)
+    recurrence_days: int | None = Field(default=None, ge=1, le=3660)
+    material: bool = True
+    satisfaction_template: dict | None = None
+    links: list[LinkIn] = Field(min_length=1, max_length=50)
+    reason: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/obligation-definitions", status_code=201)
+def create_obligation_definition(body: DefinitionIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
+    """A Zoiko-authored obligation definition derived from one or more provision versions (ZA-DOM-001 §6.1, §13), with
+    explicit, validated provision links. It stays unreleased (non-binding) until a rule for it is published in a signed
+    release, whose gate re-checks every link (INV-06, INV-09)."""
+    if body.subject_type not in cat.DEFINITION_SUBJECT_TYPES:
+        raise HTTPException(422, f"subject_type must be one of {sorted(cat.DEFINITION_SUBJECT_TYPES)}")
+    if body.coverage_mode not in codes.DIMENSIONS["coverage_mode"]:  # ZA-GLS-001 coverage mode codes
+        raise HTTPException(422, f"coverage_mode must be one of {sorted(codes.DIMENSIONS['coverage_mode'])}")
+    if body.schedule_kind not in cat.SCHEDULE_KINDS:
+        raise HTTPException(422, f"schedule_kind must be one of {sorted(cat.SCHEDULE_KINDS)}")
+    if (body.schedule_kind == "RECURRING") != (body.recurrence_days is not None):
+        raise HTTPException(422, "recurrence_days is required for RECURRING definitions and only for them.")
+    inst = cat.lock_instrument(ctx.db, body.instrument_identifier)
+    o = cat.create_definition(ctx, key=body.key, title=body.title, instrument=inst, subject_type=body.subject_type,
+                              coverage_mode=body.coverage_mode, schedule_kind=body.schedule_kind,
+                              recurrence_days=body.recurrence_days, material=body.material,
+                              satisfaction_template=body.satisfaction_template,
+                              links=[(x.requirement_version_id, x.provision_id) for x in body.links], reason=body.reason)
+    ctx.db.commit()
+    return cat.definition_view(ctx.db, o)
+
+
+@router.get("/obligation-definitions/{odef_id}")
+def obligation_definition(odef_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """One definition (ZA-API-001 §16 GET /obligation-definitions/{id}) with each link resolved to its provision,
+    requirement version and source snapshot, whether it is released, and its current rule."""
+    o = ctx.db.get(ObligationDefinition, odef_id)
+    if o is None:
+        raise HTTPException(404, "obligation definition not found")
+    return cat.definition_view(ctx.db, o)
+
+
+@router.post("/obligation-definitions/{odef_id}/links", status_code=201)
+def link_provision(odef_id: str, body: LinkAddIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
+    """Add one explicit provision link to an unreleased definition (409 OBLIGATION_DEFINITION_RELEASED otherwise)."""
+    o = cat.add_link(ctx, odef_id, body.requirement_version_id, body.provision_id, body.reason)
+    ctx.db.commit()
+    return cat.definition_view(ctx.db, o)
+
+
+@router.post("/obligation-definitions/{odef_id}/links/{provision_id}/remove")
+def unlink_provision(odef_id: str, provision_id: str, body: UnlinkIn,
+                     ctx: Ctx = Depends(authorize("content_author", platform=True))):
+    """Remove one link from an unreleased definition, with a reason; the last link cannot be removed."""
+    o = cat.remove_link(ctx, odef_id, provision_id, body.reason)
+    ctx.db.commit()
+    return cat.definition_view(ctx.db, o)
+
+
 @router.get("/fact-definitions")
-def fdefs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def fdefs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     return [to_dict(f) for f in ctx.db.execute(select(FactDefinition).order_by(FactDefinition.key)).scalars()]
 
 
 @router.get("/sets")
-def sets(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def sets(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     return [to_dict(s) for s in ctx.db.execute(select(SetVersion)).scalars()]
 
 
 @router.get("/controls")
-def control_defs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def control_defs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     out = []
     for c in ctx.db.execute(select(ControlDefinition)).scalars():
         d = to_dict(c)
@@ -228,7 +536,7 @@ def control_defs(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS)))
 
 
 @router.get("/releases")
-def releases(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def releases(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     out = []
     for r in ctx.db.execute(select(ContentRelease).order_by(ContentRelease.published_at.desc())).scalars():
         d = to_dict(r)
@@ -243,18 +551,28 @@ def releases(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
 
 
 @router.get("/releases/{release_id}/verify")
-def verify_release(release_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def verify_release(release_id: str, response: Response, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Verify one published release (A9b; app/engines/release_verification.py): signed payload, signature, rule
+    versions, requirement versions and source fingerprints. The outcome is VALID, INVALID or UNVERIFIABLE with every
+    check and its reason; while no content-release trust anchor exists (RUL-ADR-06, C-07) an intact release is
+    UNVERIFIABLE, never VALID. The fields this route returned before (manifest_hash_ok, signature_ok, signer_key_id,
+    public_key_pem) keep their meaning. A result is recorded (content.verify; ZA-SEC-001 §18) when it is new for the
+    caller: the first verification and every change of result. An identical repeat is a plain read and writes nothing.
+    The ``Za-Verification-Recorded`` response header says which; the body stays identical for every caller (global
+    content). An INVALID result that is recorded raises security.content_signature_failed (SEC-REQ-048), so every
+    distinct failure is signalled. Nothing about the release is changed or re-signed."""
     r = ctx.db.get(ContentRelease, release_id)
     if not r:
         raise HTTPException(404)
-    mb = canonical_json(r.manifest)
-    return {"content_release_id": release_id, "manifest_hash_ok": sha256_hex(mb) == r.manifest_hash,
-            "signature_ok": keys.verify(mb, r.signature), "signer_key_id": r.signer_key_id,
-            "public_key_pem": keys.public_key_pem()}
+    report = release_verification.verify_release(ctx.db, r)
+    recorded = release_verification.record(ctx.db, report, actor=ctx.actor)
+    ctx.db.commit()
+    response.headers["Za-Verification-Recorded"] = "true" if recorded else "false"
+    return report
 
 
 @router.get("/coverage")
-def coverage(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
+def coverage(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     return {"dimension": codes.DIMENSIONS["coverage_mode"],
             "instruments": [{"identifier": i.identifier, "title": i.title, "coverage_mode": i.coverage_mode,
                              "jurisdiction": i.jurisdiction} for i in ctx.db.execute(select(Instrument)).scalars()]}

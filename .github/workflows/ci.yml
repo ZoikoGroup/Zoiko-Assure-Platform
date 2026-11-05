@@ -342,6 +342,16 @@ jobs:
           --require test_governance_projections=8
           --require test_request_hardening=15
           --require test_read_authorization_matrix=2
+          --require test_authority_grant_events=14
+          --require test_dev_auto_migration=37
+          --require test_connector_certification_history=21
+          --require test_connector_version_certification=23
+          --require test_dat_req_039_review=13
+          --require test_sidebar_integration=37
+          --require test_regulatory_traceability=18
+          --require test_release_signature_verification=28
+          --require test_obligation_definition_authoring=12
+          --require test_backend_remediation=56
           --redact-env ZA_TEST_DATABASE_URL
           --redact-env ZA_TEST_DATABASE_ADMIN_URL
           --summary-json "$RUNNER_TEMP/reports/backend-postgres-summary.json"

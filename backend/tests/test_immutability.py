@@ -38,6 +38,8 @@ IMMUTABLE = {
     "catalog_content_release",       # RUL-REQ-027
     "catalog_controlled_set_version",  # RUL-REQ-014
     "catalog_fact_definition",       # "Released version immutable"; APP-REQ-005
+    # Migration 0011: an agent policy decision receipt is a completed result (IAM §16 evidence receipt; API-REQ-037)
+    "ai_policy_decision_receipt",
 }
 APPEND_ONLY = {
     "evidence_ledger_event",
@@ -49,6 +51,8 @@ APPEND_ONLY = {
     "evidence_conflict_event",
     "assurance_obligation_occurrence_event",
     "iam_role_assignment_event",  # Stage 4b, migration 0009: role assignment history (IAM-INV-09, IAM §22)
+    "ai_authority_grant_event",   # Stage 3c, migration 0011: agent authority grant history (IAM-INV-09, IAM §21)
+    "integration_connector_certification_event",  # Stage 3c, migration 0012: global certification history
 }
 GUARDED = {  # columns a legitimate code path still writes in place; everything else in the row is immutable
     "evidence_source_run": {"lifecycle", "completed_at", "evidence_ids"},       # IPE-INV-11, DAT-REQ-035
@@ -63,6 +67,15 @@ GUARDED = {  # columns a legitimate code path still writes in place; everything 
     "evidence_legal_hold_revision": {"status", "released_at"},
     "evidence_conflict": {"status", "disposition"},
     "assurance_obligation_occurrence": {"fulfilled_at", "evidence_ids"},
+    # Migration 0011: an agent authority grant changes only by revocation (IAM-REQ-015; REVOKED is final)
+    "ai_authority_grant": {"status"},
+    # Migration 0012: the global connector registry changes only in its certification and runtime-health dimensions
+    # (ZA-GLS-001 §07; the only runtime writer is app/engines/connectors.py)
+    "integration_connector_definition": {"certification", "runtime_health"},
+    # Migration 0013 (D2): contract versions are immutable certification subjects; only their GLS certification changes
+    # (ZA-IPE-001 §04/§11 "Immutable version"; IPE-REQ-029)
+    "integration_extraction_contract_version": {"status"},
+    "integration_mapping_contract_version": {"status"},
 }
 PROTECTED = IMMUTABLE | APPEND_ONLY | set(GUARDED)
 NO_RUNTIME_ACCESS = {"assure_context_key"}  # migration 0007: the context key pads; owner-only, no runtime privilege
@@ -82,11 +95,28 @@ COMPLETION = {
     "evidence_conflict": ("status = 'RESOLVED', disposition = 'probe'", "description = 'tampered'"),
     "assurance_obligation_occurrence": ("fulfilled_at = now(), evidence_ids = CAST('[\"za-probe\"]' AS json)",
                                         "due_at = due_at + interval '1 day'"),  # a real change (now() = insert time)
+    "ai_authority_grant": ("status = 'REVOKED'", "authority_level = 'A3'"),
+    "integration_connector_definition": ("certification = 'SUSPENDED', runtime_health = 'FAILED'",
+                                         "build_version = 'tampered'"),
+    "integration_extraction_contract_version": ("status = 'SUSPENDED'", "endpoint_id = 'tampered'"),
+    "integration_mapping_contract_version": ("status = 'SUSPENDED'", "source_schema_fingerprint = 'tampered'"),
 }
+# Global tables (no tenant_id, migration 0012): the runtime role writes them only in a verified platform-principal context.
+# None of them is created by a runtime path, so the runtime role holds no INSERT on them (DAT-REQ-027; review R039-03).
+RUNTIME_NO_INSERT = {"integration_connector_definition", "integration_extraction_contract_version",
+                     "integration_mapping_contract_version"}
+GLOBAL = {"integration_connector_definition", "integration_extraction_contract_version",
+          "integration_mapping_contract_version"}
 # Probe values a table's CHECK constraints need (the generic probe fills text columns with a tag).
 PROBE_VALUES = {
     "iam_role_assignment": lambda tenant: {"scope_type": "TENANT", "scope_id": tenant, "tenant_id": tenant,
                                            "status": "ACTIVE", "valid_to": None},
+    "ai_authority_grant": lambda _t: {"authority_level": "A1"},  # 0011 CHECK: ZA-DOM-001 vocabulary (R039-02)
+    "integration_extraction_contract_version": lambda _t: {"status": "UNASSESSED"},  # 0013 CHECK: GLS codes only
+    "integration_mapping_contract_version": lambda _t: {"status": "UNASSESSED"},
+    # 0013 CHECK: a connector-level history row carries both runtime-health values
+    "integration_connector_certification_event": lambda _t: {"from_runtime_health": "HEALTHY",
+                                                             "to_runtime_health": "HEALTHY"},
 }
 
 _PRIVILEGES_SQL = """
@@ -126,7 +156,10 @@ def _policy_mismatches(conn, schema: str) -> list[str]:
             if sel or ins or upd or dele or trunc or refs or trig or upd_cols:
                 out.append(f"{t}: runtime role holds a privilege on an owner-only table")
             continue
-        if not (sel and ins):
+        if t in RUNTIME_NO_INSERT:
+            if not sel or ins:
+                out.append(f"{t}: expected runtime SELECT without INSERT (no runtime writer creates these rows)")
+        elif not (sel and ins):
             out.append(f"{t}: runtime role lacks SELECT/INSERT")
         if trunc or refs or trig:
             out.append(f"{t}: runtime role holds TRUNCATE, REFERENCES or TRIGGER")  # ZA-DAT-001 §13
@@ -231,7 +264,7 @@ def test_completed_results_cannot_be_rewritten_even_by_the_owner_role(engines):
         with owner.connect() as c:
             tx = c.begin()
             try:
-                pk, key = _probe_row(c, t)
+                pk, key = _probe_row(c, t, **PROBE_VALUES.get(t, lambda _t: {})("za-probe-tenant"))
                 where = f"WHERE {pk} = :k"
                 _refused(c, f"UPDATE {t} SET {pk} = {pk} {where}", {"k": key}, f"{t} is append-only")
                 _refused(c, f"DELETE FROM {t} {where}", {"k": key}, f"{t} is append-only")
@@ -258,8 +291,14 @@ def test_guarded_rows_change_only_in_their_completion_columns(engines):
             tx = c.begin()
             try:
                 from conftest import stamp
-                stamp(c, TENANT)  # the API's signed tenant context (migration 0007)
-                pk, key = _probe_row(c, t, **{"tenant_id": TENANT, **PROBE_VALUES.get(t, lambda _t: {})(TENANT)})
+                if t in GLOBAL:  # a verified platform principal: no tenant, an authenticated actor
+                    stamp(c, None, actor="za-probe-platform")
+                    # no runtime INSERT on these (R039-03): probe an existing row; the transaction is rolled back
+                    pk = _pk(c, t)
+                    key = c.execute(text(f"SELECT {pk} FROM {t} LIMIT 1")).scalar_one()
+                else:
+                    stamp(c, TENANT)  # the API's signed tenant context (migration 0007)
+                    pk, key = _probe_row(c, t, **{"tenant_id": TENANT, **PROBE_VALUES.get(t, lambda _t: {})(TENANT)})
                 where = f"WHERE {pk} = :k"
                 assert c.execute(text(f"UPDATE {t} SET {allowed} {where}"), {"k": key}).rowcount == 1
                 _refused(c, f"UPDATE {t} SET {protected} {where}", {"k": key}, f"permission denied for table {t}")

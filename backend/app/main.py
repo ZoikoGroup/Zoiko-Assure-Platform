@@ -32,7 +32,17 @@ async def lifespan(_: FastAPI):
     # database verifies this process's context key; otherwise stop.
     if IS_POSTGRES:
         database = check_database()
-        revision = require_current(engine=engine)
+        # Development only, opt-in (ZA_AUTO_MIGRATE): an approved disposable database is migrated by a separate operator
+        # process (app/devmigrate.py), so this process still never holds the migration credential. Unset: no change.
+        from .devmigrate import startup_auto_migrate
+        from .migrate import SchemaVersionError
+        refused = startup_auto_migrate()
+        try:
+            revision = require_current(engine=engine)
+        except SchemaVersionError as e:
+            if refused:
+                raise SchemaVersionError(f"{e} Automatic migration was not performed: {refused}") from None
+            raise
         with engine.connect() as conn:
             verify_runtime_role(conn)
             verify_context_key(conn)

@@ -8,6 +8,7 @@ import { Bell, Building, ChevronDown, HelpCircle, KeyRound, Loader2, LogOut, Men
 import { api } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
+import SCREEN_ACCESS from "@/lib/screen-access.json";
 import { isStandalone, jumpTargets, navFor, orgNav, orgSection, routeMeta } from "./nav";
 import {
   Breadcrumb, Drawer, Dropdown, DropdownItem, ErrorBox, Field, IconButton, Modal, PageTitleProvider, SearchInput, ToastProvider,
@@ -17,8 +18,15 @@ import {
 const initials = (n?: string) => (n ?? "?").replace(/\(.*\)/, "").trim().split(/\s+/).slice(0, 2).map((x) => x[0]).join("").toUpperCase();
 const shortName = (n?: string) => (n ?? "").replace(/\s*\(.*\)/, "");
 
-/** Open work for the alerts menu, and the entity count for the organisation sidebar's scope (from /dashboard). */
-type OpenWork = { issues: number; facts: number; entities: number };
+/** Open work for the alerts menu, and the entity count for the organisation sidebar's scope (null: not readable by
+ *  this person's roles). */
+type OpenWork = { issues: number; facts: number; entities: number | null };
+
+/** Whether the shell's own background reads (record watermark, alert counts, entity scope) will be served to someone
+ *  with `permissions`. Generated from the backend guards (lib/screen-access.json `shell`): a read that would be refused
+ *  is not made, so an ordinary page view never records a refusal (every refusal is an audit record, IAM-REQ-037). */
+const SHELL = SCREEN_ACCESS.shell;
+const mayRead = (read: { perms: string[] }, permissions?: readonly string[]) => read.perms.some((p) => permissions?.includes(p));
 
 /* A page that shows synthetic demonstration figures raises the header's "Synthetic demo data" badge while mounted. */
 const SyntheticCtx = createContext<(on: boolean) => void>(() => {});
@@ -58,11 +66,12 @@ function Frame({ children }: { children: React.ReactNode }) {
   useEffect(() => setMobile(false), [path]);
   useEffect(() => {
     setWork(null);
-    if (!me?.tenant_id) return;
+    if (!me?.tenant_id || !mayRead(SHELL.attention, me.permissions)) return;
     // Only the two counts (/dashboard/attention), not the full /dashboard aggregation: this runs on every full page
     // load. The organisation sidebar's entity count comes from the organisation record, the same legal entities.
-    Promise.all([api("/dashboard/attention"), api("/org/tenant")])
-      .then(([a, t]) => setWork({ issues: a.open_issues, facts: a.open_fact_requests, entities: t.entities.length })).catch(() => {});
+    const entities = mayRead(SHELL.entity_scope, me.permissions) ? api("/org/tenant") : Promise.resolve(null);
+    Promise.all([api("/dashboard/attention"), entities])
+      .then(([a, t]) => setWork({ issues: a.open_issues, facts: a.open_fact_requests, entities: t ? t.entities.length : null })).catch(() => {});
   }, [me]);
 
   if (path === "/login") return <>{children}</>;
@@ -210,7 +219,7 @@ function SidebarBody({ narrow, path, onToggle, showContext }: { narrow: boolean;
       {showContext && <div className="flex shrink-0 border-b border-slate-200 px-2.5 py-2 [&>span]:w-full"><WorkContext /></div>}
 
       <nav ref={navRef} className={`flex-1 overflow-y-auto overflow-x-hidden py-2 ${narrow ? "no-scrollbar px-2" : "scroll-thin px-2.5"}`}>
-        {navFor(personaOf(me)).map((g, gi) => {
+        {navFor(personaOf(me), me?.permissions).map((g, gi) => {
           const headingId = `nav-group-${gi}`;
           return (
           <div key={g.group} role="group" aria-labelledby={narrow ? undefined : headingId} aria-label={narrow ? g.group : undefined} className="mb-2">
@@ -262,13 +271,16 @@ const ORG_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible
 /** The Organization Workspace sidebar: dark navy, grouped as ORG_NAV. A section's other screens are listed beneath it
  *  while one of them is open; collapsed, every item is an icon with a tooltip. The footer names the organisation and how
  *  many legal entities the server returned for it. */
-function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; path: string; onToggle?: () => void; entities?: number }) {
+function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; path: string; onToggle?: () => void; entities?: number | null }) {
   const { me } = useAuth();
   const current = routeMeta(path)?.item.href;
   const navRef = useRef<HTMLElement>(null);
   useEffect(() => { navRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "nearest" }); }, [current]);
-  const scope = entities === undefined ? null : `${entities} ${entities === 1 ? "entity" : "entities"} • policy checked`;
-  const scopeTitle = `Organization ${me?.tenant_name ?? ""}. The server authorizes every request against your roles and this organization's boundary; ${scope ? `it returned ${entities} legal ${entities === 1 ? "entity" : "entities"}.` : "entities are loading."}`;
+  // null: this person's roles do not read the organisation record (e.g. a security administrator or external auditor).
+  const unreadable = entities === null || (entities === undefined && !mayRead(SHELL.entity_scope, me?.permissions));
+  const scope = unreadable ? "policy checked" : entities === undefined ? null : `${entities} ${entities === 1 ? "entity" : "entities"} • policy checked`;
+  const scopeTitle = `Organization ${me?.tenant_name ?? ""}. The server authorizes every request against your roles and this organization's boundary; ${
+    unreadable ? "your roles do not include reading its legal entities." : scope ? `it returned ${entities} legal ${entities === 1 ? "entity" : "entities"}.` : "entities are loading."}`;
 
   const link = (href: string, label: string, icon: LucideIcon, sub: boolean, highlighted: boolean) => {
     const here = href === current;
@@ -304,7 +316,7 @@ function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; pat
       </div>
 
       <nav ref={navRef} className={`flex-1 overflow-y-auto overflow-x-hidden pb-4 ${narrow ? "no-scrollbar px-3 pt-2" : "scroll-thin px-[11px] pt-3"}`}>
-        {orgNav().map((g, gi) => {
+        {orgNav(me?.permissions).map((g, gi) => {
           const headingId = `org-nav-group-${gi}`;
           return (
             <div key={g.group} role="group" aria-labelledby={narrow ? undefined : headingId} aria-label={narrow ? g.group : undefined} className={narrow ? "" : "pt-6 first:pt-3"}>
@@ -377,12 +389,17 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
   const [mac, setMac] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
+  // The record watermark, polled only for someone the server will serve it to (lib/screen-access.json `shell`); for
+  // anyone else every poll would be a refusal recorded in the audit trail.
+  const watermarkReadable = mayRead(SHELL.watermark, me?.permissions);
   useEffect(() => {
+    setWm(null);
+    if (!watermarkReadable) return;
     const t = () => api("/watermark").then(setWm).catch(() => setWm(null));
     t();
     const h = setInterval(t, 10000);
     return () => clearInterval(h);
-  }, []);
+  }, [watermarkReadable]);
   // Organisation header: "/" (when not typing) or ⌘K / Ctrl+K moves focus to the search, unless a dialog is open.
   useEffect(() => {
     if (!org) return;
@@ -410,7 +427,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
   const orgCrumbs = path === "/" ? [{ label: "Zoiko Assure" }, { label: "Organization" }]
     : [{ label: "Zoiko Assure", href: "/" }, ...(section ? [{ label: section.group }] : []),
       ...(meta ? [{ label: meta.item.label, href: meta.item.href }] : []), ...(meta?.isDetail && title ? [{ label: title }] : [])];
-  const hits = useMemo(() => (q ? jumpTargets(personaOf(me)).filter((i) => `${i.label} ${i.group}`.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, me]);
+  const hits = useMemo(() => (q ? jumpTargets(personaOf(me), me?.permissions).filter((i) => `${i.label} ${i.group}`.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, me]);
   const pending = (alerts?.issues ?? 0) + (alerts?.facts ?? 0);
   // Record watermark: always visible ("derived projection watermark is always visible", Vol. 1 NFRs). Phones show it
   // under the breadcrumb, wider screens beside the account controls; the cell is added where space allows.

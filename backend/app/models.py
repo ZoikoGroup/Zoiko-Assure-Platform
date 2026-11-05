@@ -1017,6 +1017,36 @@ class ConnectorDefinition(Base):
     known_limitations: Mapped[list] = mapped_column(JSON, default=list)
 
 
+CERT_EVENT_SUBJECT_CHECK = (
+    "(subject_type = 'CONNECTOR_DEFINITION' AND subject_id IS NULL AND from_runtime_health IS NOT NULL "
+    "AND to_runtime_health IS NOT NULL) OR (subject_type IN ('EXTRACTION_CONTRACT_VERSION', 'MAPPING_CONTRACT_VERSION') "
+    "AND subject_id IS NOT NULL AND from_runtime_health IS NULL AND to_runtime_health IS NULL)")
+
+
+class ConnectorCertificationEvent(Base):
+    """Append-only history of the global certification registry (Stage 3c; migration 0012). One row per effective change
+    of certification and/or runtime health, kept as separate dimensions (GLS-REQ-017). No tenant: the registry is global;
+    the database lets only a verified platform principal write it (docs/connector-certification-history-design.md)."""
+    __tablename__ = "integration_connector_certification_event"
+    __table_args__ = (CheckConstraint(CERT_EVENT_SUBJECT_CHECK, name="ck_connector_certification_event_subject"),)
+    event_id: Mapped[str] = _id()
+    connector_id: Mapped[str] = mapped_column(String(36), index=True)
+    # Migration 0013 (D2): the certified subject. CONNECTOR_DEFINITION (the registry row; subject_id NULL) or an exact
+    # contract version; runtime health exists only for the connector itself (ZA-GLS-001 §07).
+    subject_type: Mapped[str] = mapped_column(String(32), default="CONNECTOR_DEFINITION", server_default="CONNECTOR_DEFINITION")
+    subject_id: Mapped[str | None] = mapped_column(String(36))
+    build_version: Mapped[str] = mapped_column(String(32))
+    from_certification: Mapped[str] = mapped_column(String(32))
+    to_certification: Mapped[str] = mapped_column(String(32))
+    from_runtime_health: Mapped[str | None] = mapped_column(String(32))
+    to_runtime_health: Mapped[str | None] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str] = mapped_column(Text)
+    prior_event_id: Mapped[str | None] = mapped_column(String(36))
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
 class ConnectorInstallation(Base):
     __tablename__ = "integration_connector_installation_revision"
     installation_id: Mapped[str] = _id()
@@ -1030,10 +1060,18 @@ class ConnectorInstallation(Base):
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
 
 
+# Migration 0013 (D2): a contract version is an immutable, uniquely identified certification subject (ZA-IPE-001 §04/§11,
+# IPE-REQ-028/029). Only `status` (its ZA-GLS-001 certification code) changes, through app/engines/connectors.py.
+CONTRACT_CERTIFICATION_CHECK = "status IN ('UNASSESSED', 'CERTIFIED', 'SUSPENDED', 'REVOKED')"
+
+
 class ExtractionContractVersion(Base):
     __tablename__ = "integration_extraction_contract_version"
+    __table_args__ = (UniqueConstraint("connector_id", "version", name="uq_extraction_contract_connector_version"),
+                      CheckConstraint(CONTRACT_CERTIFICATION_CHECK, name="ck_extraction_contract_certification"))
     extraction_contract_version_id: Mapped[str] = _id()
-    connector_id: Mapped[str] = mapped_column(String(36))
+    connector_id: Mapped[str] = mapped_column(ForeignKey("integration_connector_definition.connector_id",
+                                                         name="fk_extraction_contract_connector"))
     version: Mapped[int] = mapped_column(Integer)
     source_object: Mapped[str] = mapped_column(String(120))
     endpoint_id: Mapped[str] = mapped_column(String(200))
@@ -1050,8 +1088,11 @@ class ExtractionContractVersion(Base):
 
 class MappingContractVersion(Base):
     __tablename__ = "integration_mapping_contract_version"
+    __table_args__ = (UniqueConstraint("connector_id", "version", name="uq_mapping_contract_connector_version"),
+                      CheckConstraint(CONTRACT_CERTIFICATION_CHECK, name="ck_mapping_contract_certification"))
     mapping_contract_version_id: Mapped[str] = _id()
-    connector_id: Mapped[str] = mapped_column(String(36))
+    connector_id: Mapped[str] = mapped_column(ForeignKey("integration_connector_definition.connector_id",
+                                                         name="fk_mapping_contract_connector"))
     version: Mapped[int] = mapped_column(Integer)
     source_schema_fingerprint: Mapped[str] = mapped_column(String(64))
     source_fields: Mapped[list] = mapped_column(JSON)
@@ -1080,8 +1121,11 @@ class SourceRun(Base):
     entity_id: Mapped[str] = mapped_column(String(36))
     installation_id: Mapped[str] = mapped_column(String(36))
     connector_build: Mapped[str] = mapped_column(String(32))
-    extraction_contract_version_id: Mapped[str] = mapped_column(String(36))
-    mapping_contract_version_id: Mapped[str] = mapped_column(String(36))
+    # IPE-REQ-002: exact contract versions; migration 0013 makes the references foreign keys
+    extraction_contract_version_id: Mapped[str] = mapped_column(ForeignKey(
+        "integration_extraction_contract_version.extraction_contract_version_id", name="fk_source_run_extraction_contract"))
+    mapping_contract_version_id: Mapped[str] = mapped_column(ForeignKey(
+        "integration_mapping_contract_version.mapping_contract_version_id", name="fk_source_run_mapping_contract"))
     ipe_policy_version_id: Mapped[str] = mapped_column(String(36))
     actual_scopes: Mapped[list] = mapped_column(JSON)
     request_parameters: Mapped[dict] = mapped_column(JSON)
@@ -1175,6 +1219,9 @@ class AIAssetVersion(Base):
 
 class AuthorityGrant(Base):
     __tablename__ = "ai_authority_grant"
+    # ZA-DOM-001 §10.2 authority vocabulary (migration 0011; DAT-REQ-039 review R039-02)
+    __table_args__ = (CheckConstraint("authority_level IN ('A0', 'A1', 'A2', 'A3', 'A4')",
+                                      name="ck_ai_authority_grant_level"),)
     grant_id: Mapped[str] = _id()
     tenant_id: Mapped[str] = mapped_column(String(36), index=True)
     agent_subject_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -1184,8 +1231,31 @@ class AuthorityGrant(Base):
     reversibility: Mapped[str] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(TS)
     granted_by: Mapped[str] = mapped_column(String(36))
+    # A projection of ai_authority_grant_event since migration 0011: only `status` changes in place (ACTIVE ->
+    # REVOKED, written by app/engines/governance.py), REVOKED is final, and no row is deleted.
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
     fail_mode: Mapped[str] = mapped_column(String(16), default="FAIL_CLOSED")
+    created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
+
+
+class AuthorityGrantEvent(Base):
+    """Append-only history of an agent AuthorityGrant (Roadmap Stage 3c; migration 0011). IAM-INV-09: grant changes are
+    versioned and auditable; ZA-IAM-001 §21: issue/revoke carry grant, action/authority, scope, expiry, grantor."""
+    __tablename__ = "ai_authority_grant_event"
+    event_id: Mapped[str] = _id()
+    grant_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True)
+    agent_subject_id: Mapped[str] = mapped_column(String(36))
+    event_type: Mapped[str] = mapped_column(String(32))  # ISSUED, REVOKED
+    from_status: Mapped[str | None] = mapped_column(String(32))
+    to_status: Mapped[str] = mapped_column(String(32))
+    action_class: Mapped[str] = mapped_column(String(120))
+    authority_level: Mapped[str] = mapped_column(String(8))
+    scope: Mapped[str] = mapped_column(String(200))
+    expires_at: Mapped[datetime] = mapped_column(TS)
+    actor_id: Mapped[str] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    record_seq: Mapped[int] = mapped_column(BigInteger, index=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
 
 

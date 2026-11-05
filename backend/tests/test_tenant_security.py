@@ -26,6 +26,10 @@ PLATFORM_ACTOR = "t2-pg-platform-probe"
 PLATFORM_LOGS = ("platform_audit_event", "platform_outbox_event")
 IDENTITY = ("auth_session", "auth_credential")
 ROLE_REGISTRY = ("iam_role_assignment", "iam_role_assignment_event")  # migration 0009
+# Global tables with no tenant (migration 0012): every runtime context reads the registry; only a verified platform
+# principal writes it or reads and writes its history.
+GLOBAL_REGISTRY = ("integration_connector_definition", "integration_connector_certification_event",
+                   "integration_extraction_contract_version", "integration_mapping_contract_version")  # + 0013
 PG_USER, PG_EMAIL = "t2-pg-user", "t2.pg.user@test.example"
 DAT13_ROLES = ("assure_table_owner", "assure_migrator", "assure_app_rw", "assure_app_ro", "assure_outbox_publisher",
                "assure_catalog_loader", "assure_analytics_ro", "assure_breakglass_admin")
@@ -299,8 +303,9 @@ def test_every_tenant_and_identity_table_has_forced_rls_and_reviewed_policies(pg
         tenant_tables = set(_tenant_tables(c))
         policies = c.execute(text("SELECT tablename, policyname, cmd, roles::text, coalesce(qual, ''), "
                                   "coalesce(with_check, '') FROM pg_policies WHERE schemaname = 'public'")).all()
-    assert len(tenant_tables) == 50  # 42 + 6 Stage 3c governance event tables + 2 Stage 4b role registry tables
-    for t in tenant_tables | set(IDENTITY):
+    # 42 + 6 Stage 3c governance event tables + 2 Stage 4b role registry tables + the 0011 authority grant event table
+    assert len(tenant_tables) == 51
+    for t in tenant_tables | set(IDENTITY) | set(GLOBAL_REGISTRY):
         assert flags[t] == (True, True), t  # RLS enabled and forced (DAT-REQ-003, TEN-REQ-022)
     by_table: dict[str, set] = {}
     for table, name, cmd, roles, qual, check in policies:
@@ -311,7 +316,14 @@ def test_every_tenant_and_identity_table_has_forced_rls_and_reviewed_policies(pg
         if name == "migrator_all":
             assert roles == "{assure_migrator}", table
         assert "app.tenant_id" not in qual + check and "current_setting" not in qual + check, table
-    assert set(by_table) == tenant_tables | set(IDENTITY)
+    assert set(by_table) == tenant_tables | set(IDENTITY) | set(GLOBAL_REGISTRY)
+    assert by_table["integration_connector_definition"] == {("registry_read", "SELECT"), ("registry_platform_update", "UPDATE"),
+                                                         ("migrator_all", "ALL")}  # no runtime INSERT (R039-03)
+    assert by_table["integration_connector_certification_event"] == {("registry_history_read", "SELECT"),
+                                                                  ("registry_history_insert", "INSERT"), ("migrator_all", "ALL")}
+    for t in ("integration_extraction_contract_version", "integration_mapping_contract_version"):  # migration 0013
+        assert by_table[t] == {("contract_read", "SELECT"), ("contract_platform_update", "UPDATE"),
+                               ("migrator_all", "ALL")}, t  # no runtime INSERT (R039-03)
     for t in tenant_tables - set(PLATFORM_LOGS) - set(ROLE_REGISTRY) - {"org_actor"}:
         assert by_table[t] == {("tenant_isolation", "ALL"), ("migrator_all", "ALL")}, t
     for t in ROLE_REGISTRY:  # Zoiko platform principals' assignments: readable by a verified platform principal only

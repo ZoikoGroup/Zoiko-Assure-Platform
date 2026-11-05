@@ -61,6 +61,8 @@ const PERMISSIONS: Record<string, string> = {
   manage_organisations: "Create and administer customer organisations (registry only)",
 };
 
+/** Every role code the backend catalogue defines, in display order (for filters). */
+export const ROLE_CODES = Object.keys(ROLES);
 export const roleLabel = (code: string) => ROLES[code]?.label ?? code;
 export const roleAbout = (code: string) => ROLES[code]?.about;
 export const permissionText = (code: string) => PERMISSIONS[code] ?? code;

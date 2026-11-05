@@ -1,0 +1,325 @@
+{
+ "_doc": "Sidebar screen -> the GET endpoints it loads when it opens, and the permissions that let a person open it. A sidebar item is shown when the signed-in person holds one of `perms` organisation- or platform-wide; `perms` is the intersection of what the backend guards of every listed read accept, so a visible item never answers 403 on load. Screens without reads (self-service or static) have no `perms` and are always shown to their personas. Navigation only: the backend authorises every request. `reads` is maintained by hand; `perms` is generated from the backend operation registry and checked by backend/tests/test_sidebar_integration.py. `shell` lists the header and sidebar-footer reads every page makes (record watermark, alert counts, entity scope); they are made only for someone holding one of their `perms`, so a page view never records a refusal. `panels` lists in-page panels that are shown only to people holding one of their `perms` (for example the Team & Access directory and role registry).",
+ "_generated_by": "python tests/test_sidebar_integration.py  (from backend/)",
+ "screens": {
+  "/regulatory": {
+   "reads": [
+    "/catalog/sources"
+   ],
+   "perms": [
+    "audit_read",
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "read"
+   ]
+  },
+  "/sources": {
+   "reads": [
+    "/catalog/instruments",
+    "/catalog/obligation-definitions",
+    "/catalog/fact-definitions",
+    "/catalog/controls"
+   ],
+   "perms": [
+    "audit_read",
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "read"
+   ]
+  },
+  "/rules": {
+   "reads": [
+    "/rules/drafts",
+    "/rules/versions"
+   ],
+   "perms": [
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "read"
+   ]
+  },
+  "/rules/workbench": {
+   "reads": [
+    "/rules/drafts"
+   ],
+   "perms": [
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "read"
+   ]
+  },
+  "/entities": {
+   "reads": [
+    "/org/tenant",
+    "/org/subjects"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/applicability": {
+   "reads": [
+    "/applicability/determinations",
+    "/applicability/evaluations"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/fact-requests": {
+   "reads": [
+    "/fact-requests"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/applicability/trace": {
+   "reads": [
+    "/applicability/evaluations"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/obligations": {
+   "reads": [
+    "/obligations"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/controls": {
+   "reads": [
+    "/controls"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/assurance": {
+   "reads": [
+    "/obligations",
+    "/org/tenant"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/governance": {
+   "reads": [
+    "/exceptions"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/evidence": {
+   "reads": [
+    "/evidence",
+    "/evidence-conflicts"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/ipe": {
+   "reads": [
+    "/ipe/anomalies",
+    "/ipe/policies"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/ipe/runs": {
+   "reads": [
+    "/ipe/source-runs"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/packages": {
+   "reads": [
+    "/packages",
+    "/org/tenant",
+    "/obligations",
+    "/trust/public-key"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/history": {
+   "reads": [
+    "/org/subjects",
+    "/catalog/obligation-definitions",
+    "/watermark"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/ledger": {
+   "reads": [
+    "/ledger"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/ai": {
+   "reads": [
+    "/ai/assets"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/connectors": {
+   "reads": [
+    "/connectors"
+   ],
+   "perms": [
+    "certify_connectors",
+    "read"
+   ]
+  },
+  "/admin/cells": {
+   "reads": [
+    "/org/tenant"
+   ],
+   "perms": [
+    "read"
+   ]
+  },
+  "/admin/releases": {
+   "reads": [
+    "/catalog/releases"
+   ],
+   "perms": [
+    "audit_read",
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "read"
+   ]
+  },
+  "/admin/retention": {
+   "reads": [
+    "/evidence"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "/admin/access-log": {
+   "reads": [
+    "/audit-events"
+   ],
+   "perms": [
+    "read"
+   ]
+  }
+ },
+ "shell": {
+  "watermark": {
+   "reads": [
+    "/watermark"
+   ],
+   "perms": [
+    "audit_read",
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "read"
+   ]
+  },
+  "attention": {
+   "reads": [
+    "/dashboard/attention"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  },
+  "entity_scope": {
+   "reads": [
+    "/org/tenant"
+   ],
+   "perms": [
+    "read"
+   ]
+  }
+ },
+ "panels": {
+  "directory": {
+   "reads": [
+    "/actors"
+   ],
+   "perms": [
+    "certify_connectors",
+    "content_author",
+    "content_legal_review",
+    "content_peer_review",
+    "content_release",
+    "delegate_admin",
+    "manage_organisations",
+    "manage_role_assignments",
+    "read"
+   ]
+  },
+  "role_registry": {
+   "reads": [
+    "/roles",
+    "/role-assignments"
+   ],
+   "perms": [
+    "delegate_admin",
+    "manage_role_assignments"
+   ]
+  },
+  "principal_sessions": {
+   "reads": [
+    "/principals/{principal_id}/sessions"
+   ],
+   "perms": [
+    "manage_role_assignments"
+   ]
+  },
+  "overview": {
+   "reads": [
+    "/dashboard",
+    "/controls",
+    "/ipe/anomalies"
+   ],
+   "perms": [
+    "audit_read",
+    "read"
+   ]
+  }
+ }
+}

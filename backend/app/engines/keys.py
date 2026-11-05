@@ -67,9 +67,12 @@ def decrypt_payload(tenant_id: str, evidence_id: str, ciphertext: bytes, wrapped
     return AESGCM(dek).decrypt(ciphertext[:12], ciphertext[12:], aad)
 
 
+SIGNING_KEY_FILE = KEY_DIR / "cell-signing-ed25519.pem"
+
+
 @lru_cache
 def signing_key() -> Ed25519PrivateKey:
-    p = KEY_DIR / "cell-signing-ed25519.pem"
+    p = SIGNING_KEY_FILE
     if not p.exists():
         k = Ed25519PrivateKey.generate()
         p.write_bytes(k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
@@ -82,9 +85,35 @@ def public_key_pem() -> str:
                                                    serialization.PublicFormat.SubjectPublicKeyInfo).decode()
 
 
-def signer_key_id() -> str:
-    raw = signing_key().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+def key_id_of(pub: Ed25519PublicKey) -> str:
+    """The key identifier releases record: algorithm prefix + truncated SHA-256 of the raw public key."""
+    raw = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return "ed25519:" + hashlib.sha256(raw).hexdigest()[:16]
+
+
+def signer_key_id() -> str:
+    return key_id_of(signing_key().public_key())
+
+
+# ---------------------------------------------------------------- read-only access for verification (A9b)
+# Verification must never create, replace or expose a private key: these read an existing key only.
+def existing_public_key() -> Ed25519PublicKey | None:
+    """The cell signing key's public part if a key already exists; None otherwise (no key is generated)."""
+    if not SIGNING_KEY_FILE.exists():
+        return None
+    return signing_key().public_key()
+
+
+def public_pem_of(pub: Ed25519PublicKey) -> str:
+    return pub.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+
+def verify_with(pub: Ed25519PublicKey, data: bytes, signature: bytes) -> bool:
+    try:
+        pub.verify(signature, data)
+        return True
+    except Exception:  # noqa: BLE001 - any failure is "not verified"; the caller reports INVALID
+        return False
 
 
 def sign(data: bytes) -> str:

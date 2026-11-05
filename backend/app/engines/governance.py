@@ -7,6 +7,7 @@ Preserves durable, append-only, auditable governance history for mutable governa
 - Legal holds (evidence_legal_hold_event)
 - Evidence conflicts (evidence_conflict_event)
 - Obligation occurrences (assurance_obligation_occurrence_event)
+- Agent authority grants (ai_authority_grant_event; migration 0011)
 """
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import (
+    AuthorityGrant,
+    AuthorityGrantEvent,
     Compensation,
     CompensationEvent,
     EvidenceArtifact,
@@ -147,6 +150,13 @@ def propose_compensation(
     valid_from: datetime,
     valid_to: datetime | None = None,
 ) -> tuple[Compensation, CompensationEvent]:
+    problems = compensation_problems(db, tenant_id=tenant_id, obligation_lineage_id=obligation_lineage_id,
+                                     primary_control_key=primary_control_key,
+                                     compensating_expression=compensating_expression, valid_from=valid_from,
+                                     valid_to=valid_to)
+    if len((equivalence_rationale or "").strip()) < 20:  # STA §09: "source/control rationale required"
+        problems.insert(0, (422, "EQUIVALENCE_RATIONALE_REQUIRED", "an equivalence rationale is required"))
+    _refuse(problems)
     seq = next_record_seq(db)
     c = Compensation(
         tenant_id=tenant_id,
@@ -181,6 +191,74 @@ def propose_compensation(
     return c, ev
 
 
+def _current_expression(db: Session, tenant_id: str, lineage_id: str) -> SatisfactionExpressionVersion | None:
+    return db.execute(select(SatisfactionExpressionVersion).where(
+        SatisfactionExpressionVersion.tenant_id == tenant_id,
+        SatisfactionExpressionVersion.obligation_lineage_id == lineage_id)
+        .order_by(SatisfactionExpressionVersion.version.desc())).scalars().first()
+
+
+def _wrappable(node: dict, key: str) -> bool:
+    """Whether ``_wrap_comp_node`` would find a CONTROL leaf for ``key`` (the same traversal: the root and ``children``).
+    A leaf already inside a COMPENSATION branch is not re-wrapped."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("node_type") == "CONTROL" and node.get("control_key") == key:
+        return True
+    return any(_wrappable(c, key) for c in node.get("children") or [])
+
+
+def _control_keys_of(node) -> list[str]:
+    if not isinstance(node, dict):
+        return []
+    own = [node["control_key"]] if node.get("node_type") == "CONTROL" and node.get("control_key") else []
+    return own + [k for c in node.get("children") or [] for k in _control_keys_of(c)]
+
+
+def compensation_problems(db: Session, *, tenant_id: str, obligation_lineage_id: str, primary_control_key: str,
+                          compensating_expression: dict, valid_from: datetime, valid_to: datetime | None
+                          ) -> list[tuple[int, str, str]]:
+    """Why a compensation cannot be proposed or approved (audit F-03), as (status, code, message) triples.
+
+    ZA-STA-001 §09: compensating_expression is "One or more controls expressed through normal SatisfactionExpression
+    nodes"; primary_scope is the "Exact control/obligation branch being compensated"; "compensation cannot apply outside
+    approved interval". STA-REQ-013: explicitly modelled, scoped, bitemporal, independently evidenced. Checked at
+    proposal and again at approval, so a record that predates these checks cannot be approved into an expression."""
+    from ..models import ControlDefinition
+    from .assurance import expression_problems
+    out: list[tuple[int, str, str]] = []
+    structure = expression_problems(compensating_expression)
+    keys = _control_keys_of(compensating_expression)
+    if structure or not keys:
+        out.append((422, "COMPENSATING_EXPRESSION_INVALID",
+                    "; ".join(structure) or "the compensating expression names no control (ZA-STA-001 §09)"))
+    if len(set(keys)) != len(keys):
+        out.append((422, "DUPLICATE_COMPENSATING_CONTROL", "a compensating control is named more than once"))
+    if primary_control_key in keys:
+        out.append((422, "PRIMARY_CONTROL_COMPENSATES_ITSELF", "the primary control cannot be its own compensation"))
+    named = sorted({primary_control_key, *keys})
+    known = {k for (k,) in db.execute(select(ControlDefinition.key).where(ControlDefinition.key.in_(named)))}
+    if set(named) - known:
+        out.append((422, "UNKNOWN_CONTROL_DEFINITION", f"unknown control definition key(s): {sorted(set(named) - known)}"))
+    if valid_to is not None and ensure_utc(valid_to) <= ensure_utc(valid_from):
+        out.append((422, "COMPENSATION_PERIOD_EMPTY", "valid_to must be later than valid_from (half-open, non-empty)"))
+    cur = _current_expression(db, tenant_id, obligation_lineage_id)
+    if cur is None:
+        out.append((409, "NO_EXPRESSION_TO_COMPENSATE", "the obligation has no SatisfactionExpressionVersion"))
+    elif not _wrappable(cur.ast, primary_control_key):
+        out.append((409, "PRIMARY_CONTROL_NOT_IN_EXPRESSION",
+                    f"{primary_control_key} is not a compensable CONTROL leaf of the obligation's current expression "
+                    f"(version {cur.version})"))
+    return out
+
+
+def _refuse(problems: list[tuple[int, str, str]]) -> None:
+    if problems:
+        status = 422 if any(p[0] == 422 for p in problems) else 409
+        raise HTTPException(status, {"error": problems[0][1], "message": "; ".join(p[2] for p in problems),
+                                     "problems": [{"code": c, "message": m} for _, c, m in problems]})
+
+
 def _wrap_comp_node(node: dict, key: str, comp: Compensation) -> dict:
     if node.get("node_type") == "CONTROL" and node.get("control_key") == key:
         return {"node_type": "COMPENSATION", "node_id": f"compensation_{comp.compensation_id[:8]}", "primary": node,
@@ -203,18 +281,35 @@ def decide_compensation(
     c = db.get(Compensation, comp_id)
     if not c or c.tenant_id != tenant_id:
         raise HTTPException(404, "Compensation not found")
-    seq = next_record_seq(db)
+    # One decision at a time per obligation (engines/locks.py), then re-read: two approvals cannot both write expression
+    # version N+1, and a decision that waited sees the other's committed status.
+    from .locks import xact_lock
+    xact_lock(db, "satisfaction-expression", tenant_id, c.obligation_lineage_id)
+    c = db.execute(select(Compensation).where(Compensation.compensation_id == comp_id)
+                   .execution_options(populate_existing=True)).scalars().first()
     prior = c.status
+    new_ast = cur = None
     if decision == "APPROVE":
         if prior != "PENDING_APPROVAL":
             raise HTTPException(409, "not pending")
+        # Re-validated at approval, before anything is written: a proposal recorded before these checks, or whose
+        # primary branch has since left the expression, cannot be approved into a vacuous or unanchored branch.
+        _refuse(compensation_problems(db, tenant_id=tenant_id, obligation_lineage_id=c.obligation_lineage_id,
+                                      primary_control_key=c.primary_control_key,
+                                      compensating_expression=c.compensating_expression, valid_from=c.valid_from,
+                                      valid_to=c.valid_to))
+        from .assurance import expression_problems
+        cur = _current_expression(db, tenant_id, c.obligation_lineage_id)
+        new_ast = _wrap_comp_node(copy.deepcopy(cur.ast), c.primary_control_key, c)
+        problems = expression_problems(new_ast)
+        if problems or new_ast == cur.ast:
+            raise HTTPException(409, {"error": "COMPENSATED_EXPRESSION_INVALID",
+                                      "message": "; ".join(problems) or "approval would not change the expression"})
+    seq = next_record_seq(db)
+    if decision == "APPROVE":
         c.status = "APPROVED"
         c.approved_by = actor_id
-        cur = db.execute(select(SatisfactionExpressionVersion).where(
-            SatisfactionExpressionVersion.obligation_lineage_id == c.obligation_lineage_id)
-            .order_by(SatisfactionExpressionVersion.version.desc())).scalars().first()
         if cur:
-            new_ast = _wrap_comp_node(copy.deepcopy(cur.ast), c.primary_control_key, c)
             db.add(SatisfactionExpressionVersion(
                 tenant_id=tenant_id,
                 obligation_lineage_id=c.obligation_lineage_id,
@@ -601,3 +696,100 @@ def fulfil_occurrence(
          aggregate_id=occurrence_id, tenant_id=tenant_id, record_seq=seq, payload={"late": is_late})
     return o, ev
 
+
+
+# ==============================================================================
+# 7. Agent authority grants (ai_authority_grant_event; migration 0011)
+# ==============================================================================
+# IAM-INV-09 (grant changes versioned and auditable), IAM-REQ-030 (grant per action class + scope + expiry + level),
+# IAM-REQ-015 / IAM-INV-07 (revocation stops new authorisation at once; REVOKED is final: IAM §05 "prior grants are not
+# automatically restored"), IAM §21 (audit content), ZA-EVT-001 authority_grant.issued / authority_grant.revoked,
+# DAT-REQ-014 (projection, event, audit and outbox in one transaction), EVT-REQ-025 (minimised outbox payload).
+
+def _grant_audit_text(g: AuthorityGrant) -> str:
+    """IAM §21 minimum content for authority_grant.issued / revoked: grant, action/authority, scope, expiry (the
+    grantor or revoker is the audit record's actor)."""
+    return (f"action_class={g.action_class}; authority={g.authority_level}; scope={g.scope}; "
+            f"expires_at={ensure_utc(g.expires_at).isoformat()}")
+
+
+def _grant_event(g: AuthorityGrant, *, event_type: str, from_status: str | None, actor_id: str, reason: str | None,
+                 seq: int) -> AuthorityGrantEvent:
+    return AuthorityGrantEvent(
+        grant_id=g.grant_id, tenant_id=g.tenant_id, agent_subject_id=g.agent_subject_id, event_type=event_type,
+        from_status=from_status, to_status=g.status, action_class=g.action_class, authority_level=g.authority_level,
+        scope=g.scope, expires_at=g.expires_at, actor_id=actor_id, reason=reason, record_seq=seq)
+
+
+def _grant_payload(g: AuthorityGrant) -> dict:
+    # Identifiers and controlled values only: action_class and scope are free text in this version (EVT-REQ-025).
+    return {"grant_id": g.grant_id, "agent_subject_id": g.agent_subject_id, "authority_level": g.authority_level,
+            "expires_at": ensure_utc(g.expires_at).isoformat()}
+
+
+def issue_authority_grant(
+    db: Session,
+    *,
+    tenant_id: str,
+    agent_subject_id: str,
+    action_class: str,
+    authority_level: str,
+    scope: str,
+    reversibility: str,
+    expires_at: datetime,
+    fail_mode: str,
+    actor: Any,
+    actor_ref: dict | None = None,
+) -> tuple[AuthorityGrant, AuthorityGrantEvent]:
+    """Issue one grant: the projection row, its ISSUED event, the security audit record and the outbox event, with one
+    record sequence. The caller authorises (a HUMAN with grant_authority) and commits."""
+    seq = next_record_seq(db)
+    actor_id = getattr(actor, "actor_id", actor)
+    g = AuthorityGrant(tenant_id=tenant_id, agent_subject_id=agent_subject_id, action_class=action_class,
+                       authority_level=authority_level, scope=scope, reversibility=reversibility, expires_at=expires_at,
+                       granted_by=actor_id, status="ACTIVE", fail_mode=fail_mode)
+    db.add(g)
+    db.flush()
+    ev = _grant_event(g, event_type="ISSUED", from_status=None, actor_id=actor_id, reason=None, seq=seq)
+    db.add(ev)
+    audit(db, action="authority_grant.issued", object_type="AuthorityGrant", object_id=g.grant_id, actor=actor,
+          tenant_id=tenant_id, new="ACTIVE", reason=_grant_audit_text(g), record_seq=seq)
+    emit(db, event_type="authority_grant.issued", aggregate_type="AuthorityGrant", aggregate_id=g.grant_id,
+         tenant_id=tenant_id, actor=actor_ref, record_seq=seq, payload=_grant_payload(g))
+    return g, ev
+
+
+def revoke_authority_grant(
+    db: Session,
+    *,
+    tenant_id: str,
+    grant_id: str,
+    actor: Any,
+    actor_ref: dict | None = None,
+    reason: str | None = None,
+) -> tuple[AuthorityGrant, AuthorityGrantEvent | None]:
+    """Revoke a grant: ACTIVE -> REVOKED with its event, audit record and outbox event, in the caller's transaction.
+
+    Idempotent: revoking a grant that is already REVOKED changes and records nothing and returns (grant, None), so a
+    client retrying after an unknown outcome cannot create a second revocation. The row is locked first, so two
+    concurrent revocations produce exactly one event. An expired grant that is still ACTIVE can be revoked."""
+    g = db.execute(select(AuthorityGrant).where(AuthorityGrant.grant_id == grant_id, AuthorityGrant.tenant_id == tenant_id)
+                   .with_for_update().execution_options(populate_existing=True)).scalars().first()
+    if g is None:
+        raise HTTPException(404, "grant not found")
+    if g.status == "REVOKED":
+        return g, None
+    if g.status != "ACTIVE":
+        raise HTTPException(409, f"A grant in status {g.status} cannot be revoked")
+    seq = next_record_seq(db)
+    actor_id = getattr(actor, "actor_id", actor)
+    reason = (reason or "").strip() or None
+    g.status = "REVOKED"
+    ev = _grant_event(g, event_type="REVOKED", from_status="ACTIVE", actor_id=actor_id, reason=reason, seq=seq)
+    db.add(ev)
+    audit(db, action="authority_grant.revoked", object_type="AuthorityGrant", object_id=g.grant_id, actor=actor,
+          tenant_id=tenant_id, prior="ACTIVE", new="REVOKED",
+          reason=_grant_audit_text(g) + (f"; reason={reason}" if reason else ""), record_seq=seq)
+    emit(db, event_type="authority_grant.revoked", aggregate_type="AuthorityGrant", aggregate_id=g.grant_id,
+         tenant_id=tenant_id, actor=actor_ref, record_seq=seq, payload=_grant_payload(g))
+    return g, ev

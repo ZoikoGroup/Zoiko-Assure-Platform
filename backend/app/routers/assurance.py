@@ -5,12 +5,13 @@ import copy
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from sqlalchemy import select
 
 from ..engines import assurance as asr
-from ..engines import governance
-from ..models import (AdoptionAttestation, ApplicabilityDetermination, AssuranceSnapshot, Compensation,
+from ..engines import catalog, governance
+from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, AssuranceSnapshot,
+                      Compensation, RuleVersion,
                       CompensationEvent, ControlDefinition, ControlEvaluation, ControlImplementation, ControlTestPolicy,
                       EvidenceArtifact, ExceptionEvent, ExceptionRecord, Issue, IssueEvent, ObligationDefinition,
                       ObligationInstance, ObligationOccurrence, ObligationOccurrenceEvent, Provision, RiskAcceptance,
@@ -110,7 +111,24 @@ def dossier(lineage: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBL
                                                            .order_by(ObligationOccurrence.due_at)).scalars()],
         "issues": [to_dict(i) for i in ctx.db.execute(select(Issue).where(Issue.tenant_id == ctx.tenant,
                                                                          Issue.dedupe_key.like(f"%{lineage}%"))).scalars()],
+        "regulatory_provenance": _provenance(ctx, det),
     }
+
+
+def _provenance(ctx: Ctx, det) -> dict | None:
+    """Obligation -> adopted determination -> its evaluation -> the exact RuleVersion -> requirement versions,
+    provisions and source snapshots (DOM §1 canonical chain; DOM §16 end-to-end trace)."""
+    ev = ctx.db.get(ApplicabilityEvaluation, det.evaluation_id) if det else None
+    if ev is None or ev.tenant_id != ctx.tenant:
+        return None
+    rule = ctx.db.get(RuleVersion, ev.rule_version_id)
+    out = catalog.trace_rule_version(ctx.db, rule) if rule else None
+    if out is not None:
+        out["evaluation"] = {"evaluation_id": ev.evaluation_id, "outcome": ev.outcome, "effective_at": ev.effective_at,
+                             "record_cutoff_seq": ev.record_cutoff_seq, "input_bundle_hash": ev.input_bundle_hash,
+                             "evaluator_build": ev.evaluator_build}
+        out["determination_revision_id"] = det.revision_id
+    return out
 
 
 class PeriodIn(BaseModel):
@@ -221,9 +239,12 @@ def controls(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
         cd = ctx.db.get(ControlDefinition, ci.control_definition_id)
         d["definition"] = to_dict(cd)
         d["subject"] = ctx.db.get(Subject, ci.subject_id).display_name
-        ce = asr.evaluate_control(ctx.db, ci, now - timedelta(days=1), now, 10**15, persist=False)
-        d["current_state"] = {"state": ce["state"], "reason_codes": ce["reason_codes"], "window": "last 24h",
-                              "note": "Convenience view; authoritative state is the immutable ControlEvaluation."}
+        try:
+            ce = asr.evaluate_control(ctx.db, ci, now - timedelta(days=1), now, 10**15, persist=False)
+            d["current_state"] = {"state": ce["state"], "reason_codes": ce["reason_codes"], "window": "last 24h",
+                                  "note": "Convenience view; authoritative state is the immutable ControlEvaluation."}
+        except asr.AssuranceConfigurationError as e:  # shown as an error, never as a control state (STA §16)
+            d["current_state"] = {"state": None, "configuration_error": e.detail, "window": "last 24h"}
         out.append(d)
     del refs
     return out
@@ -234,8 +255,11 @@ def control_detail(ci_id: str, days: int = 30, ctx: Ctx = Depends(authorize(*DOS
     """WF-STA-02 Control Evaluation."""
     ci = ctx.scoped(ctx.db.get(ControlImplementation, ci_id), "control")
     now = datetime.now(timezone.utc)
-    ce = asr.evaluate_control(ctx.db, ci, now - timedelta(days=days), now, 10**15, persist=False)
-    pols = ctx.db.execute(select(ControlTestPolicy).where(ControlTestPolicy.control_implementation_id == ci_id)).scalars().all()
+    try:
+        ce = asr.evaluate_control(ctx.db, ci, now - timedelta(days=days), now, 10**15, persist=False)
+    except asr.AssuranceConfigurationError as e:  # an error object, never a control state (STA §16)
+        ce = {"state": None, "configuration_error": e.detail}
+    pols =ctx.db.execute(select(ControlTestPolicy).where(ControlTestPolicy.control_implementation_id == ci_id)).scalars().all()
     tests = []
     for p in pols:
         for td in ctx.db.execute(select(TestDefinition).where(TestDefinition.policy_version_id == p.policy_version_id)).scalars():
@@ -287,28 +311,43 @@ class ControlIn(BaseModel):
     method: str
     valid_from: datetime
     aggregation_mode: str = "ALL_REQUIRED"
-    k_threshold: int | None = None
+    k_threshold: StrictInt | None = None  # strict: "3", 3.0 or true are refused, never coerced
     automation_requirement: str = "PREFERRED"
     tests: list[TestDefIn]
+
+    @model_validator(mode="after")
+    def _policy(self):
+        # ZA-STA-001 §03 vocabularies and the K/primary invariants; the evaluator enforces the same rules on stored data.
+        problems = asr.policy_problems(self.aggregation_mode, self.k_threshold, self.automation_requirement,
+                                       [(t.required, t.primary) for t in self.tests])
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
 
 
 @router.post("/controls")
 def create_control(body: ControlIn, ctx: Ctx = Depends(authorize("manage_controls"))):
+    from sqlalchemy.exc import IntegrityError
     cd = ctx.db.execute(select(ControlDefinition).where(ControlDefinition.key == body.control_key)).scalars().first()
     if not cd:
         raise HTTPException(404, "control definition")
     s = ctx.scoped(ctx.db.get(Subject, body.subject_id), "subject")
+    dupe_msg = "Implementation already exists for this control/scope; frameworks are mappings, not clones (INV-08)"
     dupe = ctx.db.execute(select(ControlImplementation).where(ControlImplementation.tenant_id == ctx.tenant,
                                                               ControlImplementation.control_definition_id == cd.control_definition_id,
                                                               ControlImplementation.subject_id == s.subject_id)).scalars().first()
     if dupe:
-        raise HTTPException(409, "Implementation already exists for this control/scope; frameworks are mappings, not clones (INV-08)")
+        raise HTTPException(409, dupe_msg)
     seq = next_record_seq(ctx.db)
     ci = ControlImplementation(tenant_id=ctx.tenant, entity_id=s.entity_id, subject_id=s.subject_id,
                                control_definition_id=cd.control_definition_id, owner_actor_id=ctx.actor.actor_id,
                                method=body.method, valid_from=body.valid_from, record_seq=seq)
     ctx.db.add(ci)
-    ctx.db.flush()
+    try:
+        ctx.db.flush()
+    except IntegrityError:  # a concurrent creation took the (tenant, definition, subject, variant) key (INV-08)
+        ctx.db.rollback()
+        raise HTTPException(409, dupe_msg) from None
     pol = ControlTestPolicy(tenant_id=ctx.tenant, control_implementation_id=ci.control_implementation_id,
                             aggregation_mode=body.aggregation_mode, k_threshold=body.k_threshold,
                             automation_requirement=body.automation_requirement, record_seq=seq)
@@ -316,6 +355,10 @@ def create_control(body: ControlIn, ctx: Ctx = Depends(authorize("manage_control
     ctx.db.flush()
     for t in body.tests:
         ctx.db.add(TestDefinition(tenant_id=ctx.tenant, policy_version_id=pol.policy_version_id, **t.model_dump()))
+    audit(ctx.db, action="control_implementation.create", object_type="ControlImplementation",
+          object_id=ci.control_implementation_id, actor=ctx.actor, tenant_id=ctx.tenant, record_seq=seq, reason=(f"{cd.key} for subject {s.subject_id}; policy {pol.policy_version_id} "
+                                  f"{body.aggregation_mode} k={body.k_threshold} automation={body.automation_requirement}; "
+                                  f"{len(body.tests)} test(s)"))
     ctx.db.commit()
     return to_dict(ci)
 
@@ -339,14 +382,21 @@ def ingest_test_run(body: TestRunIn, ctx: Ctx = Depends(authorize("submit_eviden
     """External GRC/vendor results are inputs with provenance — never direct control state (STA-REQ-008)."""
     if body.result not in ("PASS", "FAIL", "ERROR", "INCONCLUSIVE", "SKIPPED"):
         raise HTTPException(422, "Invalid test result code")
+    # ZA-TIM-001 §02: half-open, non-empty ranges; an empty or inverted window is not an assertion about any period.
+    if ensure_utc(body.window_to) <= ensure_utc(body.window_from):
+        raise HTTPException(422, {"error": "TEST_RUN_WINDOW_EMPTY", "message": "window_to must be later than window_from"})
     td = ctx.scoped(ctx.db.get(TestDefinition, body.test_definition_id), "test definition")
     for e in body.evidence_ids:
         ctx.scoped(ctx.db.get(EvidenceArtifact, e), "evidence")
     if body.source_run_id:  # assurance reads this run's IPE result, so it must be one of this organisation's runs
         ctx.scoped(ctx.db.get(SourceRun, body.source_run_id), "source run")
-    tr = TestRun(tenant_id=ctx.tenant, record_seq=next_record_seq(ctx.db), **body.model_dump())
+    seq = next_record_seq(ctx.db)
+    tr = TestRun(tenant_id=ctx.tenant, record_seq=seq, **body.model_dump())
     ctx.db.add(tr)
     ctx.db.flush()
+    audit(ctx.db, action="test_run.record", object_type="TestRun", object_id=tr.test_run_id, actor=ctx.actor,
+          tenant_id=ctx.tenant, new=tr.result, record_seq=seq,
+          reason=f"test {td.test_definition_id} from {tr.source_system}; window [{tr.window_from}, {tr.window_to})")
     emit(ctx.db, event_type="test.run_recorded", aggregate_type="TestRun", aggregate_id=tr.test_run_id, tenant_id=ctx.tenant,
          payload={"result": tr.result, "external_status": tr.external_status, "test": td.name})
     ctx.db.commit()
@@ -418,7 +468,9 @@ class CompIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     obligation_lineage_id: str
     primary_control_key: str
-    compensating_control_keys: list[str]
+    # ZA-STA-001 §09: "One or more controls". Existence, duplicates and scope are checked by the domain layer
+    # (governance.compensation_problems), which also re-checks at approval.
+    compensating_control_keys: list[str] = Field(min_length=1)
     equivalence_rationale: str
     valid_from: datetime
     valid_to: datetime | None = None
@@ -516,8 +568,15 @@ class RiskIn(BaseModel):
 
 @router.post("/risk-acceptances")
 def accept_risk(body: RiskIn, ctx: Ctx = Depends(authorize("approve_exception", human=True))):
+    if body.valid_to is not None and ensure_utc(body.valid_to) <= ensure_utc(body.valid_from):
+        raise HTTPException(422, {"error": "RISK_ACCEPTANCE_PERIOD_EMPTY", "message": "valid_to must be later than valid_from"})
     r = RiskAcceptance(tenant_id=ctx.tenant, approver_id=ctx.actor.actor_id, **body.model_dump())
     ctx.db.add(r)
+    ctx.db.flush()
+    # STA-REQ-024: recorded separately from assurance state, but recorded (audit finding F-13).
+    audit(ctx.db, action="risk_acceptance.create", object_type="RiskAcceptance",
+          object_id=r.risk_acceptance_id, actor=ctx.actor,
+          tenant_id=ctx.tenant, record_seq=next_record_seq(ctx.db), reason=f"scope {body.scope_ref}")
     ctx.db.commit()
     return to_dict(r)
 

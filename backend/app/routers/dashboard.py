@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from ..engines import evidence as evd
 from ..models import (ApplicabilityDetermination, ApplicabilityEvaluation, AssuranceSnapshot, ConnectorDefinition,
                       EvidenceArtifact, FactRequest, Issue, LegalEntity, ObligationDefinition, ObligationInstance,
-                      OutboxEvent, Subject, TenantLedgerHead, TestRun)
+                      ObligationOccurrence, OutboxEvent, Subject, TenantLedgerHead, TestRun)
 from ..platform import current_watermark, ensure_utc
 from ..security import DOSSIER_READ, Ctx, authorize
 
@@ -61,6 +61,14 @@ def dashboard(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
         ev_cond[c] = ev_cond.get(c, 0) + 1
     head = db.get(TenantLedgerHead, t)
     issues = db.execute(select(Issue).where(*_open_issues(t))).scalars().all()
+    # Recorded obligation occurrences (ZA-STA-001 timeliness) of the ADOPTED obligations above that have no fulfilment
+    # yet, and how many of those are past their due time, the same boundary the assurance engine treats as missed.
+    # Counts of records, not an assurance state: a late fulfilment's effect on assurance is the snapshot's to decide.
+    adopted_lineages = {o.lineage_id for o in obls if o.lifecycle == "ADOPTED"}
+    unfulfilled = [due for lineage, due in db.execute(
+        select(ObligationOccurrence.obligation_lineage_id, ObligationOccurrence.due_at)
+        .where(ObligationOccurrence.tenant_id == t, ObligationOccurrence.fulfilled_at.is_(None))).all()
+        if lineage in adopted_lineages]
     return {
         "as_of": {**current_watermark(db), "valid_at": now},
         "denominator_rule": "Counts cover ADOPTED applicable obligations for the tenant; UNCERTAIN applicability is reported separately, never silently excluded.",
@@ -68,6 +76,10 @@ def dashboard(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
         "determinations": {s: sum(1 for d in dets if d.state == s) for s in ("PROPOSED", "IN_REVIEW", "ADOPTED", "REJECTED")}
         | {"needs_review": sum(1 for d in dets if d.needs_review)},
         "open_fact_requests": db.query(FactRequest).filter(*_open_fact_requests(t)).count(),
+        "obligation_occurrences": {
+            "unfulfilled": len(unfulfilled), "overdue": sum(1 for due in unfulfilled if ensure_utc(due) <= now),
+            "rule": "Recorded occurrences of ADOPTED obligations with no fulfilment recorded; overdue = due time has "
+                    "passed. Counts of records, not an assurance state."},
         "evidence_conditions": ev_cond,
         "ledger": {"head_seq": head.current_seq if head else 0, "last_checkpointed_seq": head.last_checkpointed_seq if head else 0,
                    "last_verified_seq": head.last_verified_seq if head else 0},

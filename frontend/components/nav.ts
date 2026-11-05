@@ -6,16 +6,22 @@ import {
   Scale, ShieldAlert, SlidersHorizontal, Users,
 } from "lucide-react";
 
+import SCREEN_ACCESS from "@/lib/screen-access.json";
+
 /** One navigation model for the sidebar, breadcrumbs and "Jump to" search.
  *  `for`: who can use the screen (default: tenant users only). Zoiko content staff and the platform Super Admin have no
- *  standing tenant-data access (INV-14, IAM-REQ-030), so tenant screens are not offered to them. The backend enforces
- *  every permission and tenant boundary either way; this only avoids showing screens that would be refused. */
-export type NavItem = { href: string; label: string; icon: LucideIcon; for?: Persona[] };
+ *  standing tenant-data access (INV-14, IAM-REQ-024), so tenant screens are not offered to them.
+ *  `perms` (from lib/screen-access.json, generated from the backend's route guards): the screen is offered only to
+ *  someone holding one of them organisation- or platform-wide, so the sidebar never shows a screen the server would
+ *  refuse on load. The backend enforces every permission and tenant boundary either way; this only avoids showing
+ *  screens that would be refused. */
+export type NavItem = { href: string; label: string; icon: LucideIcon; for?: Persona[]; perms?: readonly string[] };
+const ACCESS: Record<string, { reads: string[]; perms: string[] }> = SCREEN_ACCESS.screens;
 const ALL: Persona[] = ["tenant", "content", "platform"];
 const CONTENT: Persona[] = ["tenant", "content"];
 export type NavGroup = { group: string; items: NavItem[] };
 
-export const NAV: NavGroup[] = [
+const NAV_ITEMS: NavGroup[] = [
   { group: "Overview", items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard, for: ALL }] },
   { group: "Regulatory Content", items: [
     { href: "/regulatory", label: "Regulatory Inbox", icon: Inbox, for: CONTENT },
@@ -56,6 +62,12 @@ export const NAV: NavGroup[] = [
     { href: "/admin/access-log", label: "Privileged Access Log", icon: ShieldAlert },
   ] },
 ];
+export const NAV: NavGroup[] = NAV_ITEMS.map((g) => ({ ...g, items: g.items.map((i) => ({ ...i, perms: ACCESS[i.href]?.perms })) }));
+
+/** Whether someone with `permissions` (organisation- or platform-wide, as the session reports them) can use the item.
+ *  `permissions` omitted: no permission filter (persona only). */
+const permitted = (i: NavItem, permissions?: readonly string[]) =>
+  !i.perms || !permissions || i.perms.some((p) => permissions.includes(p));
 
 /** The organisation workspace sidebar (customer-organisation users), grouped as the Organization Command Center design.
  *  Each entry opens an existing NAV screen; `more` lists the section's other NAV screens, shown beneath it while one of
@@ -93,14 +105,18 @@ const ORG_NAV: OrgNavGroup[] = [
 
 const ITEMS = NAV.flatMap((g) => g.items.map((i) => ({ ...i, group: g.group })));
 
-/** The organisation sidebar, limited to screens the tenant navigation offers. `sub` resolves `more` to NAV items, so
- *  each sub-entry keeps its screen's own label and icon. */
-export function orgNav(): { group: string; items: (OrgNavItem & { sub: NavItem[] })[] }[] {
-  const allowed = new Set(navFor("tenant").flatMap((g) => g.items.map((i) => i.href)));
+/** The organisation sidebar, limited to screens the tenant navigation offers to someone with `permissions`. `sub`
+ *  resolves `more` to NAV items, so each sub-entry keeps its screen's own label and icon. A section whose own screen is
+ *  not permitted but one of whose `more` screens is opens that screen instead, so no permitted destination is lost. */
+export function orgNav(permissions?: readonly string[]): { group: string; items: (OrgNavItem & { sub: NavItem[] })[] }[] {
+  const allowed = new Set(navFor("tenant", permissions).flatMap((g) => g.items.map((i) => i.href)));
   return ORG_NAV.map((g) => ({
     ...g,
-    items: g.items.filter((i) => allowed.has(i.href))
-      .map((i) => ({ ...i, sub: (i.more ?? []).filter((h) => allowed.has(h)).map((h) => ITEMS.find((n) => n.href === h)!) })),
+    items: g.items.flatMap((i) => {
+      const sub = (i.more ?? []).filter((h) => allowed.has(h)).map((h) => ITEMS.find((n) => n.href === h)!);
+      if (allowed.has(i.href)) return [{ ...i, sub }];
+      return sub.length ? [{ ...i, href: sub[0].href, sub: sub.slice(1) }] : [];
+    }),
   })).filter((g) => g.items.length > 0);
 }
 
@@ -154,22 +170,23 @@ export function routeMeta(path: string): RouteMeta | null {
   return { group: item.group, item, isDetail: path !== item.href };
 }
 
-/** The navigation a signed-in persona can use. */
-export function navFor(persona: Persona): NavGroup[] {
-  return NAV.map((g) => ({ ...g, items: g.items.filter((i) => (i.for ?? ["tenant"]).includes(persona)) })).filter((g) => g.items.length > 0);
+/** The navigation a signed-in persona can use, limited to the screens its `permissions` let it open. */
+export function navFor(persona: Persona, permissions?: readonly string[]): NavGroup[] {
+  return NAV.map((g) => ({ ...g, items: g.items.filter((i) => (i.for ?? ["tenant"]).includes(persona) && permitted(i, permissions)) }))
+    .filter((g) => g.items.length > 0);
 }
 
-/** Whether a persona can use the screen at `path`. After sign-in, a `?next=` page is only followed when this holds, so
- *  each account lands on a screen meant for it (otherwise its own dashboard at "/"). Navigation only: the backend
- *  authorises every request regardless. */
-export function canOpen(persona: Persona, path: string): boolean {
+/** Whether a persona (with `permissions`) can use the screen at `path`. After sign-in, a `?next=` page is only followed
+ *  when this holds, so each account lands on a screen meant for it (otherwise its own dashboard at "/"). Navigation
+ *  only: the backend authorises every request regardless. */
+export function canOpen(persona: Persona, path: string, permissions?: readonly string[]): boolean {
   if (PLATFORM_DETAIL.test(path)) return persona === "platform";
   const meta = routeMeta(path);
   if (!meta) return false;
-  return EXTRA.some((e) => e.href === meta.item.href) || navFor(persona).some((g) => g.items.some((i) => i.href === meta.item.href));
+  return EXTRA.some((e) => e.href === meta.item.href) || navFor(persona, permissions).some((g) => g.items.some((i) => i.href === meta.item.href));
 }
 
-/** Everything "Jump to" can reach for this persona. */
-export function jumpTargets(persona: Persona) {
-  return [...navFor(persona).flatMap((g) => g.items.map(({ href, label }) => ({ href, label, group: g.group }))), ...EXTRA];
+/** Everything "Jump to" can reach for this persona (with `permissions`). */
+export function jumpTargets(persona: Persona, permissions?: readonly string[]) {
+  return [...navFor(persona, permissions).flatMap((g) => g.items.map(({ href, label }) => ({ href, label, group: g.group }))), ...EXTRA];
 }
