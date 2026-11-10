@@ -16,7 +16,7 @@ from ..models import (AdoptionAttestation, ApplicabilityDetermination, Applicabi
                       Compensation, RuleVersion,
                       CompensationEvent, ControlDefinition, ControlEvaluation, ControlImplementation, ControlTestPolicy,
                       EvidenceArtifact, ExceptionEvent, ExceptionRecord, Issue, IssueEvent, ObligationDefinition,
-                      ObligationInstance, ObligationOccurrence, ObligationOccurrenceEvent, Provision, RiskAcceptance,
+                      ObligationInstance, ObligationOccurrence, ObligationOccurrenceEvent, RiskAcceptance,
                       SatisfactionExpressionVersion, SourceRun, Subject, TestDefinition, TestRun)
 from ..platform import audit, current_watermark, digest, emit, ensure_utc, next_record_seq, to_dict
 from ..security import DOSSIER_READ, Ctx, EntityOf, authorize, entity_of
@@ -146,7 +146,8 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
     history = decision_history.obligation_decision_history(ctx.db, ctx.tenant, lineage, as_of_record_seq)
     return {
         "obligation": as_known(o), "definition": to_dict(od), "subject": to_dict(subject),
-        "provisions": [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.provision_id.in_(od.provision_ids or ["-"]))).scalars()],
+        # In the definition's link order, never the physical row order an UPDATE can change (catalog.definition_provisions).
+        "provisions": [to_dict(p) for p in catalog.definition_provisions(ctx.db, od)],
         "determination": as_known(det) if det else None, "attestation": to_dict(att) if att else None,
         "revisions": revisions,
         "expression_versions": [{**to_dict(e), "control_mappings": satisfaction.view(ctx.db, e)["control_mappings"]}
@@ -317,8 +318,17 @@ def reproduce(snapshot_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, enti
                              evaluated_at=s.created_at)
     ctx.db.rollback()
     ok_digest = r["dependency_digest"] == s.dependency_digest
+    # The snapshot pins the roll-up engine version it was computed with (ZA-TIM-001 §10 "evaluator / rollup versions";
+    # STA-REQ-032: engine/version changes need ADR, golden-vector regression and explicit snapshot versioning). This
+    # runtime holds one engine; when it is not the recorded one, the rebuild is another engine's answer, so it is
+    # reported as ENGINE_CHANGED and never as a reproduction (as applicability replay reports BUILD_CHANGED).
+    from .. import codes
+    engine_matches = s.rollup_engine_version == codes.ROLLUP_ENGINE_VERSION
+    same = ok_digest and r["state"] == s.state
     return {"snapshot_id": snapshot_id, "original_state": s.state, "reproduced_state": r["state"],
-            "dependency_digest_match": ok_digest, "reproducible": ok_digest and r["state"] == s.state,
+            "dependency_digest_match": ok_digest, "reproducible": same and engine_matches,
+            "status": "ENGINE_CHANGED" if not engine_matches else "REPRODUCED" if same else "NOT_REPRODUCED",
+            "rollup_engine_version": {"recorded": s.rollup_engine_version, "running": codes.ROLLUP_ENGINE_VERSION},
             "record_cutoff_seq": s.record_cutoff_seq, "evaluation_instant": r["evaluation_instant"],
             "history_problems": r["history_problems"]}
 
