@@ -565,7 +565,8 @@ def publish_bound(ctx, binding: list[dict], *, content_release_id: str, record_s
              actor=ctx.actor, action="requirement.lifecycle", record_seq=record_seq,
              reason=f"Released in content release {content_release_id}")
         rv.content_release_id = content_release_id
-        for p in db.execute(select(Provision).where(Provision.requirement_version_id == rv.requirement_version_id)).scalars():
+        for p in db.execute(select(Provision).where(Provision.requirement_version_id == rv.requirement_version_id)
+                            .order_by(Provision.locator, Provision.provision_id)).scalars():  # deterministic, as verify()
             if p.lifecycle == "VERIFIED":
                 move(db, p, object_type="Provision", object_id=p.provision_id, to="PUBLISHED", actor=ctx.actor,
                      action="provision.lifecycle", record_seq=record_seq,
@@ -581,7 +582,8 @@ def publish_bound(ctx, binding: list[dict], *, content_release_id: str, record_s
                      actor=ctx.actor, action="requirement.lifecycle", record_seq=record_seq,
                      reason=f"Superseded by {rv.requirement_version_id} in content release {content_release_id}")
                 # Its provisions are that version's atomic units (DOM §13) and are superseded with it.
-                for p in db.execute(select(Provision).where(Provision.requirement_version_id == old.requirement_version_id)).scalars():
+                for p in db.execute(select(Provision).where(Provision.requirement_version_id == old.requirement_version_id)
+                                    .order_by(Provision.locator, Provision.provision_id)).scalars():
                     if p.lifecycle == "PUBLISHED":
                         move(db, p, object_type="Provision", object_id=p.provision_id, to="SUPERSEDED", actor=ctx.actor,
                              action="provision.lifecycle", record_seq=record_seq,
@@ -1096,6 +1098,15 @@ def remove_link(ctx, odef_id: str, provision_id: str, reason: str) -> Obligation
           reason=(f"Removed provision {provision_id}" + (f" of requirement version {p.requirement_version_id}" if p else "")
                   + f"; {reason}")[:2000])
     return o
+
+
+def definition_provisions(db, o: ObligationDefinition) -> list[Provision]:
+    """The definition's linked provisions in its own link order (``provision_ids``, as definition_view lists them),
+    never in the database's physical row order, which an UPDATE of a provision row can change. A link whose provision
+    does not exist is left out here (definition_view reports it as missing)."""
+    ids = [p for p in (o.provision_ids or []) if isinstance(p, str)]
+    found = {p.provision_id: p for p in db.execute(select(Provision).where(Provision.provision_id.in_(ids or ["-"]))).scalars()}
+    return [found[p] for p in dict.fromkeys(ids) if p in found]
 
 
 def definition_view(db, o: ObligationDefinition) -> dict:

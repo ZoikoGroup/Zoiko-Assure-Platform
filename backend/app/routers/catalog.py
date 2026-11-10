@@ -353,7 +353,12 @@ def requirement(rv_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     if not rv:
         raise HTTPException(404)
     d = to_dict(rv)
-    d["provisions"] = [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.requirement_version_id == rv_id)).scalars()]
+    # A stable order, as /history and verify use: without ORDER BY PostgreSQL returns rows in physical order, which any
+    # UPDATE (a lifecycle move such as publication or supersession) can change, so an unchanged version would be listed
+    # differently from one read to the next.
+    d["provisions"] = [to_dict(p) for p in ctx.db.execute(
+        select(Provision).where(Provision.requirement_version_id == rv_id)
+        .order_by(Provision.locator, Provision.provision_id)).scalars()]
     src = ctx.db.get(RegulatorySource, rv.source_id)
     d["source"] = {k: v for k, v in to_dict(src).items() if k != "raw_text" or src.rights_class != "REFERENCE_ONLY"}
     d["version_number"] = cat.version_number(ctx.db, rv)
@@ -415,14 +420,17 @@ def odefs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     optionally served from the record-watermark-keyed cache (app/cache.py, ZA_CATALOG_CACHE)."""
     def build():
         out = []
-        for o in ctx.db.execute(select(ObligationDefinition)).scalars():
+        # Stable order (definitions by key, as obligation_definitions_for; each one's provisions in its link order),
+        # never PostgreSQL's physical row order, which any UPDATE can change.
+        for o in ctx.db.execute(select(ObligationDefinition).order_by(ObligationDefinition.key,
+                                                                      ObligationDefinition.obligation_definition_id)).scalars():
             d = to_dict(o)
             inst = ctx.db.get(Instrument, o.instrument_id)
             d["instrument"] = inst.identifier
             rv = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == o.obligation_definition_id,
                                                           RuleVersion.status == "PUBLISHED").order_by(RuleVersion.version.desc())).scalars().first()
             d["current_rule_version"] = to_dict(rv) if rv else None
-            d["provisions"] = [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.provision_id.in_(o.provision_ids or ["-"]))).scalars()]
+            d["provisions"] = [to_dict(p) for p in cat.definition_provisions(ctx.db, o)]
             out.append(d)
         return out
     return cached_catalog_read(ctx.db, "obligation_definitions", build)

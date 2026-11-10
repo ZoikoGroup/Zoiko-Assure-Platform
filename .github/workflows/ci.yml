@@ -376,6 +376,8 @@ jobs:
           --require test_historical_governance_state=20
           --require test_governance_decision_concurrency=7
           --require test_rule_limit_validation_parity=30
+          --require test_requirement_supersession_content=5
+          --require test_snapshot_engine_version=2
           --redact-env ZA_TEST_DATABASE_URL
           --redact-env ZA_TEST_DATABASE_ADMIN_URL
           --summary-json "$RUNNER_TEMP/reports/backend-postgres-summary.json"
