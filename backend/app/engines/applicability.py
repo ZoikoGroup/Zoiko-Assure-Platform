@@ -112,6 +112,15 @@ def _integrity_failure(db: Session, rv: RuleVersion) -> tuple[str, str] | None:
     pinned = sorted((r["set_version_id"], r["sha256"]) for r in cr.manifest.get("set_refs") or [])
     if pinned != sorted(pins.items()):
         return "RELEASE_SET_PINS_MISMATCH", cr.content_release_id
+    # 5. the source-mapping records stored on the RuleVersion are the ones the release bound (ZA-RUL-001 §12 "source
+    # mappings ... remain release-bound"). A release that predates the binding has nothing to compare (reported by the
+    # verifier and the trace as unverifiable, not refused here).
+    from .catalog import source_mapping_binding_check  # local import: catalog imports this module lazily
+    binding = source_mapping_binding_check(entries[0], rv.source_mappings)["status"]
+    if binding == "MISMATCH":
+        return "SOURCE_MAPPINGS_MISMATCH", rv.rule_version_id
+    if binding == "UNKNOWN_PROFILE":
+        return "SOURCE_MAPPINGS_PROFILE_UNSUPPORTED", cr.content_release_id
     return None
 
 
@@ -170,17 +179,108 @@ def _display(fd: dict, value):
     return value
 
 
+# ---------------------------------------------------------------- decision-scope serialisation
+def lock_decision(db: Session, tenant_id: str, subject_id: str, odef_id: str) -> None:
+    """Serialise every writer of one subject + obligation definition's determination lineage and obligation: evaluation
+    persistence (with the determination it derives), attestation and challenge. Each reads the current revision only
+    after taking the lock, so none can close a revision another has already closed (a forked lineage) or decide on a
+    stale one. APP-001 §15: "Only one current adopted/rejected determination per subject + obligation definition";
+    APP-REQ-016: concurrent identical evaluations collapse to one. No partial unique index enforces either yet (that is a
+    schema change: docs/backend-remediation-report.md R-01), so this transaction-level lock does (engines/locks.py)."""
+    xact_lock(db, "obligation", tenant_id, subject_id, odef_id)
+
+
+def lock_rule_scope(db: Session, odef_id: str, *, exclusive: bool = False) -> None:
+    """One obligation definition's binding-rule scope. A publication of a new RuleVersion for it holds this exclusively
+    from before it reads which subjects to re-evaluate until it commits; an evaluation that will persist holds it shared
+    from before it resolves the RuleVersion. So an evaluation either commits before the publication reads its targets
+    (and is re-evaluated by it), or starts after the publication committed (and resolves the new version). None commits
+    a result of the previous version after the new version's impact was computed (APP §10, ZA-RUL-001 §14)."""
+    xact_lock(db, "rule-scope", odef_id, shared=not exclusive)
+
+
+def lock_decisions(db: Session, scopes) -> None:
+    """Take several decision-scope locks in the one global order, so transactions that need more than one never wait
+    on each other in opposite orders (no deadlock):
+
+        rule scope (per obligation definition, sorted)  ->  decision scope (tenant, subject, definition, sorted)
+        ->  the cell record-sequence row (taken by next_record_seq and held until commit).
+
+    A caller takes these BEFORE its first next_record_seq: the sequence row is itself a lock, and taking a scope lock
+    after it inverts the order against a transaction that holds the scope and waits for the sequence (a deadlock)."""
+    scopes = sorted(set(scopes))
+    for odef_id in sorted({o for _, _, o in scopes}):
+        lock_rule_scope(db, odef_id)
+    for tenant_id, subject_id, odef_id in scopes:
+        lock_decision(db, tenant_id, subject_id, odef_id)
+
+
+def require_supported_versions(rv: RuleVersion) -> None:
+    """RUL-REQ-028: a RuleVersion whose declared RuleSchemaVersion or OperatorSetVersion this evaluator does not
+    implement is refused explicitly, never run under the versions it does implement. The refusal is the APP §12 error
+    SCHEMA_INCOMPATIBLE ("Rule references unsupported/retired FactDefinition or operator version"): an error, not an
+    applicability outcome, so it is never UNCERTAIN (APP-REQ-019), nothing is persisted, and there is no fallback to an
+    older RuleVersion (the resolved version is the binding one; APP-REQ-006). Not an integrity failure: a correctly
+    signed release may target a newer runtime."""
+    bad = rules.unsupported_versions(rv.rule_schema_version, rv.operator_set_version)
+    if bad:
+        raise HTTPException(409, {
+            "error": "SCHEMA_INCOMPATIBLE", "rule_version_id": rv.rule_version_id, "unsupported": bad,
+            "supported": {"rule_schema_version": sorted(rules.SUPPORTED_SCHEMA_VERSIONS),
+                          "operator_set_version": sorted(rules.SUPPORTED_OPERATOR_SET_VERSIONS)},
+            "message": f"RuleVersion {rv.rule_version_id} declares {', '.join(f'{k} {v}' for k, v in bad.items())}, which "
+                       "this evaluator does not implement; it is not evaluated (RUL-REQ-028)."})
+
+
+def resource_limit_refusal(rule_version_id: str, violations: list[dict]) -> HTTPException:
+    """RUL-REQ-029: "budget failures are infrastructure errors, not UNCERTAIN". The refusal is the APP §12 error
+    EVALUATOR_UNAVAILABLE ("Infrastructure error before deterministic result; do not store UNCERTAIN as a substitute"),
+    naming the ZA-RUL-001 §18 cause RUL_RESOURCE_LIMIT and every limit exceeded. HTTP 500 like the other runtime content
+    error (RUNTIME_RULE_INVARIANT_BREACH): ZA-API-001 keeps 503 for temporary unavailability, and a retry of the same
+    RuleVersion under the same limits cannot succeed."""
+    return HTTPException(500, {
+        "error": "EVALUATOR_UNAVAILABLE", "reason": "RUL_RESOURCE_LIMIT", "rule_version_id": rule_version_id,
+        "violations": [{k: v for k, v in x.items() if k != "message"} for x in violations],
+        "limits": dict(rules.LIMITS), "retryable": False,
+        "message": f"RuleVersion {rule_version_id} exceeds the runtime complexity limits; it was not evaluated "
+                   f"(RUL-REQ-029). " + " ".join(x["message"] for x in violations)})
+
+
+def draft_resource_limit_refusal(draft_id: str, draft_revision: int, violations: list[dict]) -> HTTPException:
+    """The same RUL-REQ-029 refusal for a RuleDraft run on the workbench (/sandbox) or in shadow: the draft is named
+    instead of a RuleVersion, and no outcome of any kind is returned."""
+    return HTTPException(500, {
+        "error": "EVALUATOR_UNAVAILABLE", "reason": "RUL_RESOURCE_LIMIT", "draft_id": draft_id,
+        "draft_revision": draft_revision,
+        "violations": [{k: v for k, v in x.items() if k != "message"} for x in violations],
+        "limits": dict(rules.LIMITS), "retryable": False,
+        "message": f"Draft {draft_id} revision {draft_revision} exceeds the runtime complexity limits; it was not "
+                   f"evaluated (RUL-REQ-029). " + " ".join(x["message"] for x in violations)})
+
+
+def require_within_limits(rv: RuleVersion) -> None:
+    """RUL-REQ-029: the released AST is measured against the complexity limits before input freeze, so a rule over a
+    limit reads no facts, writes nothing and runs no node. Nothing falls back to another RuleVersion (APP-REQ-006)."""
+    violations = rules.resource_limit_violations(rv.canonical_ast)
+    if violations:
+        raise resource_limit_refusal(rv.rule_version_id, violations)
+
+
 def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationDefinition,
              effective_at: datetime, record_cutoff_seq: int | None, trigger: str, actor_id: str,
              rule_version: RuleVersion | None = None, persist: bool = True) -> ApplicabilityEvaluation | dict:
     if odef.subject_type != subject.subject_type:
         raise HTTPException(422, f"{odef.key} applies to subject type {odef.subject_type}, not {subject.subject_type}")
     effective_at = ensure_utc(effective_at)
+    if persist:  # before the watermark is read and the RuleVersion resolved (see lock_rule_scope)
+        lock_rule_scope(db, odef.obligation_definition_id)
     if record_cutoff_seq is None:
         from ..platform import current_watermark
         record_cutoff_seq = current_watermark(db)["record_seq"]
     rv = rule_version or resolve_rule(db, odef, effective_at.date(), record_cutoff_seq)
     verify_rule_integrity(db, rv)  # before input freeze (ZA-APP-001 §13); raises RuleIntegrityError
+    require_supported_versions(rv)  # before input freeze; never an approximate interpretation (RUL-REQ-028)
+    require_within_limits(rv)  # before input freeze; a budget breach is an infrastructure error (RUL-REQ-029)
     fact_defs = load_fact_defs(db)
     sets = load_sets(db)
     fdmodels = {fd.key: fd for fd in db.execute(select(FactDefinition)).scalars()}
@@ -214,6 +314,8 @@ def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationD
     try:
         out = rules.evaluate(rv.canonical_ast, facts, {k: v["data_type"] for k, v in fact_defs.items()},
                              sets, {"effective_at": effective_at.date().isoformat()})
+    except rules.RuleResourceLimitError as e:  # the evaluator's own guard (RUL-REQ-029); same refusal as above
+        raise resource_limit_refusal(rv.rule_version_id, e.violations) from None
     except rules.RuleError as e:  # invariant breach is an infrastructure/content error, never UNCERTAIN
         raise HTTPException(500, {"error": e.code, "message": e.message, "node_id": e.node_id})
 
@@ -221,6 +323,8 @@ def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationD
         return {"outcome": out["outcome"], "trace": out["trace"], "missing_facts": out["missing_facts"],
                 "rule_version_id": rv.rule_version_id, "input_bundle_hash": bundle_hash}
 
+    # Before the duplicate check and the determination it derives (APP-REQ-016; see lock_decision).
+    lock_decision(db, tenant_id, subject.subject_id, odef.obligation_definition_id)
     existing = db.execute(select(ApplicabilityEvaluation).where(
         ApplicabilityEvaluation.tenant_id == tenant_id,
         ApplicabilityEvaluation.evaluation_key == eval_key)).scalars().first()
@@ -290,8 +394,24 @@ def _new_det_revision(db, prev: ApplicabilityDetermination | None, *, tenant_id,
     return rev
 
 
+def latest_evaluation(db: Session, tenant_id: str, subject_id: str, odef_id: str) -> ApplicabilityEvaluation | None:
+    """The evaluation made with the newest knowledge: the highest record cutoff, then the latest recorded. An evaluation
+    requested at an earlier record cutoff is history ("what did Assure know then?", TIM-REQ-006), recorded later but
+    never the latest knowledge."""
+    return db.execute(select(ApplicabilityEvaluation).where(
+        ApplicabilityEvaluation.tenant_id == tenant_id, ApplicabilityEvaluation.subject_id == subject_id,
+        ApplicabilityEvaluation.obligation_definition_id == odef_id).order_by(
+        ApplicabilityEvaluation.record_cutoff_seq.desc(), ApplicabilityEvaluation.record_seq.desc())).scalars().first()
+
+
 def _derive(db: Session, ev: ApplicabilityEvaluation, subject: Subject, odef: ObligationDefinition, seq: int, actor_id: str):
     cur = current_determination(db, ev.tenant_id, subject.subject_id, odef.obligation_definition_id)
+    if cur is not None:
+        basis = db.get(ApplicabilityEvaluation, cur.evaluation_id)
+        if basis is not None and ev.record_cutoff_seq < basis.record_cutoff_seq:
+            # Older knowledge than the determination already rests on: stored as history, but it neither refreshes,
+            # flags nor raises requests against the current decision (TIM-REQ-007; APP §10 "no silent rewrite").
+            return
     if ev.outcome == "UNCERTAIN":
         _fact_requests(db, ev, subject, odef)
         if cur and cur.state == "ADOPTED":
@@ -361,11 +481,44 @@ def _fact_requests(db: Session, ev, subject, odef):
              tenant_id=ev.tenant_id, payload={"fact_definition": key, "reason_code": reasons.get(key)})
 
 
+# ZA-GLS-001 §05 "Determination workflow" transition rules, for the two attestation decisions:
+#   PROPOSED  "May move to IN_REVIEW or ADOPTED where attestation policy permits."
+#   IN_REVIEW "May move to ADOPTED, REJECTED or SUPERSEDED."
+#   ADOPTED   flagged for review by a differing newer evaluation: a new decision is collected and recorded as a new
+#             ADOPTED determination revision on that evaluation (ZA-APP-001 §11 C steps 4-6 "collect new decision ...
+#             AD revision / attestation"; §09 "Supersession: new determination revision"). GLS gives ADOPTED no path to
+#             REJECTED; withdrawal is REVOKED "by authorized process", which is not specified for implementation.
+#   REJECTED  "New facts/rule version may create a new proposal" (an evaluation, never an attestation).
+ATTESTABLE = {"ADOPT": frozenset({"PROPOSED", "IN_REVIEW", "ADOPTED_REVIEW"}), "REJECT": frozenset({"IN_REVIEW"})}
+
+
+def _transition_refused(state: str, decision: str) -> HTTPException:
+    hint = {("PROPOSED", "REJECT"): "Challenge the determination to move it to IN_REVIEW first (GLS: PROPOSED may "
+                                    "move to IN_REVIEW or ADOPTED).",
+            ("ADOPTED_REVIEW", "REJECT"): "An adopted determination cannot become REJECTED (GLS); adopt the newer "
+                                          "evaluation's result, or resolve the review through a new evaluation."}
+    return HTTPException(409, {"error": "DETERMINATION_TRANSITION_NOT_PERMITTED", "from_state": state.replace(
+        "ADOPTED_REVIEW", "ADOPTED"), "decision": decision,
+        "message": f"{decision} is not a permitted transition from {state.replace('_REVIEW', ' (needs review)')}. "
+                   + hint.get((state, decision), "")})
+
+
 def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, authority_basis: str,
-           reason: str | None = None) -> dict:
-    """Customer adoption / rejection (FR-APP-004, INV-01, DOM-INV-03/04)."""
+           reason: str | None = None, expected_revision_id: str | None = None,
+           expected_evaluation_id: str | None = None) -> dict:
+    """Customer adoption / rejection (FR-APP-004, INV-01, DOM-INV-03/04) of the exact current determination revision.
+
+    `expected_revision_id` / `expected_evaluation_id`: the revision the attestor reviewed and the evaluation it is based
+    on. When given, a decision on anything else is refused (409) instead of being applied to a newer state: APP §12
+    "Adopt/reject exact determination revision"; APP §16 "stale/superseded revision cannot be silently attested"."""
     ctx.require_human("Determination adoption")
     ctx.require("attest")
+    if decision not in ATTESTABLE:
+        raise HTTPException(422, "decision must be ADOPT or REJECT")
+    authority_basis = (authority_basis or "").strip()
+    reason = (reason or "").strip() or None
+    if not authority_basis:
+        raise HTTPException(422, "authority_basis is required (APP §13: named actor, authority basis, exact revision)")
 
     def current():
         return db.execute(select(ApplicabilityDetermination).where(
@@ -382,22 +535,32 @@ def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, au
     # revision and is refused (409) instead of creating a second obligation lineage. A partial unique index on current
     # revisions would add a constraint-level guarantee; it is a schema change awaiting review
     # (docs/backend-remediation-report.md), so none is created here.
-    xact_lock(db, "obligation", ctx.tenant, cur.subject_id, cur.obligation_definition_id)
+    lock_decision(db, ctx.tenant, cur.subject_id, cur.obligation_definition_id)
     cur = current()
     if not cur:
         raise HTTPException(404, "Determination not found")
     if cur.state not in ("PROPOSED", "IN_REVIEW") and not (cur.state == "ADOPTED" and cur.needs_review):
         raise HTTPException(409, f"Determination in state {cur.state} cannot be attested")
-    ev = db.get(ApplicabilityEvaluation, cur.evaluation_id)
+    state = "ADOPTED_REVIEW" if cur.state == "ADOPTED" else cur.state
+    if state not in ATTESTABLE[decision]:
+        raise _transition_refused(state, decision)
+    if expected_revision_id is not None and expected_revision_id != cur.revision_id:
+        raise HTTPException(409, {"error": "STALE_DETERMINATION_REVISION", "current_revision_id": cur.revision_id,
+                                  "message": "The determination changed after it was reviewed; review the current "
+                                             "revision before attesting."})
+    latest = latest_evaluation(db, ctx.tenant, cur.subject_id, cur.obligation_definition_id)
+    if cur.state == "ADOPTED" and cur.needs_review:
+        ev = latest or db.get(ApplicabilityEvaluation, cur.evaluation_id)
+    else:
+        ev = db.get(ApplicabilityEvaluation, cur.evaluation_id)
+        # stale-revision protection: the backing evaluation must be the latest for this subject/definition
+        if latest and latest.evaluation_id != ev.evaluation_id:
+            raise HTTPException(409, "A newer evaluation exists; re-review before attesting")
+    if expected_evaluation_id is not None and expected_evaluation_id != ev.evaluation_id:
+        raise HTTPException(409, {"error": "STALE_EVALUATION", "evaluation_id": ev.evaluation_id,
+                                  "message": "The decision would rest on a different evaluation than the one reviewed."})
     if ev.outcome == "UNCERTAIN":
         raise HTTPException(409, "UNCERTAIN cannot be adopted (DOM-INV-03); resolve facts first")
-    # stale-revision protection: the backing evaluation must be the latest for this subject/definition
-    latest = db.execute(select(ApplicabilityEvaluation).where(
-        ApplicabilityEvaluation.tenant_id == ctx.tenant, ApplicabilityEvaluation.subject_id == cur.subject_id,
-        ApplicabilityEvaluation.obligation_definition_id == cur.obligation_definition_id).order_by(
-        ApplicabilityEvaluation.record_seq.desc())).scalars().first()
-    if latest and latest.evaluation_id != ev.evaluation_id:
-        raise HTTPException(409, "A newer evaluation exists; re-review before attesting")
     if decision == "REJECT" and not reason:
         raise HTTPException(422, "Rejection reason is mandatory")
     subject = db.get(Subject, cur.subject_id)
@@ -421,31 +584,57 @@ def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, au
                             actor_id=ctx.actor.actor_id, basis=reason or "Customer attestation")
     audit(db, action="determination.attest", object_type="ApplicabilityDetermination", object_id=rev.lineage_id,
           actor=ctx.actor, tenant_id=ctx.tenant, prior=cur.state, new=new_state, reason=reason, record_seq=seq)
-    obligation = None
+    obligation = closed = None
     if new_state == "ADOPTED":
-        emit(db, event_type="determination.adopted", aggregate_type="ApplicabilityDetermination",
-             aggregate_id=rev.lineage_id, tenant_id=ctx.tenant, actor=ctx.actor_ref(), record_seq=seq,
-             payload={"determination_revision_id": rev.revision_id, "attestation_id": att.attestation_id,
-                      "authority_basis": authority_basis, "outcome": ev.outcome})
         if ev.outcome == "APPLIES":
             obligation = _activate_obligation(db, rev, att, subject, odef, seq, ctx.actor.actor_id)
         else:
-            _close_obligation(db, ctx.tenant, subject.subject_id, odef.obligation_definition_id, seq, rev.valid_from)
+            closed = _close_obligation(db, ctx.tenant, subject.subject_id, odef.obligation_definition_id, seq,
+                                       rev.valid_from, closing_determination=rev, closing_attestation=att)
+        # ZA-EVT-001 / APP §12 minimum payload: "determination revision, attestation ID, actor, authority basis,
+        # resulting obligation instance ID if applicable".
+        resulting = obligation or closed
+        emit(db, event_type="determination.adopted", aggregate_type="ApplicabilityDetermination",
+             aggregate_id=rev.lineage_id, tenant_id=ctx.tenant, actor=ctx.actor_ref(), record_seq=seq,
+             payload={"determination_revision_id": rev.revision_id, "attestation_id": att.attestation_id,
+                      "authority_basis": authority_basis, "outcome": ev.outcome, "evaluation_id": ev.evaluation_id,
+                      "obligation_lineage_id": resulting.lineage_id if resulting else None,
+                      "obligation_revision_id": resulting.revision_id if resulting else None})
+    else:
+        # ZA-EVT-001 "determination.rejected: Authorized customer rejected proposed determination."
+        emit(db, event_type="determination.rejected", aggregate_type="ApplicabilityDetermination",
+             aggregate_id=rev.lineage_id, tenant_id=ctx.tenant, actor=ctx.actor_ref(), record_seq=seq,
+             payload={"determination_revision_id": rev.revision_id, "attestation_id": att.attestation_id,
+                      "authority_basis": authority_basis, "outcome": ev.outcome, "evaluation_id": ev.evaluation_id})
     return {"determination": rev, "attestation": att, "obligation": obligation}
 
 
-def _close_obligation(db, tenant_id, subject_id, odef_id, seq, at):
+def _close_obligation(db, tenant_id, subject_id, odef_id, seq, at, *, closing_determination, closing_attestation):
+    """Close the active obligation after a non-APPLIES determination is adopted: a new CLOSED revision ending at `at`
+    (prospective; the retroactive valid-time policy of APP §11 C step 6 is not specified). The revision keeps naming
+    its originating adoption; the closing decision is recorded at the same record sequence and in the
+    `obligation.revised` event (ZA-EVT-001 "Bitemporal obligation revision recorded")."""
     cur = db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant_id,
                                                       ObligationInstance.subject_id == subject_id,
                                                       ObligationInstance.obligation_definition_id == odef_id,
                                                       ObligationInstance.record_to_seq.is_(None))).scalars().first()
-    if cur and cur.lifecycle == "ADOPTED":
-        cur.record_to_seq = seq
-        db.add(ObligationInstance(lineage_id=cur.lineage_id, tenant_id=tenant_id, entity_id=cur.entity_id,
-                                  subject_id=subject_id, obligation_definition_id=odef_id,
-                                  determination_revision_id=cur.determination_revision_id, attestation_id=cur.attestation_id,
-                                  owner_actor_id=cur.owner_actor_id, lifecycle="CLOSED", valid_from=cur.valid_from,
-                                  valid_to=at, record_from_seq=seq))
+    if not (cur and cur.lifecycle == "ADOPTED"):
+        return None
+    cur.record_to_seq = seq
+    closed = ObligationInstance(lineage_id=cur.lineage_id, tenant_id=tenant_id, entity_id=cur.entity_id,
+                                subject_id=subject_id, obligation_definition_id=odef_id,
+                                determination_revision_id=cur.determination_revision_id, attestation_id=cur.attestation_id,
+                                owner_actor_id=cur.owner_actor_id, lifecycle="CLOSED", valid_from=cur.valid_from,
+                                valid_to=at, record_from_seq=seq)
+    db.add(closed)
+    db.flush()
+    emit(db, event_type="obligation.revised", aggregate_type="ObligationInstance", aggregate_id=cur.lineage_id,
+         tenant_id=tenant_id, entity_id=cur.entity_id, record_seq=seq,
+         payload={"obligation_revision_id": closed.revision_id, "prior_revision_id": cur.revision_id,
+                  "lifecycle": "CLOSED", "valid_to": at,
+                  "closing_determination_revision_id": closing_determination.revision_id,
+                  "closing_attestation_id": closing_attestation.attestation_id})
+    return closed
 
 
 def _activate_obligation(db, det, att, subject, odef, seq, actor_id) -> ObligationInstance:
@@ -477,7 +666,14 @@ def _activate_obligation(db, det, att, subject, odef, seq, actor_id) -> Obligati
         SatisfactionExpressionVersion.obligation_lineage_id == lineage)).scalars().first()
     if not has_expr and odef.satisfaction_template:
         from .assurance import AssuranceConfigurationError, expression_problems
+        from .satisfaction import leaves
         problems = expression_problems(odef.satisfaction_template)
+        # Catalogue content maps control roles only; an exact implementation binding in a stored template (legacy data:
+        # catalog.validate_template refuses it) would point this organisation at a record it may not own (DOM-INV-11).
+        if any("control_implementation_id" in n for _, n in leaves(odef.satisfaction_template)):
+            raise AssuranceConfigurationError("CONTROL_MAPPING_INVALID", "the definition's template binds an exact "
+                                              "control implementation; catalogue templates map control roles only",
+                                              obligation_definition=odef.key)
         if problems:  # STA §16: an invalid expression is blocked before production use, never stored as an obligation's
             raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", "; ".join(problems[:5]),
                                               obligation_definition=odef.key)
@@ -492,38 +688,56 @@ def _activate_obligation(db, det, att, subject, odef, seq, actor_id) -> Obligati
     return oi
 
 
-def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: FactDefinition, actor_id: str) -> list:
-    """Impact scheduling: re-evaluate dependents of a changed FactDefinition (ZA-APP-001 §10)."""
+def fact_impact_plan(db: Session, *, tenant_id: str, holder: Subject, fd: FactDefinition) -> list[tuple]:
+    """The (subject, obligation definition) pairs a change of `fd` on `holder` re-evaluates (ZA-APP-001 §10, TIM §17
+    impact index): the holder and, for a legal entity, its subordinate subjects, for every definition with a published
+    version that needs the fact and that the subject was evaluated against before. Read-only."""
     subjects = [holder]
     if holder.subject_type == "LEGAL_ENTITY":
         subjects += db.execute(select(Subject).where(Subject.tenant_id == tenant_id,
                                                      Subject.entity_id == holder.entity_id,
                                                      Subject.subject_id != holder.subject_id)
                                .order_by(Subject.subject_id)).scalars().all()
-    results = []
+    plan = []
     for s in subjects:
-        odefs = db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)
-                           .order_by(ObligationDefinition.key, ObligationDefinition.obligation_definition_id)).scalars().all()
-        for od in odefs:
-            # A dependent if any published version needs the fact (deterministic; the evaluation resolves the version).
+        for od in db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)
+                             .order_by(ObligationDefinition.key, ObligationDefinition.obligation_definition_id)).scalars():
             versions = db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == od.obligation_definition_id,
                                                             RuleVersion.status == "PUBLISHED")
                                   .order_by(RuleVersion.version.desc())).scalars().all()
             if not any(fd.key in v.required_facts for v in versions):
                 continue
-            had = db.execute(select(ApplicabilityEvaluation).where(
+            had = db.execute(select(ApplicabilityEvaluation.evaluation_id).where(
                 ApplicabilityEvaluation.tenant_id == tenant_id,
                 ApplicabilityEvaluation.subject_id == s.subject_id,
-                ApplicabilityEvaluation.obligation_definition_id == od.obligation_definition_id)
-                .order_by(ApplicabilityEvaluation.record_seq.desc())).scalars().first()
-            if not had:
-                continue
-            try:
-                ev = evaluate(db, tenant_id=tenant_id, subject=s, odef=od, effective_at=datetime.now(timezone.utc),
-                              record_cutoff_seq=None, trigger="FACT_CHANGED", actor_id=actor_id)
-                results.append({"subject": s.display_name, "obligation": od.key, "outcome": ev.outcome})
-            except HTTPException as e:
-                results.append({"subject": s.display_name, "obligation": od.key, "error": e.detail})
+                ApplicabilityEvaluation.obligation_definition_id == od.obligation_definition_id).limit(1)).first()
+            if had:
+                plan.append((s, od))
+    return plan
+
+
+def lock_fact_impact(db: Session, tenant_id: str, plan: list[tuple]) -> None:
+    """Lock every scope a fact change will re-evaluate. Must run before the fact is written, which takes the record
+    sequence (lock_decisions)."""
+    lock_decisions(db, [(tenant_id, s.subject_id, od.obligation_definition_id) for s, od in plan])
+
+
+def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: FactDefinition, actor_id: str,
+                        plan: list[tuple] | None = None) -> list:
+    """Impact scheduling: re-evaluate dependents of a changed FactDefinition (ZA-APP-001 §10). `plan` is the
+    fact_impact_plan the caller computed and locked before writing the fact; without it the plan is computed and locked
+    here, which is only safe in a transaction that has not yet taken the record sequence."""
+    results = []
+    if plan is None:
+        plan = fact_impact_plan(db, tenant_id=tenant_id, holder=holder, fd=fd)
+        lock_fact_impact(db, tenant_id, plan)
+    for s, od in plan:
+        try:
+            ev = evaluate(db, tenant_id=tenant_id, subject=s, odef=od, effective_at=datetime.now(timezone.utc),
+                          record_cutoff_seq=None, trigger="FACT_CHANGED", actor_id=actor_id)
+            results.append({"subject": s.display_name, "obligation": od.key, "outcome": ev.outcome})
+        except HTTPException as e:
+            results.append({"subject": s.display_name, "obligation": od.key, "error": e.detail})
     # resolve fact requests satisfied by new knowledge
     for fr in db.execute(select(FactRequest).where(FactRequest.tenant_id == tenant_id,
                                                    FactRequest.subject_id == holder.subject_id,
@@ -535,7 +749,12 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
 
 
 def shadow_impact(db: Session, *, odef: ObligationDefinition, candidate_ast: dict, candidate_required: list) -> dict:
-    """Shadow evaluation of a candidate rule; returns aggregate buckets only (APP-REQ-014)."""
+    """Shadow evaluation of a candidate rule; returns aggregate buckets only (APP-REQ-014).
+    Raises rules.RuleResourceLimitError before any subject's facts are read when the candidate exceeds a complexity
+    limit (RUL-REQ-029): a budget breach is an infrastructure error, never a per-subject execution error."""
+    violations = rules.resource_limit_violations(candidate_ast)
+    if violations:
+        raise rules.RuleResourceLimitError(violations)
     fact_defs = load_fact_defs(db)
     sets = load_sets(db)
     fdm = {fd.key: fd for fd in db.execute(select(FactDefinition)).scalars()}

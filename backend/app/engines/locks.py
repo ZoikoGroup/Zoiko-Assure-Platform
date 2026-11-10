@@ -21,9 +21,13 @@ from ..db import IS_POSTGRES
 _NAMESPACE = "zoiko-assure:regulatory-core"
 
 
-def xact_lock(db: Session, *parts: str) -> None:
+def xact_lock(db: Session, *parts: str, shared: bool = False) -> None:
+    """Exclusive by default. ``shared=True`` takes the shared mode: shared holders run together and only wait for (and
+    block) an exclusive holder of the same key, e.g. many evaluations of one obligation definition against one
+    publication of a new RuleVersion for it."""
     if not IS_POSTGRES:
         return
     key = "|".join((_NAMESPACE, *(str(p) for p in parts)))
+    fn = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
     # hashtextextended (PostgreSQL 11+) maps the key to a bigint; a collision only over-serialises, never under-locks.
-    db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"), {"k": key})
+    db.execute(text(f"SELECT {fn}(hashtextextended(:k, 0))"), {"k": key})

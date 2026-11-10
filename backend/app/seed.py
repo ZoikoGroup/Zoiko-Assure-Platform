@@ -14,14 +14,16 @@ from sqlalchemy.orm import Session
 from .db import CELL_ID
 from .engines import applicability as appl
 from .engines import assurance as asr
+from .engines import catalog
 from .engines import evidence as evd
 from .engines import ipe as ipe_engine
 from .engines import keys, rules
 from .engines.facts import assert_fact
 from .models import (Actor, AuthorityGrant, AIAssetVersion, Cell, Compensation, ConnectorDefinition,
                      ConnectorInstallation, ContentRelease, ControlDefinition, ControlImplementation, ControlTestPolicy,
-                     ExceptionRecord, ExtractionContractVersion, FactDefinition, FrameworkMapping, Instrument,
-                     IPEPolicyVersion, LegalEntity, MappingContractVersion, ObligationDefinition, ObligationOccurrence,
+                     ExceptionEvent, ExceptionRecord, ExtractionContractVersion, FactDefinition, FrameworkMapping,
+                     Instrument, IPEPolicyVersion, LegalEntity, MappingContractVersion, ObligationDefinition,
+                     ObligationOccurrence, ObligationOccurrenceEvent,
                      Provision, RegulatorySource, RequirementVersion, RuleDraft, RuleVersion, SetVersion, Subject, Tenant,
                      TestDefinition, TestRun, new_id)
 from .platform import canonical_json, next_record_seq, sha256_hex
@@ -166,20 +168,20 @@ def seed(db: Session) -> None:
                     "Financial entities shall have a sound, comprehensive and well-documented ICT risk management framework. The ICT risk "
                     "management framework shall be documented and reviewed at least once a year. Financial entities shall define, establish "
                     "and implement an ICT-related incident management process to detect, manage and notify ICT-related incidents.", date(2025, 1, 17))
-    _, p_hr = req(insts["EU-2024-1689"], "AIA-ART26", "Deployer obligations for high-risk AI systems", "Art. 26(1)-(5)", s_aia, date(2027, 12, 2), [
+    rv_hr, p_hr = req(insts["EU-2024-1689"], "AIA-ART26", "Deployer obligations for high-risk AI systems", "Art. 26(1)-(5)", s_aia, date(2027, 12, 2), [
         ("Art. 26(2)", "DEPLOYER", "assign human oversight", "high-risk AI system", "continuous",
          "Assign human oversight to competent natural persons.", "Oversight assignment record; training evidence"),
         ("Art. 26(5)", "DEPLOYER", "monitor operation and keep logs", "high-risk AI system", "continuous",
          "Monitor operation; retain automatically generated logs.", "Log retention configuration; monitoring reports")])
-    _, p_tr = req(insts["EU-2024-1689"], "AIA-ART50", "Transparency for AI systems interacting with natural persons", "Art. 50(1)", s_aia, date(2026, 8, 2), [
+    rv_tr, p_tr = req(insts["EU-2024-1689"], "AIA-ART50", "Transparency for AI systems interacting with natural persons", "Art. 50(1)", s_aia, date(2026, 8, 2), [
         ("Art. 50(1)", "PROVIDER_DEPLOYER", "inform persons of AI interaction", "AI system interacting with natural persons", "at first interaction",
          "Persons must be informed they are interacting with an AI system.", "UI disclosure evidence")])
-    _, p_dora = req(insts["EU-2022-2554"], "DORA-ART6", "ICT risk management framework", "Art. 6(1),(5)", s_dora, date(2025, 1, 17), [
+    rv_dora, p_dora = req(insts["EU-2022-2554"], "DORA-ART6", "ICT risk management framework", "Art. 6(1),(5)", s_dora, date(2025, 1, 17), [
         ("Art. 6(1)", "FINANCIAL_ENTITY", "maintain documented ICT risk management framework", "ICT risk management framework", "continuous",
          "Maintain a sound, comprehensive, documented ICT risk management framework.", "Framework document; access & MFA controls evidence"),
         ("Art. 6(5)", "FINANCIAL_ENTITY", "review framework", "ICT risk management framework", "at least annually",
          "Review the framework at least once a year.", "Annual review record")])
-    _, p_inc = req(insts["EU-2022-2554"], "DORA-ART17", "ICT-related incident management process", "Art. 17(1)", s_dora, date(2025, 1, 17), [
+    rv_inc, p_inc = req(insts["EU-2022-2554"], "DORA-ART17", "ICT-related incident management process", "Art. 17(1)", s_dora, date(2025, 1, 17), [
         ("Art. 17(1)", "FINANCIAL_ENTITY", "implement incident management process", "ICT-related incidents", "continuous",
          "Define, establish and implement an ICT incident management process.", "Process document; incident drill evidence")])
 
@@ -371,22 +373,87 @@ def seed(db: Session) -> None:
         d.status = "PUBLISHED"
         return rv
 
-    sm_hr = [{"source_mapping_id": "srcmap_aia_26", "provision_locator": "Art. 26", "mapping_type": "DIRECT_TEXT",
-              "interpretation_rationale": "Deployer duties apply to high-risk systems in use under the deployer's authority.", "reviewer": "actor-content-legal"},
-             {"source_mapping_id": "srcmap_aia_6_2", "provision_locator": "Art. 6(2) + Annex III", "mapping_type": "CROSS_REFERENCE",
-              "interpretation_rationale": "High-risk classification via Annex III.", "reviewer": "actor-content-legal"}]
+    sm_hr = [
+        {"source_mapping_id": "srcmap_aia_26", "requirement_version_id": rv_hr.requirement_version_id,
+         "provision_id": p_hr[0], "provision_locator": "Art. 26", "authoritative_reference": "Art. 26",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "DIRECT_TEXT",
+         "interpretation_rationale": "Deployer duties apply to high-risk systems in use under the deployer's authority.",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_aia_2_scope", "requirement_version_id": rv_hr.requirement_version_id,
+         "provision_id": p_hr[0], "provision_locator": "Art. 2(1)(b)", "authoritative_reference": "Art. 2(1)(b)",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "CROSS_REFERENCE",
+         "interpretation_rationale": "Territorial scope: deployers established in the EU (Art. 2(1)(b)).",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_aia_3_4", "requirement_version_id": rv_hr.requirement_version_id,
+         "provision_id": p_hr[0], "provision_locator": "Art. 3(4)", "authoritative_reference": "Art. 3(4)",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "CROSS_REFERENCE",
+         "interpretation_rationale": "Deployer role definition as duty bearer for high-risk system obligations (Art. 3(4)).",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_aia_6_2", "requirement_version_id": rv_hr.requirement_version_id,
+         "provision_id": p_hr[0], "provision_locator": "Art. 6(2) + Annex III", "authoritative_reference": "Art. 6(2)",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "CROSS_REFERENCE",
+         "interpretation_rationale": "High-risk classification via Annex III (Art. 6(2)).",
+         "reviewer": "actor-content-legal"},
+    ]
     publish(o_hr, "AST", ast_hr, vec_hr, date(2027, 12, 2), "CR-2026-AIA-001", sm_hr)
-    publish(o_tr, "AST", ast_tr, vec_tr, date(2026, 8, 2), "CR-2026-AIA-002",
-            [{"source_mapping_id": "srcmap_aia_50_1", "provision_locator": "Art. 50(1)", "mapping_type": "DIRECT_TEXT"}])
-    publish(o_dora, "DECISION_TABLE", dt_dora, vec_dora, date(2025, 1, 17), "CR-2026-DORA-001",
-            [{"source_mapping_id": "srcmap_dora_6_1", "provision_locator": "Art. 6(1)", "mapping_type": "DIRECT_TEXT"}])
-    publish(o_inc, "AST", ast_inc, vec_inc, date(2025, 1, 17), "CR-2026-DORA-002",
-            [{"source_mapping_id": "srcmap_dora_17", "provision_locator": "Art. 17(1)", "mapping_type": "DIRECT_TEXT"}])
+
+    sm_tr = [
+        {"source_mapping_id": "srcmap_aia_50", "requirement_version_id": rv_tr.requirement_version_id,
+         "provision_id": p_tr[0], "provision_locator": "Art. 50", "authoritative_reference": "Art. 50",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "DIRECT_TEXT",
+         "interpretation_rationale": "Transparency obligations for AI systems interacting with natural persons.",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_aia_50_1", "requirement_version_id": rv_tr.requirement_version_id,
+         "provision_id": p_tr[0], "provision_locator": "Art. 50(1)", "authoritative_reference": "Art. 50(1)",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "DIRECT_TEXT",
+         "interpretation_rationale": "Duty to inform natural persons that they are interacting with an AI system.",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_aia_2_1", "requirement_version_id": rv_tr.requirement_version_id,
+         "provision_id": p_tr[0], "provision_locator": "Art. 2(1)(a)", "authoritative_reference": "Art. 2(1)(a)",
+         "source_fingerprint": s_aia.fingerprint, "mapping_type": "CROSS_REFERENCE",
+         "interpretation_rationale": "Scope of application: AI systems placed on the market or put into service in the EU (Art. 2(1)(a)).",
+         "reviewer": "actor-content-legal"},
+    ]
+    publish(o_tr, "AST", ast_tr, vec_tr, date(2026, 8, 2), "CR-2026-AIA-002", sm_tr)
+
+    sm_dora = [
+        {"source_mapping_id": "srcmap_dora_2", "requirement_version_id": rv_dora.requirement_version_id,
+         "provision_id": p_dora[0], "provision_locator": "Art. 2", "authoritative_reference": "Art. 2(1)",
+         "source_fingerprint": s_dora.fingerprint, "mapping_type": "CROSS_REFERENCE",
+         "interpretation_rationale": "Financial entities within the scope of DORA operational resilience requirements (Art. 2(1)).",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_dora_6_1", "requirement_version_id": rv_dora.requirement_version_id,
+         "provision_id": p_dora[0], "provision_locator": "Art. 6(1)", "authoritative_reference": "Art. 6(1)",
+         "source_fingerprint": s_dora.fingerprint, "mapping_type": "DIRECT_TEXT",
+         "interpretation_rationale": "Sound, comprehensive and well-documented ICT risk management framework (Art. 6(1)).",
+         "reviewer": "actor-content-legal"},
+        {"source_mapping_id": "srcmap_dora_16", "requirement_version_id": rv_dora.requirement_version_id,
+         "provision_id": p_dora[0], "provision_locator": "Art. 16", "authoritative_reference": "Art. 16(1)",
+         "source_fingerprint": s_dora.fingerprint, "mapping_type": "CROSS_REFERENCE",
+         "interpretation_rationale": "Simplified ICT risk management framework for microenterprises (Art. 16(1)).",
+         "reviewer": "actor-content-legal"},
+    ]
+    publish(o_dora, "DECISION_TABLE", dt_dora, vec_dora, date(2025, 1, 17), "CR-2026-DORA-001", sm_dora)
+
+    sm_inc = [
+        {"source_mapping_id": "srcmap_dora_17", "requirement_version_id": rv_inc.requirement_version_id,
+         "provision_id": p_inc[0], "provision_locator": "Art. 17(1)", "authoritative_reference": "Art. 17(1)",
+         "source_fingerprint": s_dora.fingerprint, "mapping_type": "DIRECT_TEXT",
+         "interpretation_rationale": "ICT-related incident management process to detect, manage and notify incidents (Art. 17(1)).",
+         "reviewer": "actor-content-legal"},
+    ]
+    publish(o_inc, "AST", ast_inc, vec_inc, date(2025, 1, 17), "CR-2026-DORA-002", sm_inc)
+
     # a draft awaiting the content team (WF-RUL-01 walkthrough)
     db.add(RuleDraft(obligation_definition_id=o_tr.obligation_definition_id, authoring_mode="AST",
                      ast={**ast_tr, "children": ast_tr["children"] + [pred("t3", "NEQ", [fact("t3f", "ai.role"), lit("t3c", "ENUM", "DISTRIBUTOR")], ["srcmap_aia_50_scope"])]},
-                     source_mappings=[{"source_mapping_id": "srcmap_aia_50_scope", "provision_locator": "Art. 50(1)-(2)", "mapping_type": "INTERPRETIVE",
-                                       "interpretation_rationale": "Proposed: exclude pure distributors (draft for legal review)."}],
+                     source_mappings=sm_tr + [{"source_mapping_id": "srcmap_aia_50_scope",
+                                               "requirement_version_id": rv_tr.requirement_version_id,
+                                               "provision_id": p_tr[0], "provision_locator": "Art. 50(1)-(2)",
+                                               "authoritative_reference": "Art. 50(1)", "source_fingerprint": s_aia.fingerprint,
+                                               "mapping_type": "INTERPRETIVE",
+                                               "interpretation_rationale": "Proposed: exclude pure distributors (draft for legal review).",
+                                               "reviewer": "actor-content-legal"}],
                      golden_vectors=vec_tr, valid_from=date(2026, 8, 2), status="DRAFT", change_class="EXECUTABLE_OUTCOME",
                      author_id="actor-content-analyst"))
     db.flush()
@@ -600,9 +667,20 @@ def seed(db: Session) -> None:
     # annual review occurrence (fulfilled before due date)
     review = capture("ICT framework annual review record 2026", "HUMAN_UPLOAD", "P4_MANUAL_UNATTESTED", "2026-09-20", "2026-09-21", 365,
                      "Annual review AR-2026 completed and approved (synthetic)")
-    db.add(ObligationOccurrence(tenant_id=t.tenant_id, obligation_lineage_id=dora_obl.lineage_id, window_from=dt("2026-01-01"),
-                                due_at=dt("2026-09-30"), fulfilled_at=dt("2026-09-20"), evidence_ids=[review.evidence_id],
-                                record_seq=next_record_seq(db)))
+    # Recorded with its history (assurance_obligation_occurrence_event, as governance.schedule_occurrence and
+    # fulfil_occurrence write it): historical snapshots read fulfilment from these events, never from the row.
+    occ_seq = next_record_seq(db)
+    occ = ObligationOccurrence(tenant_id=t.tenant_id, obligation_lineage_id=dora_obl.lineage_id, window_from=dt("2026-01-01"),
+                               due_at=dt("2026-09-30"), fulfilled_at=dt("2026-09-20"), evidence_ids=[review.evidence_id],
+                               record_seq=occ_seq)
+    db.add(occ)
+    db.flush()
+    for kind, fulfilled, evidence, seq in (("SCHEDULED", None, [], occ_seq),
+                                           ("FULFILLED", dt("2026-09-20"), [review.evidence_id], next_record_seq(db))):
+        db.add(ObligationOccurrenceEvent(occurrence_id=occ.occurrence_id, tenant_id=t.tenant_id,
+                                         obligation_lineage_id=dora_obl.lineage_id, event_type=kind, actor_id="actor-owner",
+                                         window_from=occ.window_from, due_at=occ.due_at, fulfilled_at=fulfilled,
+                                         evidence_ids=evidence, is_late=False, record_seq=seq))
     # governance objects: pending compensation (STA §7 example) and an approved exception for the September gap
     db.add(Compensation(tenant_id=t.tenant_id, obligation_lineage_id=dora_obl.lineage_id, primary_control_key="C_MFA_PHISHING_RESISTANT",
                         compensating_expression={"node_type": "ALL", "node_id": "comp_all", "children": [
@@ -611,10 +689,19 @@ def seed(db: Session) -> None:
                         equivalence_rationale="Device attestation plus privileged-network restriction mitigates credential phishing for the "
                                               "residual accounts not yet on FIDO2 during migration.",
                         valid_from=dt("2026-08-15"), valid_to=dt("2026-12-31"), record_seq=next_record_seq(db)))
-    db.add(ExceptionRecord(tenant_id=t.tenant_id, target_type="OBLIGATION", target_id=dora_obl.lineage_id,
-                           reason="September access review delayed by Vanta workflow migration; manual review scheduled.",
-                           state="APPROVED", requested_by="actor-owner", approved_by="actor-risk", valid_from=dt("2026-09-01"),
-                           valid_to=dt("2026-12-31"), record_seq=next_record_seq(db)))
+    exc_seq = next_record_seq(db)
+    exc = ExceptionRecord(tenant_id=t.tenant_id, target_type="OBLIGATION", target_id=dora_obl.lineage_id,
+                          reason="September access review delayed by Vanta workflow migration; manual review scheduled.",
+                          state="APPROVED", requested_by="actor-owner", approved_by="actor-risk", valid_from=dt("2026-09-01"),
+                          valid_to=dt("2026-12-31"), record_seq=exc_seq)
+    db.add(exc)
+    db.flush()
+    # Its history (assurance_exception_event, as governance.request_exception and decide_exception write it).
+    for kind, prior, state, actor, seq in (("REQUESTED", None, "PENDING_APPROVAL", "actor-owner", exc_seq),
+                                           ("APPROVED", "PENDING_APPROVAL", "APPROVED", "actor-risk", next_record_seq(db))):
+        db.add(ExceptionEvent(exception_id=exc.exception_id, tenant_id=t.tenant_id, event_type=kind, from_state=prior,
+                              to_state=state, actor_id=actor, reason=exc.reason, target_type=exc.target_type,
+                              target_id=exc.target_id, valid_from=exc.valid_from, valid_to=exc.valid_to, record_seq=seq))
     db.flush()
 
     # ---------------------------------------------------------------- frozen Q3 snapshots + ledger checkpoint

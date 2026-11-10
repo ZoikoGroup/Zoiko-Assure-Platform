@@ -7,7 +7,7 @@ import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { useActorNames } from "@/lib/people";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, CoverageBadge, ErrorBox, ExceptionBadge, Hash, Json, KV, LiveRegion, Modal, Notice, PageHeader, PeriodSelector, PermissionNote, Table, TabPanel, Tabs, useAction } from "@/components/ui";
+import { A, Badge, Card, CoverageBadge, ErrorBox, ExceptionBadge, Hash, Json, KV, LiveRegion, Modal, Notice, PageHeader, PeriodSelector, PermissionNote, Table, TabPanel, Tabs, useAction, useToast } from "@/components/ui";
 import { ExprTrace, SegmentRibbon, TreatmentList } from "@/components/Trace";
 import { ManualProvenance } from "@/components/EvidenceProvenance";
 import { CompensationSoDNote } from "@/components/CompensationSoD";
@@ -22,7 +22,8 @@ export default function Dossier() {
     <>
       <PageHeader kicker="Obligation dossier" spec="WF-STA-01 Obligation Assurance Dossier" title={d?.definition.title ?? "Obligation"}
         subtitle={d ? `For ${d.subject.display_name} · ${d.definition.key}` : undefined} />
-      <PermissionNote perms={[["manage_controls", "manage_facts"]]} />
+      <PermissionNote perms={[["manage_controls", "manage_facts"], ["request_evaluation", "package"], "request_exception"]}
+        actions={{ "manage_controls|manage_facts": "Add and fulfil occurrences", "request_evaluation|package": "Freeze period snapshots", request_exception: "Request exceptions and compensating controls" }} />
       <ErrorBox error={error} />
       {d && (
         <>
@@ -123,7 +124,7 @@ function Overview({ d, name, go }: { d: any; name: (id?: string | null) => strin
       {(approved > 0 || openIssues > 0) && (
         <Notice tone="warn">
           {approved > 0 && <>{approved} approved exception(s) apply to this obligation. They are shown beside the assurance state and never change it. </>}
-          {openIssues > 0 && <>{openIssues} open issue(s) relate to it: see <A href="/governance">Exceptions &amp; Issues</A>.</>}
+          {openIssues > 0 && <>{openIssues} open issue(s) relate to it: see <A href="/governance">Findings &amp; Actions</A>.</>}
         </Notice>
       )}
     </div>
@@ -139,6 +140,8 @@ function Period({ d, lineage, reload }: { d: any; lineage: string; reload: () =>
   const [cutoff, setCutoff] = useState("");
   const a = useAction();
   const rep = useAction();
+  const { canAny, whyAny } = useCan();
+  const FREEZE = ["request_evaluation", "package"];  // POST /obligations/{lineage}/snapshots accepts any of these
   const [preview, setPreview] = useState<any>(null);
   const fid = useId();
   useEffect(() => setSeg(0), [snapId]);
@@ -154,7 +157,7 @@ function Period({ d, lineage, reload }: { d: any; lineage: string; reload: () =>
           <PeriodSelector required from={from} to={to} onChange={(f, t) => { setFrom(f); setTo(t); }} />
           <div><label className="label" htmlFor={`${fid}-cutoff`}>Record cutoff seq (blank = current watermark)</label><input id={`${fid}-cutoff`} type="number" className="input w-36" value={cutoff} onChange={(e) => setCutoff(e.target.value)} /></div>
           <button className="btn-ghost" disabled={a.busy || !from || !to} onClick={() => a.run(async () => { setPreview(await api(`/obligations/${lineage}/preview`, { method: "POST", json: body() })); setSeg(0); })}>Preview</button>
-          <button className="btn-primary" disabled={a.busy || !from || !to} onClick={() => a.run(async () => {
+          <button className="btn-primary" disabled={a.busy || !from || !to || !canAny(FREEZE)} title={whyAny(FREEZE)} onClick={() => a.run(async () => {
             const r = await api(`/obligations/${lineage}/snapshots`, { method: "POST", json: body() });
             setPreview(null); await reload(); setSnapId(r.snapshot_id);
           })}>Freeze snapshot</button>
@@ -303,7 +306,7 @@ function Occurrences({ d, lineage, reload }: { d: any; lineage: string; reload: 
   const canAdd = can("manage_controls") || can("manage_facts");
   const fid = useId();
   return (
-    <Card title="Occurrences" subtitle="Recurring duties: each due occurrence must be fulfilled with evidence. A missed occurrence is never overwritten by later success. Whether an occurrence was met, late or missed is decided by the backend's period assurance evaluation (Period assurance tab), not by this list.">
+    <Card title="Occurrences" subtitle="Each due occurrence must be fulfilled with evidence. Met, late or missed is decided in Period assurance; a missed occurrence is never overwritten.">
       <ErrorBox error={a.error} />
       <Table head={["Window", "Due", "Fulfilled", "Evidence", "Status", ""]} empty={!d.occurrences.length}>
         {d.occurrences.map((o: any) => (
@@ -312,7 +315,7 @@ function Occurrences({ d, lineage, reload }: { d: any; lineage: string; reload: 
             <td className="td text-xs">{fmtDate(o.fulfilled_at)}</td>
             <td className="td">{(o.evidence_ids || []).map((e: string) => <div key={e}><A href={`/evidence/${e}`}>{e.slice(0, 8)}…</A></div>)}</td>
             <td className="td text-xs text-slate-600">{o.fulfilled_at ? "Fulfilment recorded" : "No fulfilment recorded"}</td>
-            <td className="td">{!o.fulfilled_at && <button className="btn-ghost" onClick={() => setFul(o)}>Record fulfilment</button>}</td>
+            <td className="td">{!o.fulfilled_at && <button className="btn-ghost" disabled={!canAdd} title={canAdd ? undefined : why("manage_controls")} onClick={() => setFul(o)}>Record fulfilment</button>}</td>
           </tr>
         ))}
       </Table>
@@ -360,6 +363,10 @@ function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () =
   const [exc, setExc] = useState({ reason: "", valid_from: "", valid_to: "" });
   const [comp, setComp] = useState({ primary_control_key: d.controls[0]?.control_key ?? "", compensating: "", rationale: "", valid_from: "" });
   const a = useAction();
+  const c = useAction();
+  const toast = useToast();
+  const { can, why } = useCan();
+  const canRequest = can("request_exception");
   const name = useActorNames();
   const fid = useId();
   // Owner of the primary control's implementation as the dossier resolves it now; shown for reference, never compared.
@@ -378,13 +385,15 @@ function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () =
           <div className="sm:col-span-2"><label className="label" htmlFor={`${fid}-exc-reason`}>Request exception — reason (required)</label><input id={`${fid}-exc-reason`} required className="input" value={exc.reason} onChange={(e) => setExc({ ...exc, reason: e.target.value })} /></div>
           <div><label className="label" htmlFor={`${fid}-exc-from`}>From (required)</label><input id={`${fid}-exc-from`} type="date" required className="input" value={exc.valid_from} onChange={(e) => setExc({ ...exc, valid_from: e.target.value })} /></div>
           <div><label className="label" htmlFor={`${fid}-exc-to`}>To (required)</label><input id={`${fid}-exc-to`} type="date" required className="input" value={exc.valid_to} onChange={(e) => setExc({ ...exc, valid_to: e.target.value })} /></div>
-          <div className="sm:col-span-2"><button className="btn-primary" disabled={!exc.reason || !exc.valid_from || !exc.valid_to || a.busy} onClick={() => a.run(async () => {
-            await api("/exceptions", { method: "POST", json: { target_type: "OBLIGATION", target_id: lineage, reason: exc.reason, valid_from: new Date(exc.valid_from).toISOString(), valid_to: new Date(exc.valid_to).toISOString() } });
+          <div className="sm:col-span-2"><button className="btn-primary" disabled={!exc.reason.trim() || !exc.valid_from || !exc.valid_to || a.busy || !canRequest} title={why("request_exception")} onClick={() => a.run(async () => {
+            await api("/exceptions", { method: "POST", json: { target_type: "OBLIGATION", target_id: lineage, reason: exc.reason.trim(), valid_from: new Date(exc.valid_from).toISOString(), valid_to: new Date(exc.valid_to).toISOString() } });
+            setExc({ reason: "", valid_from: "", valid_to: "" }); toast("Exception requested. It now needs approval by someone other than you.", "good");
             reload();
-          })}>Request exception</button> <A href="/governance">Approve in governance →</A></div>
+          })}>{a.busy ? "Requesting…" : "Request exception"}</button> <A href="/governance">Approve in governance →</A></div>
         </div>
       </Card>
       <Card title="Compensating controls" subtitle="Approval creates a new satisfaction-expression version with an explicit COMPENSATION branch — never a manual green flag.">
+        <ErrorBox error={c.error} />
         <Table head={["Primary", "Compensating", "Status", "Rationale", "Proposed / approved by"]} empty={!d.compensations.length}>
           {d.compensations.map((c: any) => (
             <tr key={c.compensation_id}><td className="td mono text-xs">{c.primary_control_key}</td>
@@ -403,11 +412,12 @@ function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () =
           <div className="sm:col-span-2"><label className="label" htmlFor={`${fid}-comp-rationale`}>Equivalence rationale (required, ≥ 20 chars)</label><textarea id={`${fid}-comp-rationale`} required className="input" rows={2} value={comp.rationale} onChange={(e) => setComp({ ...comp, rationale: e.target.value })} /></div>
           <div className="sm:col-span-2"><CompensationSoDNote id={`${fid}-comp-sod`} stage="propose" /></div>
           <div><label className="label" htmlFor={`${fid}-comp-from`}>Valid from (required)</label><input id={`${fid}-comp-from`} type="date" required className="input" value={comp.valid_from} onChange={(e) => setComp({ ...comp, valid_from: e.target.value })} /></div>
-          <div className="flex items-end"><button className="btn-primary" aria-describedby={`${fid}-comp-sod`} disabled={!comp.compensating || !comp.valid_from || a.busy} onClick={() => a.run(async () => {
+          <div className="flex items-end"><button className="btn-primary" aria-describedby={`${fid}-comp-sod`} disabled={!comp.compensating.trim() || !comp.valid_from || c.busy || !canRequest} title={why("request_exception")} onClick={() => c.run(async () => {
             await api("/compensations", { method: "POST", json: { obligation_lineage_id: lineage, primary_control_key: comp.primary_control_key,
               compensating_control_keys: comp.compensating.split(",").map((x) => x.trim()).filter(Boolean), equivalence_rationale: comp.rationale, valid_from: new Date(comp.valid_from).toISOString() } });
+            setComp({ ...comp, compensating: "", rationale: "", valid_from: "" }); toast("Compensating control proposed for approval.", "good");
             reload();
-          })}>Propose compensation</button></div>
+          })}>{c.busy ? "Proposing…" : "Propose compensation"}</button></div>
         </div>
       </Card>
     </div>

@@ -6,12 +6,12 @@ import type { ButtonHTMLAttributes, InputHTMLAttributes, KeyboardEvent as ReactK
 import type { LucideIcon } from "lucide-react";
 import {
   AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Building2, CheckCircle2, ChevronRight, CircleDashed, Flag, HelpCircle, Inbox, Info, Loader2,
-  MinusCircle, Search, ShieldAlert, X, XCircle,
+  Lock, MinusCircle, Search, ShieldAlert, X, XCircle,
 } from "lucide-react";
 import { useAuth } from "@/lib/actor";
 import { ApiError, errText } from "@/lib/api";
 import { short } from "@/lib/format";
-import { permissionText, rolesText } from "@/lib/roles";
+import { heldByText, permissionText, rolesText } from "@/lib/roles";
 
 /* ================================================================ controlled status
    State semantics are conveyed by icon + text + colour — never colour alone (ZA-GLS-001 §11). */
@@ -294,8 +294,12 @@ export function PageTitleProvider({ children }: { children: ReactNode }) {
 }
 export const usePageTitle = () => useContext(PageTitleCtx);
 
-/** `kicker`: what kind of record or workspace the page shows (e.g. "Obligation dossier"), above the title. */
-export function PageHeader({ title, subtitle, actions, spec, kicker }: { title: string; subtitle?: string; actions?: ReactNode; spec?: string; kicker?: ReactNode }) {
+/** `kicker`: what kind of record or workspace the page shows (e.g. "Obligation dossier"), above the title.
+ *  `subtitle`: one short sentence saying what the page is for. `help`: the longer explanation (how records behave,
+ *  regulatory and control rules), shown on request under "About this page" together with the governing `spec`, so the
+ *  working area starts right below the header without losing that context. */
+export function PageHeader({ title, subtitle, actions, spec, kicker, help }:
+  { title: string; subtitle?: string; actions?: ReactNode; spec?: string; kicker?: ReactNode; help?: ReactNode }) {
   const { setTitle } = usePageTitle();
   useEffect(() => { setTitle(title); return () => setTitle(""); }, [title, setTitle]);
   return (
@@ -303,15 +307,29 @@ export function PageHeader({ title, subtitle, actions, spec, kicker }: { title: 
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           {kicker && <div data-za="page-context" className="mb-1 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">{kicker}</div>}
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-xl font-semibold tracking-tight text-slate-900">{title}</h1>
-            {spec && <span title="Governing specification" className="mono rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] text-slate-500">{spec}</span>}
-          </div>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900">{title}</h1>
           {subtitle && <p className="mt-1 max-w-3xl text-[13px] leading-5 text-slate-500">{subtitle}</p>}
+          {(help || spec) && <PageHelp spec={spec}>{help}</PageHelp>}
         </div>
         {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
       </div>
     </div>
+  );
+}
+
+/** "About this page": contextual explanation kept one click away instead of in front of the working area. */
+export function PageHelp({ children, spec, label = "About this page" }: { children?: ReactNode; spec?: string; label?: string }) {
+  return (
+    <details className="group mt-1.5 max-w-3xl text-[13px]">
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1 rounded text-[12px] font-medium text-navy-700 hover:text-navy-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 [&::-webkit-details-marker]:hidden">
+        <HelpCircle size={13} aria-hidden />{label}
+        <ChevronRight size={12} aria-hidden className="transition-transform group-open:rotate-90" />
+      </summary>
+      <div className="mt-1.5 space-y-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 leading-5 text-slate-600">
+        {children}
+        {spec && <p className="text-[11px] text-slate-500">Specification: <span className="mono">{spec}</span></p>}
+      </div>
+    </details>
   );
 }
 
@@ -359,14 +377,15 @@ export function TabPanel({ id, value, children }: { id: string; value: string; c
 /* ================================================================ tables */
 /** `loading` shows placeholder rows until the first response arrives, so a list that is still loading is never shown
  *  as an empty one ("Nothing here yet") or as a bare header. */
-export function Table({ head, children, empty, loading }: { head: string[]; children: ReactNode; empty?: boolean; loading?: boolean }) {
+export function Table({ head, children, empty, loading, emptyTitle = "Nothing here yet", emptyDescription, emptyAction }:
+  { head: string[]; children: ReactNode; empty?: boolean; loading?: boolean; emptyTitle?: string; emptyDescription?: ReactNode; emptyAction?: ReactNode }) {
   return (
     <div className="scroll-thin overflow-x-auto">
       <table className="min-w-full border-separate border-spacing-0">
         <thead><tr>{head.map((h, i) => <th key={`${h}-${i}`} className="th border-b border-slate-200">{h}</th>)}</tr></thead>
         <tbody className="[&>tr:hover]:bg-slate-50/70 [&>tr>td]:border-b [&>tr>td]:border-slate-100">{children}</tbody>
       </table>
-      {loading ? <LoadingSkeleton rows={4} /> : empty && <EmptyState title="Nothing here yet" compact />}
+      {loading ? <LoadingSkeleton rows={4} /> : empty && <EmptyState title={emptyTitle} description={emptyDescription} action={emptyAction} compact />}
     </div>
   );
 }
@@ -482,17 +501,32 @@ export function LiveRegion({ children }: { children?: ReactNode }) {
 }
 
 /** Visible reason for buttons disabled by role, so it does not rely on a `title` tooltip that keyboard and touch users
- *  cannot open. Each entry is a permission, or a list of which any one is enough. Display only; the backend decides. */
-export function PermissionNote({ perms, className = "mb-4" }: { perms: (string | string[])[]; className?: string }) {
+ *  cannot open. Each entry is a permission, or a list of which any one is enough; `actions` names, per entry (keyed by
+ *  its permissions joined with "|"), what it blocks on this page. Each line says which roles can do it, so the person
+ *  knows whom to ask. Display only; the backend decides. */
+export function PermissionNote({ perms, actions, className = "mb-4" }:
+  { perms: (string | string[])[]; actions?: Record<string, string>; className?: string }) {
   const { me } = useAuth();
   const missing = perms.map((p) => (Array.isArray(p) ? p : [p])).filter((any) => !any.some((p) => me?.permissions?.includes(p)));
   if (!me || !missing.length) return null;
   return (
-    <div className={className}>
-      <Notice>
-        Your role ({rolesText(me) || "none"}) does not include the permissions below, so the actions on this page that need them are disabled:
-        <ul className="mt-1 list-disc pl-5">{missing.map((any) => <li key={any.join("|")}>{any.map(permissionText).join(" or ")}</li>)}</ul>
-      </Notice>
+    <div role="note" className={`${className} flex items-start gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[12px] leading-5 text-slate-700`}>
+      <Lock size={14} aria-hidden className="mt-0.5 shrink-0 text-slate-500" />
+      <div className="min-w-0">
+        <span className="font-medium text-slate-800">Some actions here aren&apos;t available to your role</span> ({rolesText(me) || "none"}).
+        <ul className="mt-0.5 space-y-0.5">
+          {missing.map((any) => {
+            const key = any.join("|");
+            const held = heldByText(any);
+            return (
+              <li key={key}>
+                {actions?.[key] ? <span className="font-medium">{actions[key]}: </span> : null}
+                needs “{any.map(permissionText).join("” or “")}”{held ? <> — ask a {held}</> : <> — done by Zoiko&apos;s platform and content teams, not by an organisation role</>}.
+              </li>
+            );
+          })}
+        </ul>
+      </div>
     </div>
   );
 }

@@ -18,7 +18,7 @@ What this proves, per the matrix:
 * Org Settings: entity registration validates its input (API-REQ-014/033) and is audited (IAM-REQ-037).
 * Overview: the "Obligations due / late" figure is a recount of recorded occurrences, not synthetic.
 
-Regenerate the `perms` of frontend/lib/screen-access.json deliberately with:
+Regenerate the `perms` and `roles` of frontend/lib/screen-access.json deliberately with:
     python tests/test_sidebar_integration.py      (from backend/)
 """
 from __future__ import annotations
@@ -81,6 +81,15 @@ def screen_perms(reads: list[str]) -> list[str]:
         assert not op.requirement.platform and not op.requirement.human, f"{path}: screen reads need no platform/human flag"
         out = set(op.requirement.permissions) if out is None else out & set(op.requirement.permissions)
     return sorted(out or set())
+
+
+def tenant_role_permissions() -> dict[str, list[str]]:
+    """The permissions each organisation role a person can hold confers (ROLE_PERMISSIONS), so the frontend can name
+    which roles may take an action its user cannot. Workload identities (SERVICE) are left out: no person holds them."""
+    from app.iam import ASSIGNABILITY
+    from app.security import ROLE_PERMISSIONS
+    codes = [c for c in ASSIGNABILITY if c != "SERVICE"] + ["TENANT_OWNER"]
+    return {c: sorted(ROLE_PERMISSIONS[c]) for c in codes}
 
 
 def _access() -> dict:
@@ -174,7 +183,7 @@ def _normalise(literal: str) -> str | None:
     return out if out.startswith("/") and not out.startswith("/{}") else None
 
 
-CALL = re.compile(r"\b(useApi|api|download|fetch)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(")
+CALL = re.compile(r"\b(useApi|api|download|fetch|uploadForm)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(")
 
 
 def frontend_calls() -> list[tuple[str, str, str]]:
@@ -196,7 +205,7 @@ def frontend_calls() -> list[tuple[str, str, str]]:
                     j += 1
             if fn == "fetch":
                 literals = [x for x in literals if x.startswith("${API}")]
-            method = "GET"
+            method = "POST" if fn == "uploadForm" else "GET"  # lib/api.ts uploadForm always POSTs
             if fn in ("api", "fetch"):
                 mm = re.search(r"\bmethod\s*:\s*[\"'](\w+)[\"']", args)
                 method = mm.group(1).upper() if mm else "GET"
@@ -221,7 +230,8 @@ def test_the_scanner_sees_the_calls_this_task_wired():
     for call in (("GET", "/audit-events"), ("GET", "/sessions"), ("POST", "/sessions/{}/revoke"),
                  ("GET", "/principals/{}/sessions"), ("GET", "/roles"), ("GET", "/role-assignments"),
                  ("POST", "/role-assignments"), ("POST", "/role-assignments/{}/revoke"),
-                 ("GET", "/principals/{}/effective-access"), ("GET", "/platform/organisations")):
+                 ("GET", "/principals/{}/effective-access"), ("GET", "/platform/organisations"),
+                 ("POST", "/evidence/upload")):
         assert call in found, call
 
 
@@ -239,6 +249,8 @@ def test_screen_access_is_generated_from_the_backend_guards():
              if s["perms"] != screen_perms(s["reads"])}
     assert not stale, f"regenerate frontend/lib/screen-access.json and review: {stale}"
     assert all(s["perms"] for s in every.values()), "reads that no permission satisfies can never be made"
+    # "Which roles can do this" in the frontend's permission notes is the backend catalogue, never a separate list.
+    assert doc["roles"] == tenant_role_permissions(), "regenerate frontend/lib/screen-access.json (roles)"
 
 
 @pytest.mark.parametrize("actor", ["actor-cco", "actor-ext-auditor", "sb-tsa", "sb-super", "actor-content-analyst"])
@@ -711,5 +723,6 @@ if __name__ == "__main__":  # regenerate the `perms` of frontend/lib/screen-acce
     doc = json.loads(ACCESS.read_text(encoding="utf-8"))
     for screen in [*doc["screens"].values(), *doc["shell"].values(), *doc["panels"].values()]:
         screen["perms"] = screen_perms(screen["reads"])
+    doc["roles"] = tenant_role_permissions()
     ACCESS.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {ACCESS} ({len(doc['screens'])} screens, {len(doc['shell'])} shell reads, {len(doc['panels'])} panels)")

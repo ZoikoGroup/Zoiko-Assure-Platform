@@ -21,6 +21,19 @@ OUTCOME = {TRUE: "APPLIES", FALSE: "DOES_NOT_APPLY", UNKNOWN: "UNCERTAIN"}
 
 SCHEMA_VERSION = "1.0"
 OPERATOR_SET_VERSION = "1.0"
+# The RuleSchemaVersions and OperatorSetVersions this evaluator implements. RUL-REQ-028: a RuleVersion declaring any
+# other version "MUST be rejected explicitly and MUST NOT be interpreted approximately by older runtimes". A version is
+# added here only together with the evaluator support for it (and its golden-vector regression, RUL-REQ-017).
+SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
+SUPPORTED_OPERATOR_SET_VERSIONS = frozenset({OPERATOR_SET_VERSION})
+
+
+def unsupported_versions(rule_schema_version, operator_set_version) -> dict | None:
+    """The declared versions this runtime does not implement, or None when both are supported."""
+    bad = {k: v for k, v, ok in (("rule_schema_version", rule_schema_version, SUPPORTED_SCHEMA_VERSIONS),
+                                 ("operator_set_version", operator_set_version, SUPPORTED_OPERATOR_SET_VERSIONS))
+           if v not in ok}
+    return bad or None
 LIMITS = {"max_depth": 32, "max_nodes": 500, "max_inline_set": 100, "max_table_rows": 250,
           "max_conditions_per_row": 40, "max_source_mappings_per_node": 20}
 
@@ -43,8 +56,119 @@ class RuleError(Exception):
         self.code, self.message, self.node_id = code, message, node_id
 
 
+class RuleResourceLimitError(RuleError):
+    """RUL-REQ-029: the rule exceeds a ZA-RUL-001 §11 complexity limit at runtime. "Budget breach is infrastructure
+    error, never UNCERTAIN": the evaluator does not start, and no outcome of any kind is produced."""
+
+    def __init__(self, violations: list[dict]):
+        super().__init__("RUL_RESOURCE_LIMIT", " ".join(v["message"] for v in violations))
+        self.violations = violations
+
+
+_LIMIT_ORDER = ("max_depth", "max_nodes", "max_inline_set", "max_table_rows", "max_conditions_per_row",
+                "max_source_mappings_per_node")
+
+
+def _executed_children(n: dict) -> list:
+    """The operands the evaluator (_Eval) executes for a node, in its order. A malformed ``children``/``args`` value
+    (not a list) has no operands to measure here; validate() reports it as RUL_SCHEMA_INVALID."""
+    nt = n.get("node_type")
+    if nt in ("ALL", "ANY"):
+        ch = n.get("children")
+        return list(ch) if isinstance(ch, list) else []
+    if nt == "NOT":
+        return [n.get("child")]
+    if nt == "PREDICATE":
+        args = n.get("args")
+        return list(args) if isinstance(args, list) else []
+    return []
+
+
+def _table_limit_issues(n: dict, nid) -> list[dict]:
+    """ZA-RUL-001 §11 "Maximum decision-table rows 250 / Maximum conditions per row 40: Validation error", measured
+    on any node of the AST exactly as resource_limit_violations measures it at runtime (the executed operands of a
+    ``decision_table`` root and of a ``row_id`` node), whether the AST was compiled from a table or authored directly,
+    and wherever the table or row is nested (RUL-REQ-029)."""
+    kids = _executed_children(n)
+    out = []
+    if n.get("decision_table") and len(kids) > LIMITS["max_table_rows"]:
+        out.append(_limit_issue("max_table_rows", f"Decision table {nid} has {len(kids)} rows; the limit is "
+                                f"{LIMITS['max_table_rows']}.", nid))
+    if "row_id" in n and len(kids) > LIMITS["max_conditions_per_row"]:
+        out.append(_limit_issue("max_conditions_per_row", f"Row {n['row_id']} has {len(kids)} conditions; the limit "
+                                f"is {LIMITS['max_conditions_per_row']}.", nid))
+    return out
+
+
+def resource_limit_violations(ast: Any) -> list[dict]:
+    """The ZA-RUL-001 §11 compiler resource limits (LIMITS), measured on the AST the evaluator is about to execute.
+    RUL-REQ-029: "Rule complexity limits MUST be enforced at validation and runtime"; this is the runtime half, run
+    before execution starts. Each limit is measured exactly as validation measures it, so a rule that validation accepts
+    under the same LIMITS is never refused here:
+
+      max_depth                     the root is depth 1; ALL/ANY children, the NOT child and PREDICATE args are one
+                                    level deeper (validate() walk depth);
+      max_nodes                     every node object the evaluator can reach (validate() node_count);
+      max_inline_set                elements of an inline SET<T> literal (CONST);
+      max_source_mappings_per_node  source_mappings on one node;
+      max_table_rows                rows of a compiled decision table (children of its decision_table root);
+      max_conditions_per_row        conditions of one compiled row (children of a row_id node).
+
+    Every violation is reported, not only the first: per limit in LIMITS order, then in walk order. The walk is
+    iterative, so an AST nested beyond the limit cannot exhaust the interpreter stack while it is measured."""
+    if not isinstance(ast, dict):
+        return []
+    found: dict[str, list[dict]] = {k: [] for k in _LIMIT_ORDER}
+    nodes, deepest, deepest_id = 0, 0, None
+    stack = [(ast, 1)]
+    while stack:
+        n, depth = stack.pop()
+        if not isinstance(n, dict):
+            continue
+        nodes += 1
+        nid = n.get("node_id")
+        if depth > deepest:
+            deepest, deepest_id = depth, nid
+        sm = n.get("source_mappings")
+        sm = sm if isinstance(sm, list) else []  # a malformed value maps nothing (validate: RUL_SCHEMA_INVALID)
+        if len(sm) > LIMITS["max_source_mappings_per_node"]:
+            found["max_source_mappings_per_node"].append(
+                {"limit": "max_source_mappings_per_node", "allowed": LIMITS["max_source_mappings_per_node"],
+                 "actual": len(sm), "node_id": nid,
+                 "message": f"Node {nid} has {len(sm)} source mappings; the limit is {LIMITS['max_source_mappings_per_node']}."})
+        if n.get("node_type") == "CONST" and is_set(n.get("type")) and isinstance(n.get("value"), list) \
+                and len(n["value"]) > LIMITS["max_inline_set"]:
+            found["max_inline_set"].append(
+                {"limit": "max_inline_set", "allowed": LIMITS["max_inline_set"], "actual": len(n["value"]), "node_id": nid,
+                 "message": f"Inline set {nid} has {len(n['value'])} elements; the limit is {LIMITS['max_inline_set']}."})
+        kids = _executed_children(n)
+        if n.get("decision_table") and len(kids) > LIMITS["max_table_rows"]:
+            found["max_table_rows"].append(
+                {"limit": "max_table_rows", "allowed": LIMITS["max_table_rows"], "actual": len(kids), "node_id": nid,
+                 "message": f"Decision table {nid} has {len(kids)} rows; the limit is {LIMITS['max_table_rows']}."})
+        if "row_id" in n and len(kids) > LIMITS["max_conditions_per_row"]:
+            found["max_conditions_per_row"].append(
+                {"limit": "max_conditions_per_row", "allowed": LIMITS["max_conditions_per_row"], "actual": len(kids),
+                 "node_id": nid,
+                 "message": f"Row {n['row_id']} has {len(kids)} conditions; the limit is {LIMITS['max_conditions_per_row']}."})
+        stack.extend((c, depth + 1) for c in reversed(kids))
+    if deepest > LIMITS["max_depth"]:
+        found["max_depth"].append({"limit": "max_depth", "allowed": LIMITS["max_depth"], "actual": deepest,
+                                   "node_id": deepest_id,
+                                   "message": f"AST depth {deepest} exceeds the limit of {LIMITS['max_depth']}."})
+    if nodes > LIMITS["max_nodes"]:
+        found["max_nodes"].append({"limit": "max_nodes", "allowed": LIMITS["max_nodes"], "actual": nodes, "node_id": None,
+                                   "message": f"The rule has {nodes} nodes; the limit is {LIMITS['max_nodes']}."})
+    return [v for k in _LIMIT_ORDER for v in found[k]]
+
+
 def _issue(code, msg, node_id=None, severity="ERROR"):
     return {"code": code, "severity": severity, "node_id": node_id, "message": msg}
+
+
+def _limit_issue(limit: str, msg: str, node_id=None) -> dict:
+    """A RUL_RESOURCE_LIMIT validation error naming the ZA-RUL-001 §11 limit it enforces (LIMITS key)."""
+    return {**_issue("RUL_RESOURCE_LIMIT", msg, node_id), "limit": limit}
 
 
 # ------------------------------------------------------------------ types
@@ -65,8 +189,31 @@ def _base(t: str) -> str:
 
 
 # ------------------------------------------------------------------ decision tables
-def compile_decision_table(table: dict) -> tuple[dict, list[dict]]:
-    """Compile a decision table into the canonical AST. Returns (ast, issues)."""
+def decision_table_shape_problems(table: Any) -> list[dict]:
+    """Structural problems that stop a decision table from being compiled at all: the table is an object, ``columns``
+    a list of objects each with a string ``column_id`` and ``fact``, ``rows`` a list of objects whose ``cells`` (if
+    present) is an object and whose ``row_id`` is a string. Reported as RUL_SCHEMA_INVALID, never raised."""
+    if not isinstance(table, dict):
+        return [_issue("RUL_SCHEMA_INVALID", "decision_table must be an object.")]
+    issues = []
+    cols, rows = table.get("columns", []), table.get("rows", [])
+    if not isinstance(cols, list) or not all(
+            isinstance(c, dict) and isinstance(c.get("column_id"), str) and isinstance(c.get("fact"), str) for c in cols):
+        issues.append(_issue("RUL_SCHEMA_INVALID", "columns must be a list of objects with string column_id and fact."))
+    if not isinstance(rows, list) or not all(
+            isinstance(r, dict) and isinstance(r.get("row_id"), str) and isinstance(r.get("cells", {}), dict)
+            for r in rows):
+        issues.append(_issue("RUL_SCHEMA_INVALID", "rows must be a list of objects with a string row_id and an object "
+                                                   "of cells."))
+    return issues
+
+
+def compile_decision_table(table: dict) -> tuple[dict | None, list[dict]]:
+    """Compile a decision table into the canonical AST. Returns (ast, issues); ast is None when the table is too
+    malformed to compile (decision_table_shape_problems)."""
+    shape = decision_table_shape_problems(table)
+    if shape:
+        return None, shape
     issues: list[dict] = []
     mode = table.get("table_mode")
     if mode == "FIRST_MATCH":
@@ -76,7 +223,7 @@ def compile_decision_table(table: dict) -> tuple[dict, list[dict]]:
     cols = {c["column_id"]: c for c in table.get("columns", [])}
     rows = table.get("rows", [])
     if len(rows) > LIMITS["max_table_rows"]:
-        issues.append(_issue("RUL_RESOURCE_LIMIT", "Too many decision-table rows."))
+        issues.append(_limit_issue("max_table_rows", "Too many decision-table rows."))
     seen_sigs: dict[str, str] = {}
     row_nodes = []
     for row in rows:
@@ -98,7 +245,7 @@ def compile_decision_table(table: dict) -> tuple[dict, list[dict]]:
                           "args": [{"node_type": "FACT_REF", "node_id": f"row_{rid}_{cid}_fact", "fact": col["fact"]}, right],
                           "source_mappings": [], "inherits_mapping": True})
         if len(preds) > LIMITS["max_conditions_per_row"]:
-            issues.append(_issue("RUL_RESOURCE_LIMIT", f"Row {rid} has too many conditions."))
+            issues.append(_limit_issue("max_conditions_per_row", f"Row {rid} has too many conditions.", f"row_{rid}"))
         if not preds:
             issues.append(_issue("RUL_DECISION_DUPLICATE_ROW", f"Row {rid} is all ANY (unconditional match).", f"row_{rid}"))
         sig = json.dumps(cells, sort_keys=True)
@@ -116,7 +263,7 @@ def compile_decision_table(table: dict) -> tuple[dict, list[dict]]:
             for j in range(i + 1, len(rows)):
                 exclusive = False
                 for cid, col in cols.items():
-                    a, b = rows[i]["cells"].get(cid), rows[j]["cells"].get(cid)
+                    a, b = rows[i].get("cells", {}).get(cid), rows[j].get("cells", {}).get(cid)
                     if col.get("operator", "EQ") == "EQ" and a not in (None, "ANY") and b not in (None, "ANY") and a != b:
                         exclusive = True
                 if not exclusive:
@@ -131,6 +278,19 @@ def compile_decision_table(table: dict) -> tuple[dict, list[dict]]:
 
 
 # ------------------------------------------------------------------ validation / type checking
+def _mapping_refs(n: dict, nid, issues: list) -> list:
+    """The source-mapping references a node carries: a list of source_mapping_id strings (ZA-RUL-001 §04 example
+    `"source_mappings":["srcmap_42"]`; §08 source_mapping_id). Anything else is a schema error and maps nothing, so a
+    malformed value can never make a branch count as mapped."""
+    sm = n.get("source_mappings")
+    if sm is None or sm == []:
+        return []
+    if not isinstance(sm, list) or not all(isinstance(r, str) and r.strip() for r in sm):
+        issues.append(_issue("RUL_SCHEMA_INVALID", "source_mappings must be a list of source mapping IDs.", nid))
+        return []
+    return sm
+
+
 def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict]) -> dict:
     """Schema parse + reference resolution + static type check + lint + limits (ZA-RUL-001 §11)."""
     issues: list[dict] = []
@@ -155,18 +315,28 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
             if k.lower() in PROHIBITED_KEYS:
                 issues.append(_issue("RUL_PROHIBITED_CONSTRUCT", f"Prohibited construct '{k}'.", nid))
         if depth > LIMITS["max_depth"]:
-            issues.append(_issue("RUL_RESOURCE_LIMIT", "AST depth limit exceeded.", nid))
+            issues.append(_limit_issue("max_depth", "AST depth limit exceeded.", nid))
             return None
         nt = n.get("node_type")
         if nt not in NODE_TYPES:
             issues.append(_issue("RUL_UNKNOWN_NODE", f"Unknown node_type {nt!r}.", nid))
             return None
-        sm = n.get("source_mappings") or []
+        issues.extend(_table_limit_issues(n, nid))
+        sm = _mapping_refs(n, nid, issues)
         if len(sm) > LIMITS["max_source_mappings_per_node"]:
-            issues.append(_issue("RUL_RESOURCE_LIMIT", "Too many source mappings on node.", nid))
+            issues.append(_limit_issue("max_source_mappings_per_node", "Too many source mappings on node.", nid))
+        if "row_id" in n and not sm:
+            # §07 source_mapping_refs: "Each row maps to at least one source/interpretation reference", whichever
+            # authoring view produced the row (the decision-table compiler reports the same issue for its own rows).
+            issues.append(_issue("RUL_SOURCE_MAPPING_REQUIRED", f"Row {n.get('row_id')} has no source mapping.", nid))
+        # Mapped means a source mapping actually carried by this node or an enclosing one. inherits_mapping is never
+        # proof of anything: it is an ordinary field of the submitted AST, so an author can set it on any node.
         here_mapped = mapped or bool(sm)
         if nt in ("ALL", "ANY"):
             ch = n.get("children") or []
+            if not isinstance(ch, list):
+                issues.append(_issue("RUL_SCHEMA_INVALID", f"{nt} children must be a list of nodes.", nid))
+                return "TRUTH3"
             if len(ch) < (1 if (n.get("row_id") or n.get("decision_table")) else 2):
                 issues.append(_issue("RUL_SCHEMA_INVALID", f"{nt} requires >= 2 children.", nid))
             for c in ch:
@@ -185,15 +355,21 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
             if op not in SIGNATURES:
                 issues.append(_issue("RUL_UNKNOWN_OPERATOR", f"Operator {op!r} not in OperatorSetVersion 1.0.", nid))
                 return "TRUTH3"
-            if not here_mapped and not n.get("inherits_mapping"):
-                issues.append(_issue("RUL_SOURCE_MAPPING_REQUIRED", "Predicate lacks legal source mapping.", nid))
+            if not here_mapped:
+                # RUL-REQ-008 / §08 branch coverage rule: a source mapping "directly or inherit[ed] ... from an
+                # enclosing legal branch with an explicit inheritance flag". The flag marks an inheritance; it cannot
+                # create one where no enclosing branch carries a mapping.
+                issues.append(_issue("RUL_SOURCE_MAPPING_REQUIRED",
+                                     "Predicate sets inherits_mapping but no enclosing legal branch carries a source "
+                                     "mapping." if n.get("inherits_mapping") else "Predicate lacks legal source mapping.",
+                                     nid))
             args = n.get("args") or []
-            if len(args) != SIGNATURES[op]:
+            if not isinstance(args, list) or len(args) != SIGNATURES[op]:
                 issues.append(_issue("RUL_SCHEMA_INVALID", f"{op} expects {SIGNATURES[op]} args.", nid))
                 return "TRUTH3"
             types = [walk(a, depth + 1, here_mapped) for a in args]
             if op in ("EXISTS", "IS_UNKNOWN"):
-                if args[0].get("node_type") != "FACT_REF":
+                if not isinstance(args[0], dict) or args[0].get("node_type") != "FACT_REF":
                     issues.append(_issue("RUL_TYPE_MISMATCH", f"{op} accepts FactRef only.", nid))
                 if op == "IS_UNKNOWN":
                     issues.append(_issue("RUL_LINT_IS_UNKNOWN", "IS_UNKNOWN is restricted; ensure it is intended.", nid, "WARNING"))
@@ -224,7 +400,7 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
                 if not isinstance(v, list):
                     issues.append(_issue("RUL_TYPE_MISMATCH", "Inline set must be a list.", nid))
                 elif len(v) > LIMITS["max_inline_set"]:
-                    issues.append(_issue("RUL_RESOURCE_LIMIT", "Inline set too large; use SetVersion.", nid))
+                    issues.append(_limit_issue("max_inline_set", "Inline set too large; use SetVersion.", nid))
                 return t
             if _base(t) not in SCALARS:
                 issues.append(_issue("RUL_TYPE_MISMATCH", f"Unknown literal type {t!r}.", nid))
@@ -247,7 +423,15 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
 
     walk(ast, 1, False)
     if counter["nodes"] > LIMITS["max_nodes"]:
-        issues.append(_issue("RUL_RESOURCE_LIMIT", "Executable node limit exceeded."))
+        issues.append(_limit_issue("max_nodes", "Executable node limit exceeded."))
+    # RUL-REQ-029 parity: validation must refuse everything the runtime guard (resource_limit_violations) would refuse,
+    # so a rule this validator accepts can never fail its budget at evaluation. The walk above stops at the first
+    # schema error of a branch; the runtime measures every reachable node, so any limit it finds that the walk did
+    # not report is added here, with the runtime's own message and node.
+    flagged = {i.get("limit") for i in issues if i["code"] == "RUL_RESOURCE_LIMIT"}
+    for v in resource_limit_violations(ast):
+        if v["limit"] not in flagged:
+            issues.append(_limit_issue(v["limit"], v["message"], v["node_id"]))
     errors = [i for i in issues if i["severity"] == "ERROR"]
     return {"ok": not errors, "issues": issues, "error_count": len(errors),
             "warning_count": len(issues) - len(errors), "required_facts": sorted(required_facts),
@@ -500,7 +684,11 @@ def _collect_unknown_facts(trace: dict, material: bool, mat: set, nonmat: set):
 
 
 def evaluate(ast: dict, facts: dict, fact_types: dict, sets: dict, context: dict) -> dict:
-    """Pure deterministic evaluation. ``facts``: key -> {known, value, revision_id} | {known: False, reason}."""
+    """Pure deterministic evaluation. ``facts``: key -> {known, value, revision_id} | {known: False, reason}.
+    Raises RuleResourceLimitError, before any node executes, when the AST exceeds a complexity limit (RUL-REQ-029)."""
+    violations = resource_limit_violations(ast)
+    if violations:
+        raise RuleResourceLimitError(violations)
     ev = _Eval(facts, fact_types, sets, context)
     res, trace = ev.truth(ast)
     mat, nonmat = set(), set()

@@ -27,9 +27,9 @@ from test_authorization import db_fingerprint, denials
 TAG = secrets.token_hex(3).upper()
 INSTR, INSTR_B = f"RT-{TAG}-REG", f"RT-{TAG}-OTHER"
 AUTHOR, PEER, LEGAL, RELEASE = "actor-content-analyst", "actor-encoder", "actor-content-legal", "actor-release"
-TA, TB = "tenant-rt-a", "tenant-rt-b"
-A_CCO, B_CCO, SUPER = "rt-a-cco", "rt-b-cco", "rt-super"
-SUBJECT = "subj-rt-a"
+TA, TB = f"tenant-rt-a-{TAG}", f"tenant-rt-b-{TAG}"
+A_CCO, B_CCO, SUPER = f"rt-a-cco-{TAG}", f"rt-b-cco-{TAG}", f"rt-super-{TAG}"
+SUBJECT = f"subj-rt-a-{TAG}"
 
 
 def _audit(action, **where):
@@ -60,7 +60,7 @@ def world(client):
         for ident in (INSTR, INSTR_B):
             db.add(Instrument(identifier=ident, title=f"Traceability probe instrument {ident}", jurisdiction="EU",
                               authority="Probe Authority", coverage_mode="ENCODED", regime_owner="Zoiko probe"))
-        for tid, sid in ((TA, SUBJECT), (TB, "subj-rt-b")):
+        for tid, sid in ((TA, SUBJECT), (TB, f"subj-rt-b-{TAG}")):
             if db.get(Tenant, tid) is None:
                 db.add(Tenant(tenant_id=tid, legal_name=f"{tid} Group", contracting_region="EU"))
                 db.flush()
@@ -290,7 +290,7 @@ def test_requirement_listing_filters_and_cursor_pagination(client, world):
     first = client.get("/api/catalog/requirements", params={"instrument": INSTR_B, "limit": 2}, headers=H(AUTHOR)).json()
     cur = first["page"]["next_cursor"]
     for params in ({"instrument": INSTR, "limit": 2, "cursor": cur}, {"instrument": INSTR_B, "limit": 3, "cursor": cur},
-                   {"instrument": INSTR_B, "limit": 2, "cursor": cur[:-2] + "AA"}):
+                   {"instrument": INSTR_B, "limit": 2, "cursor": cur[:-2] + ("BB" if cur.endswith("AA") else "AA")}):
         r = client.get("/api/catalog/requirements", params=params, headers=H(AUTHOR))
         assert r.status_code == 400 and r.json()["detail"]["error"] == "invalid_cursor", params
     for params in ({"lifecycle": "APPROVED"}, {"limit": 0}, {"limit": 201}, {"origin": "ai"}, {"valid_at": "soon"}):
@@ -341,7 +341,8 @@ def test_forward_and_reverse_traceability(client, chain):
 
 def test_traceability_validation_reports_missing_and_broken_links(client, world):
     from app.db import AdminSession
-    from app.models import Instrument, ObligationDefinition, RegulatorySource, RequirementVersion
+    from app.models import ContentRelease, Instrument, ObligationDefinition, RegulatorySource, RequirementVersion, RuleVersion
+    from app.platform import canonical_json, next_record_seq, sha256_hex
     s = _source(client, "Entities shall retain records.").json()
     v = _requirement(client, s["source_id"], f"RT-{TAG}-BROKEN").json()
     with AdminSession() as db:
@@ -350,12 +351,39 @@ def test_traceability_validation_reports_missing_and_broken_links(client, world)
                                  provision_ids=["rt-no-such-provision", v["provisions"][0]["provision_id"]],
                                  subject_type="LEGAL_ENTITY", coverage_mode="ENCODED")
         db.add(o)
+        db.flush()
         # The same requirement identity recorded under a second instrument, below the API's identity check.
         db.add(RequirementVersion(requirement_key=f"RT-{TAG}-BROKEN", instrument_id=inst_b.instrument_id,
                                   source_id=s["source_id"], title="Duplicate identity", locator="Art. 1",
                                   valid_from=datetime(2025, 1, 1).date(), lifecycle="REVIEW_REQUIRED", record_seq=1))
         # The stored text changed after its fingerprint was taken.
         db.get(RegulatorySource, s["source_id"]).raw_text = "Entities shall retain records for ten years."
+        # Probe release and rule with an unresolved source mapping and unbound release (well-formed cryptographic integrity)
+        import json
+        from app.engines import keys, rules
+        from app.models import new_id
+        probe_ast = {"node_type": "PREDICATE", "node_id": "p_probe", "operator": "EQ",
+                     "args": [{"node_type": "FACT_REF", "node_id": "f", "fact": "entity.established_in_eu"},
+                              {"node_type": "CONST", "node_id": "c", "type": "BOOLEAN", "value": True}],
+                     "source_mappings": ["srcmap_probe_unresolved"]}
+        canon_probe = rules.canonicalize(probe_ast)
+        h_probe = rules.ast_hash(canon_probe, {})
+        rv_probe_id, cr_probe_id = new_id(), new_id()
+        manifest_probe = json.loads(canonical_json({"label": "probe-unbound", "rule_versions": [
+            {"rule_version_id": rv_probe_id, "ast_sha256": h_probe, "valid_from": "2025-01-01"}]}))
+        mb_probe = canonical_json(manifest_probe)
+        cr_probe = ContentRelease(content_release_id=cr_probe_id, label="probe-unbound",
+                                  manifest=manifest_probe, manifest_hash=sha256_hex(mb_probe),
+                                  signature=keys.sign(mb_probe), signer_key_id=keys.signer_key_id(),
+                                  released_by="actor-release", cell_received_seq=next_record_seq(db))
+        db.add(cr_probe)
+        db.flush()
+        db.add(RuleVersion(rule_version_id=rv_probe_id, obligation_definition_id=o.obligation_definition_id, version=1,
+                           valid_from=datetime(2025, 1, 1).date(), coverage_mode="ENCODED",
+                           rule_schema_version=rules.SCHEMA_VERSION, operator_set_version=rules.OPERATOR_SET_VERSION,
+                           canonical_ast=canon_probe, ast_hash=h_probe, required_facts=["entity.established_in_eu"], set_refs=[],
+                           source_mappings=[], golden_vectors=[], status="PUBLISHED", content_release_id=cr_probe.content_release_id,
+                           record_seq=next_record_seq(db)))
         db.commit()
         odef_id = o.obligation_definition_id
     report = client.get("/api/catalog/traceability/validation", headers=H(LEGAL)).json()
@@ -366,10 +394,12 @@ def test_traceability_validation_reports_missing_and_broken_links(client, world)
     assert ("OBLIGATION_INSTRUMENT_MISMATCH", odef_id) in found
     assert ("REQUIREMENT_KEY_MULTIPLE_INSTRUMENTS", f"RT-{TAG}-BROKEN") in found
     assert ("SOURCE_FINGERPRINT_MISMATCH", s["source_id"]) in found
-    # The seeded releases: AST nodes cite mappings their rule versions do not carry, and none binds its requirements.
+    # Probe rule: AST nodes cite mappings their rule versions do not carry, and release is unbound.
     unresolved = {i["source_mapping_id"] for i in report["issues"] if i["code"] == "RULE_SOURCE_MAPPING_UNRESOLVED"}
-    assert {"srcmap_aia_2_scope", "srcmap_aia_3_4"} <= unresolved
-    assert report["by_code"]["RELEASE_REQUIREMENTS_UNBOUND"] >= 4
+    assert "srcmap_probe_unresolved" in unresolved
+    assert report["by_code"]["RELEASE_REQUIREMENTS_UNBOUND"] >= 1
+    # Seeded releases are remediated: zero unresolved source mappings
+    assert not {"srcmap_aia_2_scope", "srcmap_aia_3_4"} & unresolved
     assert all(i["severity"] in ("ERROR", "WARNING") for i in report["issues"])
     # Content that rests on an altered source is never verified, and the requirement's own trace shows why.
     r = client.post(f"/api/catalog/requirements/{v['requirement_version_id']}/verify", headers=H(LEGAL))

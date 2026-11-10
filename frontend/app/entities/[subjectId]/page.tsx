@@ -32,7 +32,8 @@ export default function SubjectPage() {
   return (
     <>
       <PageHeader kicker="Subject · facts and applicability" spec="WF-APP-01 · ZA-TIM-001" title={p?.subject.display_name ?? "Subject"}
-        subtitle="The facts recorded about this subject, and the applicability evaluations and determinations based on them. Valid time (when a fact was true) and record time (when Assure learned it) are kept separately."
+        subtitle="Facts about this subject and the applicability decisions based on them."
+        help="Valid time (when a fact was true) and record time (when Assure learned it) are kept separately."
         actions={<button className="btn-primary" disabled={a.busy || !can("request_evaluation")} title={why("request_evaluation")} onClick={() => a.run(async () => { const r = await api(`/applicability/evaluate-all?subject_id=${subjectId}`, { method: "POST" }); evals.reload(); return r; })}>Evaluate all obligations</button>} />
       <PermissionNote perms={["request_evaluation", "manage_facts"]} />
       <ErrorBox error={prof.error || a.error} />

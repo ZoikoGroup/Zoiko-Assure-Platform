@@ -14,7 +14,8 @@ export default function Ledger() {
   return (
     <>
       <PageHeader spec="ZA-EVD-001 §§8-10 · WF-EVD-03" title="Ledger"
-        subtitle="A per-tenant SHA-256 hash chain, anchored by cell-level Merkle checkpoints signed with Ed25519. RFC 3161 timestamping is reported honestly as pending when no TSA is configured."
+        subtitle="Your organisation's tamper-evident evidence ledger."
+        help="A per-tenant SHA-256 hash chain, anchored by cell-level Merkle checkpoints signed with Ed25519. RFC 3161 timestamping is reported as pending when no timestamp authority is configured."
         actions={<>
           <button className="btn-primary" disabled={v.busy} onClick={() => v.run(async () => { const r = await api("/ledger/verify", { method: "POST" }); reload(); return r; })}>Verify chain</button>
           <button className="btn-accent" disabled={c.busy || !canCheckpoint} title={canCheckpoint ? undefined : why("checkpoint")} onClick={() => c.run(async () => { const r = await api("/ledger/checkpoint", { method: "POST" }); reload(); return r; })}>Create checkpoint</button>

@@ -449,7 +449,7 @@ def test_publication_refuses_tampered_set_when_zero_subjects_evaluated(client):
     draft = client.post("/api/rules/drafts", headers=H("actor-content-analyst"), json={
         "obligation_definition_id": new_od_id, "authoring_mode": "AST",
         "ast": base["canonical_ast"], "golden_vectors": base["golden_vectors"], "source_mappings": base["source_mappings"],
-        "valid_from": base["valid_from"], "change_class": "CORRECTION"})  # DraftIn has no reason field (API-REQ-014: unknown fields refused)
+        "valid_from": base["valid_from"], "change_class": "EXECUTABLE_OUTCOME"})  # a new definition has no release to correct
     assert draft.status_code == 200, draft.text
     did = draft.json()["draft_id"]
     for actor, step in (("actor-content-analyst", "submit-review"), ("actor-encoder", "peer-approve"),
@@ -511,6 +511,7 @@ def test_publication_refuses_missing_set_version(client):
         c.execute(text("UPDATE catalog_rule_draft SET status = 'VERIFIED' WHERE draft_id = :d"), {"d": did})
 
     resp = client.post(f"/api/rules/drafts/{did}/publish", headers=H("actor-release"),
-                       json={"label": "missing-set-probe", "changelog": "Probe missing set"})
+                       json={"label": "missing-set-probe", "changelog": "Probe missing set",
+                             "correction_reason": "Probe missing set"})
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["error"] == "SET_VERSION_MISSING"

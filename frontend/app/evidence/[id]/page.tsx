@@ -25,23 +25,24 @@ export default function EvidenceRecord() {
   const name = useActorNames();
   return (
     <>
-      <PageHeader kicker="Evidence record" spec="WF-EVD-01 Evidence Record & Chain Explorer" title={e?.title ?? "Evidence"} subtitle={e ? `${e.origin_class} · ${e.acquisition_method}` : undefined}
+      <PageHeader kicker={<A href="/evidence">← Evidence Records</A>} spec="WF-EVD-01 Evidence Record & Chain Explorer" title={e?.title ?? "Evidence"} subtitle={e ? `${e.origin_class} · ${e.acquisition_method}` : undefined}
+        help="Every change to this record is appended to your organisation's evidence ledger; nothing is edited in place. Verifying integrity re-checks the stored payload against its recorded digests."
         actions={e && <>
           <button className="btn-primary" disabled={a.busy} onClick={() => a.run(async () => { const r = await api(`/evidence/${id}/verify`, { method: "POST" }); reload(); return r; })}>Verify integrity</button>
           {e.payload_available && <button className="btn-ghost" onClick={() => a.run(() => download(`/evidence/${id}/download`, `${e.title}`))}>Download</button>}
-          <button className="btn-ghost" onClick={() => setAct("bind")}>Bind</button>
+          <button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setAct("bind")}>Bind</button>
           <button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setAct("supersede")}>Supersede</button>
           <button className="btn-ghost" disabled={!can("submit_evidence")} title={why("submit_evidence")} onClick={() => setAct("invalidate")}>Invalidate</button>
           {e.legal_hold ? <button className="btn-ghost" disabled={!can("attest")} title={why("attest")} onClick={() => setAct("release-hold")}>Release hold</button>
             : <button className="btn-ghost" disabled={!can("attest")} title={why("attest")} onClick={() => setAct("hold")}>Legal hold</button>}
           {e.payload_available && <button className="btn-danger" disabled={!can("attest")} title={why("attest")} onClick={() => setAct("erase")}>Erase payload</button>}
         </>} />
-      <PermissionNote perms={["submit_evidence", "attest"]} />
+      <PermissionNote perms={["submit_evidence", "attest"]} actions={{ submit_evidence: "Bind, supersede or invalidate", attest: "Legal hold and payload erasure" }} />
       <ErrorBox error={error || a.error} />
       <LiveRegion>{a.result?.checks && (
         <div className="mb-4"><Notice tone={a.result.result === "VERIFIED" ? "good" : "warn"}>
           Integrity verification: <b>{a.result.result}</b> — {a.result.checks.map((c: any) => `${c.check}: ${c.result}`).join(" · ")}.{" "}
-          {a.result.result === "FAILED" && <>A CRITICAL integrity incident was opened in <A href="/governance">Exceptions &amp; Issues</A>. </>}
+          {a.result.result === "FAILED" && <>A CRITICAL integrity incident was opened in <A href="/governance">Findings &amp; Actions</A>. </>}
           This only checks that the stored payload still matches its recorded digests. It does not show that the evidence is CURRENT, sufficient or correct for any control.
         </Notice></div>
       )}</LiveRegion>
@@ -72,7 +73,7 @@ export default function EvidenceRecord() {
           </Card>
 
           <div className="grid gap-4 xl:grid-cols-3">
-            <Card className="xl:col-span-2" title="Ledger history" subtitle="Each event hashes the previous one. Lifecycle is derived from these events, never edited in place.">
+            <Card className="xl:col-span-2" title="Ledger history" subtitle="Each event hashes the previous one; lifecycle is derived from these events.">
               <Table head={["Seq", "Event", "Actor", "Reason", "Event hash", "Prev hash", "At"]}>
                 {e.history.map((h: any) => (
                   <tr key={h.event_id}>
@@ -97,7 +98,7 @@ export default function EvidenceRecord() {
             </Card>
           </div>
 
-          <Card title="Evidence conflicts" subtitle="Conflict records that name this artifact as a member (ZA-EVD-001 §13). The artifact itself is never altered by a conflict.">
+          <Card title="Evidence conflicts" subtitle="Conflicts that include this evidence (ZA-EVD-001 §13). The evidence itself is never altered.">
             <ErrorBox error={conflicts.error} />
             {conflicts.data ? <ConflictTable conflicts={mine} currentId={id} emptyText="No evidence conflict record names this artifact." />
               : !conflicts.error && <p className="text-xs text-slate-500">Loading conflict records…</p>}

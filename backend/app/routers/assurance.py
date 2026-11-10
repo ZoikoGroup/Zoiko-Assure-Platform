@@ -3,20 +3,22 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from ..engines import assurance as asr
-from ..engines import catalog, governance
+from ..db import CELL_ID
+from ..engines import catalog, decision_history, governance, satisfaction, test_results
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, AssuranceSnapshot,
                       Compensation, RuleVersion,
                       CompensationEvent, ControlDefinition, ControlEvaluation, ControlImplementation, ControlTestPolicy,
                       EvidenceArtifact, ExceptionEvent, ExceptionRecord, Issue, IssueEvent, ObligationDefinition,
                       ObligationInstance, ObligationOccurrence, ObligationOccurrenceEvent, Provision, RiskAcceptance,
                       SatisfactionExpressionVersion, SourceRun, Subject, TestDefinition, TestRun)
-from ..platform import audit, digest, emit, ensure_utc, next_record_seq, to_dict
+from ..platform import audit, current_watermark, digest, emit, ensure_utc, next_record_seq, to_dict
 from ..security import DOSSIER_READ, Ctx, EntityOf, authorize, entity_of
 
 router = APIRouter()
@@ -76,14 +78,29 @@ def obligations(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
 
 
 @router.get("/obligations/{lineage}")
-def dossier(lineage: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBLIGATION))):
-    """WF-STA-01 Obligation Assurance Dossier."""
-    o = _current_obl(ctx.db, ctx.tenant, lineage)
+def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=0),
+            ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBLIGATION))):
+    """WF-STA-01 Obligation Assurance Dossier, with historical bitemporal replay support (ZA-TIM-001 §12)."""
+    now_seq = current_watermark(ctx.db)["record_seq"]
+    if as_of_record_seq is not None and as_of_record_seq > now_seq:
+        raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                  "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
+    if as_of_record_seq is not None:
+        o = ctx.db.execute(select(ObligationInstance).where(
+            ObligationInstance.tenant_id == ctx.tenant, ObligationInstance.lineage_id == lineage,
+            ObligationInstance.record_from_seq <= as_of_record_seq,
+            or_(ObligationInstance.record_to_seq.is_(None), ObligationInstance.record_to_seq > as_of_record_seq))
+            .order_by(ObligationInstance.record_from_seq.desc())).scalars().first()
+        if not o:
+            raise HTTPException(404, "obligation not found as of requested record sequence")
+    else:
+        o = _current_obl(ctx.db, ctx.tenant, lineage)
     od = ctx.db.get(ObligationDefinition, o.obligation_definition_id)
     det = ctx.db.get(ApplicabilityDetermination, o.determination_revision_id)
     att = ctx.db.get(AdoptionAttestation, o.attestation_id)
-    exprs = ctx.db.execute(select(SatisfactionExpressionVersion).where(
-        SatisfactionExpressionVersion.obligation_lineage_id == lineage).order_by(SatisfactionExpressionVersion.version)).scalars().all()
+    exprs = satisfaction.versions(ctx.db, ctx.tenant, lineage)
+    if as_of_record_seq is not None:
+        exprs = [e for e in exprs if e.record_seq <= as_of_record_seq]
     keys = set()
     for e in exprs:
         keys |= asr._control_keys(e.ast)
@@ -91,43 +108,167 @@ def dossier(lineage: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBL
     controls = []
     now = datetime.now(timezone.utc)
     for k in sorted(keys):
-        ci = asr._resolve_impl(ctx.db, ctx.tenant, k, subject, now - timedelta(days=1), now, 10**15)
+        ci = asr._resolve_impl(ctx.db, ctx.tenant, k, subject, now - timedelta(days=1), now,
+                               as_of_record_seq if as_of_record_seq is not None else 10**15)
         cd = ctx.db.execute(select(ControlDefinition).where(ControlDefinition.key == k)).scalars().first()
         controls.append({"control_key": k, "title": cd.title if cd else k,
                          "implementation": to_dict(ci) if ci else None})
+    rev_q = select(ObligationInstance).where(ObligationInstance.tenant_id == ctx.tenant,
+                                             ObligationInstance.lineage_id == lineage)
+    if as_of_record_seq is not None:
+        rev_q = rev_q.where(ObligationInstance.record_from_seq <= as_of_record_seq)
+    as_known = lambda row: _as_known(to_dict(row), as_of_record_seq)  # noqa: E731
+    revisions = [as_known(r) for r in ctx.db.execute(rev_q.order_by(ObligationInstance.record_from_seq)).scalars()]
+
+    snap_q = select(AssuranceSnapshot).where(AssuranceSnapshot.tenant_id == ctx.tenant,
+                                             AssuranceSnapshot.obligation_lineage_id == lineage)
+    if as_of_record_seq is not None:
+        snap_q = snap_q.where(AssuranceSnapshot.record_cutoff_seq <= as_of_record_seq)
+    by_id = {e.expression_version_id: e for e in satisfaction.versions(ctx.db, ctx.tenant, lineage)}
+    snapshots = [{**{k: v for k, v in to_dict(s).items() if k != "dependency_manifest"},
+                  "expression_pins": _expression_pins(s, by_id)}
+                 for s in ctx.db.execute(snap_q.order_by(AssuranceSnapshot.created_at.desc())).scalars()]
+
+    # Records that carry only the sequence at which they were created: a historical read lists those known by the
+    # cutoff, but their state fields are the current ones (no state history is recorded for them yet).
+    def known(q, model):
+        return q.where(model.record_seq <= as_of_record_seq) if as_of_record_seq is not None else q
+    exceptions = ctx.db.execute(known(select(ExceptionRecord).where(ExceptionRecord.tenant_id == ctx.tenant,
+                                                                    ExceptionRecord.target_id == lineage),
+                                      ExceptionRecord)).scalars()
+    compensations = ctx.db.execute(known(select(Compensation).where(Compensation.tenant_id == ctx.tenant,
+                                                                    Compensation.obligation_lineage_id == lineage),
+                                         Compensation)).scalars()
+    occurrences = ctx.db.execute(known(select(ObligationOccurrence).where(
+        ObligationOccurrence.tenant_id == ctx.tenant, ObligationOccurrence.obligation_lineage_id == lineage),
+        ObligationOccurrence).order_by(ObligationOccurrence.due_at)).scalars()
+    provenance = _provenance(ctx, det, as_of_record_seq)
+    history = decision_history.obligation_decision_history(ctx.db, ctx.tenant, lineage, as_of_record_seq)
     return {
-        "obligation": to_dict(o), "definition": to_dict(od), "subject": to_dict(subject),
+        "obligation": as_known(o), "definition": to_dict(od), "subject": to_dict(subject),
         "provisions": [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.provision_id.in_(od.provision_ids or ["-"]))).scalars()],
-        "determination": to_dict(det) if det else None, "attestation": to_dict(att) if att else None,
-        "revisions": [to_dict(r) for r in ctx.db.execute(select(ObligationInstance).where(ObligationInstance.lineage_id == lineage)
-                                                         .order_by(ObligationInstance.record_from_seq)).scalars()],
-        "expression_versions": [to_dict(e) for e in exprs], "controls": controls,
-        "snapshots": [{k: v for k, v in to_dict(s).items() if k != "dependency_manifest"} for s in ctx.db.execute(
-            select(AssuranceSnapshot).where(AssuranceSnapshot.obligation_lineage_id == lineage)
-            .order_by(AssuranceSnapshot.created_at.desc())).scalars()],
-        "exceptions": [to_dict(x) for x in ctx.db.execute(select(ExceptionRecord).where(ExceptionRecord.target_id == lineage)).scalars()],
-        "compensations": [to_dict(c) for c in ctx.db.execute(select(Compensation).where(Compensation.obligation_lineage_id == lineage)).scalars()],
-        "occurrences": [to_dict(x) for x in ctx.db.execute(select(ObligationOccurrence).where(ObligationOccurrence.obligation_lineage_id == lineage)
-                                                           .order_by(ObligationOccurrence.due_at)).scalars()],
+        "determination": as_known(det) if det else None, "attestation": to_dict(att) if att else None,
+        "revisions": revisions,
+        "expression_versions": [{**to_dict(e), "control_mappings": satisfaction.view(ctx.db, e)["control_mappings"]}
+                                for e in exprs], "controls": controls,
+        "snapshots": snapshots,
+        "exceptions": [to_dict(x) for x in exceptions],
+        "compensations": [to_dict(c) for c in compensations],
+        "occurrences": [to_dict(x) for x in occurrences],
         "issues": [to_dict(i) for i in ctx.db.execute(select(Issue).where(Issue.tenant_id == ctx.tenant,
                                                                          Issue.dedupe_key.like(f"%{lineage}%"))).scalars()],
-        "regulatory_provenance": _provenance(ctx, det),
+        "regulatory_provenance": provenance,
+        "decision_history": history,
+        "as_of_record_seq": as_of_record_seq,
+        # TIM-REQ-006/017: the record-time perspective this answer resolved to, and the valid time the control
+        # resolution used. A historical read pins record time only; controls are resolved for the last day.
+        "record_watermark": {"cell_id": CELL_ID, "record_seq": as_of_record_seq if as_of_record_seq is not None else now_seq,
+                             "perspective": "AS_OF_RECORD_SEQ" if as_of_record_seq is not None else "CURRENT"},
+        "controls_valid_time": [now - timedelta(days=1), now],
+        "historical_limitations": [
+            "Exceptions, compensations and occurrences are listed if recorded by the cutoff; their state fields are "
+            "current, because no state history is recorded for them.",
+            "Issues are not record-sequenced and are shown as they are now."] if as_of_record_seq is not None else [],
     }
 
 
-def _provenance(ctx: Ctx, det) -> dict | None:
+def _as_known(row: dict, as_of: int | None) -> dict:
+    """A revision as a historical perspective knew it: its record_to_seq is shown only if recorded by the cutoff
+    (TIM-REQ-006; a later closure was not yet known)."""
+    if as_of is not None and row.get("record_to_seq") is not None and row["record_to_seq"] > as_of:
+        return {**row, "record_to_seq": None}
+    return row
+
+
+def _expression_pins(snap, by_id: dict) -> dict:
+    """Whether the SatisfactionExpression versions a snapshot pinned still exist for this obligation and still hash to
+    their recorded hash (STA-REQ-021). Snapshots pin version IDs only; pinning their hashes in the snapshot manifest is
+    the unresolved snapshot-manifest decision (TIM-ADR-04), so each version's own recorded hash is what is checked."""
+    pinned = sorted({*((snap.dependency_manifest or {}).get("expression_versions") or []),
+                     *(seg.get("expression_version_id") for seg in (snap.segments or []) if seg.get("expression_version_id"))})
+    missing = [i for i in pinned if i not in by_id]
+    altered = [i for i in pinned if i in by_id and not satisfaction.hash_intact(by_id[i])]
+    return {"pinned": pinned, "missing": missing, "hash_mismatch": altered,
+            "status": "MISMATCH" if altered else "INCOMPLETE" if missing else "INTACT"}
+
+
+# ------------------------------------------------------------------ satisfaction expressions and control mappings
+class ExpressionVersionIn(BaseModel):
+    """A new SatisfactionExpressionVersion (ZA-STA-001 §07). Control mappings are its CONTROL leaves: a selector
+    (``control_key``) or an exact implementation (``control_key`` + ``control_implementation_id``)."""
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
+    ast: dict
+    valid_from: datetime
+    valid_to: datetime | None = None
+    rationale: str = Field(min_length=1, max_length=4000)  # STA §16 SatisfactionExpressionVersion "mapping rationale"
+
+
+@router.get("/obligations/{lineage}/expression-versions")
+def expression_versions(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=0),
+                        ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBLIGATION))):
+    """Every SatisfactionExpressionVersion of one obligation, oldest first, with its control mappings. Versions are
+    immutable; each snapshot names the version it used for each segment. ``in_force_now`` marks the version the
+    evaluator would select for the present instant (the highest version whose valid period contains it)."""
+    now_seq = current_watermark(ctx.db)["record_seq"]
+    if as_of_record_seq is not None and as_of_record_seq > now_seq:
+        raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                  "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
+    if as_of_record_seq is not None:
+        o = ctx.db.execute(select(ObligationInstance).where(
+            ObligationInstance.tenant_id == ctx.tenant, ObligationInstance.lineage_id == lineage,
+            ObligationInstance.record_from_seq <= as_of_record_seq,
+            or_(ObligationInstance.record_to_seq.is_(None), ObligationInstance.record_to_seq > as_of_record_seq))
+            .order_by(ObligationInstance.record_from_seq.desc())).scalars().first()
+        if not o:
+            raise HTTPException(404, "obligation not found as of requested record sequence")
+    else:
+        _current_obl(ctx.db, ctx.tenant, lineage)
+    vs = satisfaction.versions(ctx.db, ctx.tenant, lineage)
+    if as_of_record_seq is not None:
+        vs = [e for e in vs if e.record_seq <= as_of_record_seq]
+    current = satisfaction.in_force_at(vs, datetime.now(timezone.utc))
+    return [{**satisfaction.view(ctx.db, e), "in_force_now": current is not None and e is current} for e in vs]
+
+
+@router.post("/obligations/{lineage}/expression-versions", status_code=201)
+def create_expression_version(lineage: str, body: ExpressionVersionIn,
+                              ctx: Ctx = Depends(authorize("assurance_review", human=True, entity=OBLIGATION))):
+    """Release a new expression version: create, change or retire control mappings (STA §07 "Expression versioning";
+    DOM §9.2). An Assurance Reviewer approves the design (STA §22). Earlier versions and snapshots never change."""
+    if not body.rationale.strip():
+        raise HTTPException(422, {"error": "RATIONALE_REQUIRED", "message": "a mapping rationale is required"})
+    _current_obl(ctx.db, ctx.tenant, lineage)
+    e = satisfaction.create_version(ctx, lineage_id=lineage, ast=body.ast, valid_from=body.valid_from,
+                                    valid_to=body.valid_to, rationale=body.rationale)
+    ctx.db.commit()
+    return satisfaction.view(ctx.db, e)
+
+
+def _provenance(ctx: Ctx, det, as_of_record_seq: int | None = None) -> dict | None:
     """Obligation -> adopted determination -> its evaluation -> the exact RuleVersion -> requirement versions,
     provisions and source snapshots (DOM §1 canonical chain; DOM §16 end-to-end trace)."""
     ev = ctx.db.get(ApplicabilityEvaluation, det.evaluation_id) if det else None
     if ev is None or ev.tenant_id != ctx.tenant:
         return None
     rule = ctx.db.get(RuleVersion, ev.rule_version_id)
-    out = catalog.trace_rule_version(ctx.db, rule) if rule else None
-    if out is not None:
-        out["evaluation"] = {"evaluation_id": ev.evaluation_id, "outcome": ev.outcome, "effective_at": ev.effective_at,
-                             "record_cutoff_seq": ev.record_cutoff_seq, "input_bundle_hash": ev.input_bundle_hash,
-                             "evaluator_build": ev.evaluator_build}
-        out["determination_revision_id"] = det.revision_id
+    evaluation = {"evaluation_id": ev.evaluation_id, "outcome": ev.outcome, "effective_at": ev.effective_at,
+                  "record_cutoff_seq": ev.record_cutoff_seq, "input_bundle_hash": ev.input_bundle_hash,
+                  "evaluator_build": ev.evaluator_build}
+    # The determination must rest on this evaluation's result for the same subject and definition (DOM §1 chain).
+    chain = [] if (ev.outcome, ev.subject_id, ev.obligation_definition_id) == (
+        det.outcome, det.subject_id, det.obligation_definition_id) else [
+        catalog._problem("EVALUATION_MISMATCH", "MISMATCH", evaluation_id=ev.evaluation_id,
+                         determination_revision_id=det.revision_id)]
+    if rule is not None:
+        out = catalog.trace_rule_version(ctx.db, rule, as_of_record_seq)
+        if chain:
+            out["integrity"] = catalog.integrity_verdict(out["integrity"]["problems"] + chain)
+    else:
+        out = {"binding_basis": "INCOMPLETE", "rule_version_id": ev.rule_version_id, "missing": True,
+               "integrity": catalog.integrity_verdict(
+                   [catalog._problem("RULE_VERSION_MISSING", "INCOMPLETE", rule_version_id=ev.rule_version_id), *chain])}
+    out["evaluation"] = evaluation
+    out["determination_revision_id"] = det.revision_id
     return out
 
 
@@ -166,16 +307,20 @@ def get_snapshot(snapshot_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, e
 
 @router.get("/snapshots/{snapshot_id}/reproduce")
 def reproduce(snapshot_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=SNAPSHOT))):
-    """Rebuild from the pinned record cutoff and compare (TIM-REQ-015/016)."""
+    """Rebuild from the pinned record cutoff and compare (TIM-REQ-015/016). The rebuild reads exception and occurrence
+    state as recorded by that cutoff and decides due times at the snapshot's own evaluation instant (its stored
+    created_at), so later events and the passage of time do not change the answer."""
     s = ctx.scoped(ctx.db.get(AssuranceSnapshot, snapshot_id), "snapshot")
     r = asr.compute_snapshot(ctx.db, tenant_id=ctx.tenant, obligation_lineage_id=s.obligation_lineage_id,
                              period_from=s.period_from, period_to=s.period_to, record_cutoff_seq=s.record_cutoff_seq,
-                             perspective=s.perspective, actor_id=ctx.actor.actor_id, persist=False)
+                             perspective=s.perspective, actor_id=ctx.actor.actor_id, persist=False,
+                             evaluated_at=s.created_at)
     ctx.db.rollback()
     ok_digest = r["dependency_digest"] == s.dependency_digest
     return {"snapshot_id": snapshot_id, "original_state": s.state, "reproduced_state": r["state"],
             "dependency_digest_match": ok_digest, "reproducible": ok_digest and r["state"] == s.state,
-            "record_cutoff_seq": s.record_cutoff_seq}
+            "record_cutoff_seq": s.record_cutoff_seq, "evaluation_instant": r["evaluation_instant"],
+            "history_problems": r["history_problems"]}
 
 
 # ------------------------------------------------------------------ occurrences
@@ -364,43 +509,33 @@ def create_control(body: ControlIn, ctx: Ctx = Depends(authorize("manage_control
 
 
 class TestRunIn(BaseModel):
+    """One test result (ZA-STA-001 §01/§04; DOM §7.1 "source provenance and evaluated period required"). Field limits
+    are the column sizes, so an over-long value is a 422, never a database error."""
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    test_definition_id: str
+    test_definition_id: str = Field(min_length=1, max_length=36)
     occurred_at: datetime
     window_from: datetime
     window_to: datetime
-    result: str
-    source_system: str
-    external_status: str | None = None
-    evidence_ids: list[str] = []
-    source_run_id: str | None = None
+    result: Literal["PASS", "FAIL", "ERROR", "INCONCLUSIVE", "SKIPPED"]  # GLS §06 / STA §01: these "only"
+    source_system: str = Field(min_length=1, max_length=80)
+    external_status: str | None = Field(default=None, max_length=64)  # vendor status kept as input only
+    evidence_ids: list[str] = Field(default_factory=list, max_length=500)
+    source_run_id: str | None = Field(default=None, min_length=1, max_length=36)
     detail: str | None = None
 
 
 @router.post("/test-runs")
-def ingest_test_run(body: TestRunIn, ctx: Ctx = Depends(authorize("submit_evidence"))):
-    """External GRC/vendor results are inputs with provenance — never direct control state (STA-REQ-008)."""
-    if body.result not in ("PASS", "FAIL", "ERROR", "INCONCLUSIVE", "SKIPPED"):
-        raise HTTPException(422, "Invalid test result code")
-    # ZA-TIM-001 §02: half-open, non-empty ranges; an empty or inverted window is not an assertion about any period.
-    if ensure_utc(body.window_to) <= ensure_utc(body.window_from):
-        raise HTTPException(422, {"error": "TEST_RUN_WINDOW_EMPTY", "message": "window_to must be later than window_from"})
-    td = ctx.scoped(ctx.db.get(TestDefinition, body.test_definition_id), "test definition")
-    for e in body.evidence_ids:
-        ctx.scoped(ctx.db.get(EvidenceArtifact, e), "evidence")
-    if body.source_run_id:  # assurance reads this run's IPE result, so it must be one of this organisation's runs
-        ctx.scoped(ctx.db.get(SourceRun, body.source_run_id), "source run")
-    seq = next_record_seq(ctx.db)
-    tr = TestRun(tenant_id=ctx.tenant, record_seq=seq, **body.model_dump())
-    ctx.db.add(tr)
-    ctx.db.flush()
-    audit(ctx.db, action="test_run.record", object_type="TestRun", object_id=tr.test_run_id, actor=ctx.actor,
-          tenant_id=ctx.tenant, new=tr.result, record_seq=seq,
-          reason=f"test {td.test_definition_id} from {tr.source_system}; window [{tr.window_from}, {tr.window_to})")
-    emit(ctx.db, event_type="test.run_recorded", aggregate_type="TestRun", aggregate_id=tr.test_run_id, tenant_id=ctx.tenant,
-         payload={"result": tr.result, "external_status": tr.external_status, "test": td.name})
+def ingest_test_run(body: TestRunIn, ctx: Ctx = Depends(authorize("submit_evidence")),
+                    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    """External GRC/vendor and manual results are inputs with provenance, never direct control state (STA-REQ-008).
+    A TestRun is immutable: a correction or retest is a new run. Rules: app/engines/test_results.py. With an
+    ``Idempotency-Key`` (API-001 §08) a retry returns the original run; a changed request is 409 idempotency_conflict."""
+    if not body.source_system.strip():
+        raise HTTPException(422, {"error": "SOURCE_PROVENANCE_REQUIRED", "message": "source_system is required"})
+    run, _ = test_results.record_test_run(ctx.db, tenant_id=ctx.tenant, actor=ctx.actor, body=body.model_dump(),
+                                          idempotency_key=idempotency_key)
     ctx.db.commit()
-    return to_dict(tr)
+    return to_dict(run)
 
 
 # ------------------------------------------------------------------ exceptions (separate governance treatment)
@@ -543,6 +678,55 @@ def move_issue(issue_id: str, body: IssueMove, ctx: Ctx = Depends(authorize("man
     ctx.scoped(ctx.db.get(Issue, issue_id), "issue")
     i, _ = governance.transition_issue(ctx.db, tenant_id=ctx.tenant, actor_id=ctx.actor.actor_id, actor=ctx.actor,
                                        issue_id=issue_id, to_state=body.state, reason=body.reason)
+    ctx.db.commit()
+    return to_dict(i)
+
+
+class IssueAssignIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields (e.g. due_at, state) are refused
+    owner_actor_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/issues/{issue_id}/assign")
+def assign_issue(issue_id: str, body: IssueAssignIn, ctx: Ctx = Depends(authorize("manage_issues"))):
+    """Record the accountable owner (STA §17; GLS TRIAGED needs ownership established). An ASSIGNED event, never a
+    state change; no due date or escalation policy is invented (ZA-WRK-001 §06 needs a versioned deadline policy)."""
+    ctx.scoped(ctx.db.get(Issue, issue_id), "issue")
+    if not body.reason.strip():
+        raise HTTPException(422, {"error": "REASON_REQUIRED", "message": "A reason is required."})
+    i, _ = governance.assign_issue(ctx.db, tenant_id=ctx.tenant, actor=ctx.actor, issue_id=issue_id,
+                                   owner_actor_id=body.owner_actor_id, reason=body.reason.strip())
+    ctx.db.commit()
+    return to_dict(i)
+
+
+class IssueCloseIn(BaseModel):
+    """The new result that verifies remediation (STA §17): an AssuranceSnapshot for obligation-level issues, or a
+    ControlEvaluation for control-level issues. Exactly one."""
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014
+    verification_snapshot_id: str | None = Field(default=None, min_length=1, max_length=36)
+    verification_control_evaluation_id: str | None = Field(default=None, min_length=1, max_length=36)
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _one_reference(self):
+        if (self.verification_snapshot_id is None) == (self.verification_control_evaluation_id is None):
+            raise ValueError("give exactly one of verification_snapshot_id or verification_control_evaluation_id")
+        return self
+
+
+@router.post("/issues/{issue_id}/close")
+def close_issue(issue_id: str, body: IssueCloseIn, ctx: Ctx = Depends(authorize("manage_issues"))):
+    """Close a remediated issue against the new AssuranceSnapshot that verifies it (STA §17 closure rule; STA-REQ-023).
+    Closing changes the issue only; the snapshot already holds the authoritative updated state."""
+    ctx.scoped(ctx.db.get(Issue, issue_id), "issue")
+    if not body.reason.strip():
+        raise HTTPException(422, {"error": "REASON_REQUIRED", "message": "A reason is required."})
+    i, _ = governance.close_issue(ctx.db, tenant_id=ctx.tenant, actor=ctx.actor, issue_id=issue_id,
+                                  verification_snapshot_id=body.verification_snapshot_id,
+                                  verification_control_evaluation_id=body.verification_control_evaluation_id,
+                                  reason=body.reason.strip())
     ctx.db.commit()
     return to_dict(i)
 

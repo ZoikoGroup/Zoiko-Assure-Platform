@@ -18,7 +18,8 @@ export default function Applicability() {
   return (
     <>
       <PageHeader spec="ZA-APP-001 · WF-APP-01" title="Applicability Review"
-        subtitle="Deterministic evaluations produce PROPOSED determinations. Only an authorised human can adopt them; adoption creates the obligation instance." />
+        subtitle="Applicability determinations waiting for a human decision."
+        help="Deterministic evaluations produce PROPOSED determinations. Only an authorised human can adopt them; adoption creates the obligation instance." />
       <PermissionNote perms={["attest"]} />
       <ErrorBox error={dets.error || evals.error} />
       <Card actions={

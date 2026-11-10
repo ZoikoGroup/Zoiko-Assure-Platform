@@ -24,7 +24,8 @@ export default function RuleTestWorkbench() {
   return (
     <>
       <PageHeader spec="WF-RUL-04 · RUL-REQ-015/016" title="Rule Test Workbench"
-        subtitle="Run the exact draft artifact against its golden vectors and against synthetic fixtures. Customer production facts are never reachable from rule authoring." />
+        subtitle="Test a rule draft against golden vectors and synthetic fixtures."
+        help="Runs the exact draft artifact. Customer production facts are never reachable from rule authoring." />
       <ErrorBox error={drafts.error || a.error} />
       {drafts.loading && !drafts.data && <div className="card"><LoadingSkeleton rows={4} /></div>}
       {drafts.data && list.length === 0 && (

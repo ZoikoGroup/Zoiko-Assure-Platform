@@ -9,7 +9,8 @@ export default function CellsAndResidency() {
   return (
     <>
       <PageHeader spec="WF-TEN-01/02 · TEN-REQ-013" title="Cells & Residency"
-        subtitle="Your tenant, its legal entities and the cells that hold their data. Raw entity evidence and customer assurance state stay in the entity's home cell." />
+        subtitle="Your organisation, its legal entities and where their data is held."
+        help="Raw entity evidence and customer assurance state stay in the entity's home cell (TEN-REQ-013)." />
       <PermissionNote perms={["manage_tenant"]} />
       <Tenancy />
     </>

@@ -41,7 +41,8 @@ export default function Assurance() {
   return (
     <>
       <PageHeader spec="WF-STA-05 · WF-TIM-04 · ZA-STA-001" title="Assurance Periods"
-        subtitle="The most recently frozen period assurance snapshot for each adopted obligation. Periods and record cutoffs can differ between rows. States are computed by the backend roll-up over frozen inputs; they cannot be edited here."
+        subtitle="The latest frozen period assurance state for each adopted obligation."
+        help="Periods and record cutoffs can differ between rows. States are computed by the backend roll-up over frozen inputs and cannot be edited here. States are evidential (PROVEN / NOT_PROVEN / FAILING / REQUIRES_REVIEW), never ‘compliant’."
         actions={<>
           <EntitySelector entities={org.data?.entities ?? []} value={entity} onChange={setEntity} className="w-56" />
           <Select aria-label="Filter by state" options={STATE_FILTER} value={state} onChange={(e) => setState(e.target.value)} className="w-44" />

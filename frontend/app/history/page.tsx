@@ -58,7 +58,8 @@ export default function History() {
   return (
     <>
       <PageHeader spec="ZA-TIM-001 §12 · WF-TIM-02" title="Historical Reconstruction"
-        subtitle="Pin one valid time and compare the applicability evaluation at two record cutoffs. The two sides are shown separately, and differences are classified, not blended." />
+        subtitle="Compare an applicability evaluation as it was known at two points in time."
+        help="Pin one valid time and compare the evaluation at two record cutoffs. The two sides are shown separately, and differences are classified, not blended." />
       <div className="mb-4">
         <Notice>
           Applicability only. Each side is evaluated on request from the published rule version and the fact revisions recorded by its cutoff, and nothing is saved.

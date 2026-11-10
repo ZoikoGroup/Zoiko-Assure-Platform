@@ -28,7 +28,8 @@ from typing import Any
 from sqlalchemy import select
 
 from ..db import CELL_ID
-from ..models import AuditEvent, ContentRelease, Provision, RegulatorySource, RequirementVersion, RuleVersion
+from ..models import (AuditEvent, ContentRelease, ObligationDefinition, Provision,
+                      RegulatorySource, RequirementVersion, RuleVersion)
 from ..platform import audit, canonical_json, emit, next_record_seq, sha256_hex
 from . import catalog as cat
 from . import keys
@@ -141,6 +142,51 @@ def _rule_versions(db, cr: ContentRelease, manifest: dict, checks: list) -> None
         _add(checks, "integrity", "RULE_VERSION_INTEGRITY", FAIL if failure else PASS,
              f"{failure[0]} ({failure[1]})" if failure else "AST hash, SetVersion pins and manifest entry match.",
              rule_version_id=rid)
+        if rv.obligation_definition_id:
+            od = db.get(ObligationDefinition, rv.obligation_definition_id)
+            if od is None:
+                _add(checks, "integrity", "OBLIGATION_DEFINITION_PRESENT", FAIL,
+                     f"Rule version names obligation definition '{rv.obligation_definition_id}' that does not exist.",
+                     rule_version_id=rid, obligation_definition_id=rv.obligation_definition_id)
+            else:
+                _add(checks, "integrity", "OBLIGATION_DEFINITION_PRESENT", PASS,
+                     f"Obligation definition '{od.key}' present.",
+                     rule_version_id=rid, obligation_definition_id=rv.obligation_definition_id)
+        bound_reqs = {b["requirement_version_id"]: b for b in (manifest.get("requirement_versions") or []) if isinstance(b, dict)}
+        sm_problems = []
+        for sm in (rv.source_mappings or []):
+            if not isinstance(sm, dict):
+                sm_problems.append("malformed mapping record")
+                continue
+            sm_id = sm.get("source_mapping_id") or "unidentified"
+            sm_rv = sm.get("requirement_version_id")
+            sm_pv = sm.get("provision_id")
+            if sm_rv:
+                if bound_reqs:
+                    if sm_rv not in bound_reqs:
+                        sm_problems.append(f"{sm_id}: requirement version '{sm_rv}' not bound in release")
+                    elif sm_pv:
+                        b_pids = set(bound_reqs[sm_rv].get("provision_ids") or [])
+                        if sm_pv not in b_pids:
+                            sm_problems.append(f"{sm_id}: provision '{sm_pv}' not bound in release requirement")
+                elif db.get(RequirementVersion, sm_rv) is None:
+                    sm_problems.append(f"{sm_id}: missing requirement version '{sm_rv}'")
+            if sm_pv and not bound_reqs:
+                pv = db.get(Provision, sm_pv)
+                if pv is None:
+                    sm_problems.append(f"{sm_id}: missing provision '{sm_pv}'")
+                elif sm_rv and pv.requirement_version_id != sm_rv:
+                    sm_problems.append(f"{sm_id}: provision '{sm_pv}' does not belong to requirement '{sm_rv}'")
+            sm_fp = sm.get("source_fingerprint")
+            if sm_fp and sm_rv and sm_rv in bound_reqs:
+                b_fp = bound_reqs[sm_rv].get("source_fingerprint")
+                if b_fp and sm_fp != b_fp:
+                    sm_problems.append(f"{sm_id}: fingerprint mismatch")
+        _add(checks, "integrity", "RULE_SOURCE_MAPPINGS", FAIL if sm_problems else PASS,
+             f"Rule source mapping issues: {'; '.join(sm_problems)}" if sm_problems else
+             f"All {len(rv.source_mappings or [])} rule source mapping(s) grounded and bound.",
+             rule_version_id=rid)
+        _mapping_binding(entry, rv, checks)
     claiming = db.execute(select(RuleVersion.rule_version_id).where(RuleVersion.content_release_id == cr.content_release_id)
                           .order_by(RuleVersion.rule_version_id)).scalars().all()
     extra = sorted(set(claiming) - set(listed))
@@ -148,6 +194,30 @@ def _rule_versions(db, cr: ContentRelease, manifest: dict, checks: list) -> None
          (f"Rule versions name this release but the signed manifest does not list them: {extra}" if extra else
           "The manifest lists no rule version." if not listed else
           "Every rule version naming this release is in its signed manifest."), **({"rule_version_ids": extra} if extra else {}))
+
+
+def _mapping_binding(entry: dict, rv: RuleVersion, checks: list) -> None:
+    """SOURCE_MAPPING_BINDING: the rule version's stored source-mapping records are exactly the ones its signed manifest
+    entry binds (ZA-RUL-001 §12; catalog.source_mapping_binding). Names every missing, unbound and altered mapping."""
+    rid = rv.rule_version_id
+    res = cat.source_mapping_binding_check(entry, rv.source_mappings)
+    if res["status"] == "NOT_BOUND":
+        _add(checks, "integrity", "SOURCE_MAPPING_BINDING", UNVERIFIABLE, "The release predates source-mapping binding: "
+             "its manifest does not bind the mapping records, so their content cannot be proven (ZA-RUL-001 §12).",
+             rule_version_id=rid)
+    elif res["status"] == "UNKNOWN_PROFILE":
+        _add(checks, "integrity", "SOURCE_MAPPING_BINDING", UNVERIFIABLE,
+             f"Unknown source-mapping binding profile {res['profile']!r}.", rule_version_id=rid)
+    elif res["status"] == "MATCH":
+        _add(checks, "integrity", "SOURCE_MAPPING_BINDING", PASS,
+             f"The {len(rv.source_mappings or [])} stored source-mapping record(s) are exactly the ones the release bound.",
+             rule_version_id=rid)
+    else:
+        detail = "; ".join(f"{k}: {res[k]}" for k in ("missing", "unbound", "altered") if res.get(k))
+        _add(checks, "integrity", "SOURCE_MAPPING_BINDING", FAIL,
+             "The stored source-mapping records are not the ones the release bound"
+             + (f" ({detail})" if detail else " (malformed binding)" if res.get("malformed") else " (aggregate digest differs)")
+             + ".", rule_version_id=rid, missing=res.get("missing"), unbound=res.get("unbound"), altered=res.get("altered"))
 
 
 def _requirements(db, manifest: dict, checks: list) -> None:
@@ -213,6 +283,43 @@ def _requirements(db, manifest: dict, checks: list) -> None:
                  "Stored source text no longer matches its fingerprint.", **sids)
 
 
+
+def _correction_metadata(db, cr: ContentRelease, manifest: dict, checks: list) -> None:
+    is_corr = cr.correction_of_release_id is not None
+    m_corr = manifest.get("correction") if isinstance(manifest, dict) else None
+    m_class = manifest.get("change_class") if isinstance(manifest, dict) else None
+
+    if not is_corr and m_corr is None and m_class != "CORRECTION":
+        return
+
+    problems = []
+    if is_corr:
+        if not isinstance(m_corr, dict):
+            problems.append("Manifest lacks correction metadata block")
+        else:
+            c_rel = m_corr.get("corrects_release_id")
+            if c_rel != cr.correction_of_release_id:
+                problems.append(f"Manifest correction target '{c_rel}' does not match release record '{cr.correction_of_release_id}'")
+            reason = m_corr.get("reason")
+            if not reason or not isinstance(reason, str) or not reason.strip():
+                problems.append("Manifest correction metadata missing explicit reason")
+        prior_cr = db.get(ContentRelease, cr.correction_of_release_id)
+        if prior_cr is None:
+            problems.append(f"Corrected release '{cr.correction_of_release_id}' does not exist in catalogue")
+        elif isinstance(m_corr, dict) and m_corr.get("corrects_rule_version_id"):
+            c_rv = m_corr.get("corrects_rule_version_id")
+            rv_prior = db.get(RuleVersion, c_rv)
+            if rv_prior is None or rv_prior.content_release_id != prior_cr.content_release_id:
+                problems.append(f"Corrected rule version '{c_rv}' does not belong to release '{prior_cr.content_release_id}'")
+    else:
+        problems.append("Manifest declares correction but release record is not marked as a correction")
+
+    _add(checks, "integrity", "CORRECTION_METADATA", FAIL if problems else PASS,
+         f"Correction metadata issues: {'; '.join(problems)}" if problems else
+         f"Correction metadata verified: corrects release {cr.correction_of_release_id} with explicit reason.",
+         corrects_release_id=cr.correction_of_release_id)
+
+
 def verify_release(db, cr: ContentRelease) -> dict:
     """The verification report for one release. Read-only; deterministic for a given stored state."""
     checks: list[dict] = []
@@ -239,6 +346,7 @@ def verify_release(db, cr: ContentRelease) -> dict:
     if manifest is not None:
         _rule_versions(db, cr, manifest, checks)
         _requirements(db, manifest, checks)
+        _correction_metadata(db, cr, manifest, checks)
     altered = any(c["status"] == FAIL and c["dimension"] == "integrity" for c in checks)
     public = keys.existing_public_key()
     return {

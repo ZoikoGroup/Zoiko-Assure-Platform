@@ -22,7 +22,8 @@ export default function AI() {
   return (
     <>
       <PageHeader spec="WF-DOM-07 · ZA-ARCH-001 §12 · FR-AI-001..006" title="AI/Agent Asset Dossiers"
-        subtitle="AI asset registry with AgBOM, the obligations that apply to each asset, scoped authority grants and a deterministic policy decision point. No model call sits on the decision path."
+        subtitle="Your AI assets, the obligations that apply to them, and the authority granted to agents."
+        help="Each asset carries an AgBOM (AI bill of materials). Agent actions are decided by a deterministic policy decision point using scoped authority grants; no model call sits on the decision path."
         actions={<button className="btn-primary" disabled={!can("manage_ai")} title={why("manage_ai")} onClick={() => setReg(true)}>Register asset</button>} />
       <PermissionNote perms={["manage_ai", "grant_authority"]} />
       <ErrorBox error={error} />

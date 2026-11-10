@@ -2,6 +2,7 @@
 
 import { useCallback } from "react";
 import { personaOf, useAuth, type Me } from "./actor";
+import SCREEN_ACCESS from "./screen-access.json";
 
 /* Plain-English names for the backend role catalogue (backend/app/security.py ROLE_PERMISSIONS) and the permissions
    they grant. Display only: the backend decides what every role may do. Codes stay visible beside the names so
@@ -76,12 +77,34 @@ export function workContext(me: Me | null): { kind: "organisation" | "platform" 
   return { kind: "content", label: "Zoiko staff", name: "Content operations" };
 }
 
+/* The permissions each organisation role confers, generated from the backend catalogue (ROLE_PERMISSIONS) into
+   lib/screen-access.json and checked against it by backend/tests/test_sidebar_integration.py. */
+const ROLE_PERMS: Record<string, string[]> = SCREEN_ACCESS.roles;
+
+/** The organisation roles that confer any of `perms`, by name: who to ask when an action is unavailable. */
+export function rolesHolding(perms: string | readonly string[]): string[] {
+  const want = typeof perms === "string" ? [perms] : perms;
+  return Object.entries(ROLE_PERMS).filter(([, p]) => want.some((x) => p.includes(x))).map(([code]) => roleLabel(code));
+}
+
+/** "Control Owner" / "Chief Compliance Officer or Risk Approver": the roles that confer any of `perms`. */
+export const heldByText = (perms: string | readonly string[]) => {
+  const r = rolesHolding(perms);
+  return r.length <= 1 ? (r[0] ?? "") : `${r.slice(0, -1).join(", ")} or ${r[r.length - 1]}`;
+};
+
 /** Whether the signed-in person's roles grant a permission, and why an action is unavailable when they don't.
- *  This only shapes the UI; the backend refuses the call either way. */
+ *  `canAny`/`whyAny` take the permissions a backend route accepts (any one is enough). This only shapes the UI; the
+ *  backend refuses the call either way. */
 export function useCan() {
   const { me } = useAuth();
   const can = useCallback((perm: string) => !!me?.permissions?.includes(perm), [me]);
-  const why = useCallback((perm: string) => (me?.permissions?.includes(perm) ? undefined
-    : `Not available to your role (${rolesText(me) || "none"}): needs “${permissionText(perm)}”`), [me]);
-  return { can, why };
+  const canAny = useCallback((perms: readonly string[]) => perms.some((p) => !!me?.permissions?.includes(p)), [me]);
+  const whyAny = useCallback((perms: readonly string[]) => {
+    if (perms.some((p) => me?.permissions?.includes(p))) return undefined;
+    const held = heldByText(perms);
+    return `Not available to your role (${rolesText(me) || "none"}). Needs “${perms.map(permissionText).join("” or “")}”${held ? `, held by ${held}` : ""}.`;
+  }, [me]);
+  const why = useCallback((perm: string) => whyAny([perm]), [whyAny]);
+  return { can, why, canAny, whyAny };
 }

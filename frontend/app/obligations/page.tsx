@@ -9,7 +9,8 @@ export default function Obligations() {
   return (
     <>
       <PageHeader spec="ZA-STA-001 · WF-STA-01" title="Obligation Dossiers"
-        subtitle="An obligation is a requirement your organisation has adopted for one subject by attesting its applicability determination. Open a dossier to see why it applies, the controls and evidence behind it, and its period assurance state. States are evidential (PROVEN / NOT_PROVEN / FAILING / REQUIRES_REVIEW), never ‘compliant’." />
+        subtitle="Requirements your organisation has adopted, and their current assurance state."
+        help="An obligation is a requirement adopted for one subject by attesting its applicability determination. Open a dossier to see why it applies, the controls and evidence behind it, and its period assurance state. States are evidential (PROVEN / NOT_PROVEN / FAILING / REQUIRES_REVIEW), never ‘compliant’." />
       <ErrorBox error={error} />
       <Card>
         <Table head={["Obligation", "Subject", "Lifecycle", "Valid", "Latest snapshot", "Snapshot period (end exclusive) · perspective", "Exceptions"]} empty={data?.length === 0} loading={!data && !error}>

@@ -93,6 +93,9 @@ def expression_problems(node, path: str = "$", count: list | None = None) -> lis
     if nt == "CONTROL":
         if not isinstance(node.get("control_key"), str) or not node["control_key"]:
             out.append(f"{path}: CONTROL needs a control_key")
+        if "control_implementation_id" in node and not (isinstance(node["control_implementation_id"], str)
+                                                        and node["control_implementation_id"]):
+            out.append(f"{path}: control_implementation_id must be a non-empty string when present")
     elif nt in ("ALL", "ANY", "K_OF_N"):
         kids = node.get("children")
         if not isinstance(kids, list):
@@ -285,6 +288,11 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
             db.add(ce)
             db.flush()
             out["evaluation_id"] = ce.evaluation_id
+            # STA §17: a newly stored FAILING / REQUIRES_REVIEW evaluation creates or links its control-level issue in
+            # the same transaction (committed together, rolled back together). A reused evaluation (same digest) is
+            # not new, so retries raise nothing; previews (persist=False) store nothing and raise nothing.
+            from . import governance
+            governance.raise_control_issue(db, ci=ci, evaluation=ce)
     return out
 
 
@@ -381,7 +389,10 @@ def eval_expression(node: dict, leaf_fn, comp_fn, occ_fn) -> dict:
     nt = node["node_type"]
     base = {"node_id": node.get("node_id"), "node_type": nt}
     if nt == "CONTROL":
-        v, info = leaf_fn(node["control_key"])
+        # An exact mapping (STA §07 "exact ControlImplementation") is passed through; a selector leaf keeps the
+        # one-argument call, so selector traces and digests are unchanged.
+        impl = node.get("control_implementation_id")
+        v, info = leaf_fn(node["control_key"], impl) if impl is not None else leaf_fn(node["control_key"])
         base.update(result=v, control_key=node["control_key"], **info)
         return base
     if nt == "OCCURRENCES":
@@ -492,8 +503,14 @@ def _comp_ids(node) -> set[str]:
 
 def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str, period_from: datetime,
                      period_to: datetime, record_cutoff_seq: int | None, perspective: str, actor_id: str,
-                     persist: bool = True) -> dict:
+                     persist: bool = True, evaluated_at: datetime | None = None) -> dict:
+    """``evaluated_at``: the instant that decides whether an unfulfilled occurrence's due time has passed (MISSED) or
+    not yet (PENDING). A reproduction passes the stored snapshot's ``created_at``, which a persisted snapshot sets to
+    exactly this instant, so rebuilding it later gives the same result. Without it the request instant is used
+    (``evaluation_instant_source`` REQUEST_TIME; a persisted snapshot stores it as created_at). No other wall-clock time
+    is read."""
     from ..platform import current_watermark
+    now = ensure_utc(evaluated_at) if evaluated_at is not None else datetime.now(timezone.utc)
     period_from, period_to = ensure_utc(period_from), ensure_utc(period_to)
     if period_to <= period_from:
         raise HTTPException(422, "Assurance period must be a non-empty half-open interval")
@@ -531,6 +548,11 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                 obligation_lineage_id=obligation_lineage_id, segment=[a.isoformat(), b.isoformat()],
                 record_cutoff_seq=cutoff)
         if e.expression_version_id not in checked:
+            from .satisfaction import hash_intact
+            if not hash_intact(e):  # substituted in place after release: never evaluated as the released version
+                raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_HASH_MISMATCH",
+                                                  "the stored expression no longer matches its recorded hash",
+                                                  expression_version_id=e.expression_version_id, version=e.version)
             problems = expression_problems(e.ast)
             if problems:
                 raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", "; ".join(problems[:5]),
@@ -587,12 +609,14 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                             .order_by(ExceptionRecord.record_seq, ExceptionRecord.exception_id)).scalars().all()
     for x in exceptions:
         add(x.valid_from, x.valid_to)
+    exc_hist = exception_states_at(db, tenant_id, exceptions, cutoff)
     occs = db.execute(select(ObligationOccurrence).where(ObligationOccurrence.tenant_id == tenant_id,
                                                          ObligationOccurrence.obligation_lineage_id == obligation_lineage_id,
                                                          ObligationOccurrence.record_seq <= cutoff)
                       .order_by(ObligationOccurrence.record_seq, ObligationOccurrence.occurrence_id)).scalars().all()
     for o in occs:
         add(o.due_at)
+    occ_hist = occurrence_states_at(db, tenant_id, occs, cutoff)
     pts = sorted(bounds)
     raw = list(zip(pts[:-1], pts[1:]))
 
@@ -600,7 +624,6 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
             "control_implementations": set(), "control_evaluation_digests": set(), "test_runs": set(), "evidence": set(),
             "compensations": sorted(c.compensation_id for c in comps), "exceptions": sorted(x.exception_id for x in exceptions),
             "occurrences": sorted(o.occurrence_id for o in occs)}
-    now = datetime.now(timezone.utc)
     segments, excluded = [], []
     for a, b in raw:
         if not any(f <= a and (t is None or t >= b) for f, t in active_ranges):
@@ -609,10 +632,23 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
         expr = in_force(a, b)
         leaves = []
 
-        def leaf_fn(key, a=a, b=b, leaves=leaves):
-            ci = _resolve_impl(db, tenant_id, key, subject, a, b, cutoff)
+        def leaf_fn(key, impl_id=None, a=a, b=b, leaves=leaves):
+            exact = {}
+            if impl_id is not None:  # exact control mapping (engines/satisfaction.py): never re-resolved by selector
+                from .satisfaction import binding_problem
+                problem = binding_problem(db, tenant_id, subject, key, impl_id) if isinstance(impl_id, str) else \
+                    "control_implementation_id must be a string"
+                if problem:  # stored mapping no longer valid: a configuration error, never a leaf state (STA §16)
+                    raise AssuranceConfigurationError("CONTROL_MAPPING_INVALID", problem, control_key=key,
+                                                      expression_version_id=expr.expression_version_id)
+                exact = {"binding": "EXACT"}
+                ci = db.get(ControlImplementation, impl_id)
+                if ci.record_seq > cutoff:  # not yet known at this record cutoff
+                    ci = None
+            else:
+                ci = _resolve_impl(db, tenant_id, key, subject, a, b, cutoff)
             if ci is None:
-                info = {"control_state": "NOT_EVALUATED", "reason_codes": ["CONTROL_NOT_IMPLEMENTED"]}
+                info = {"control_state": "NOT_EVALUATED", "reason_codes": ["CONTROL_NOT_IMPLEMENTED"], **exact}
                 leaves.append({"control_key": key, **info})
                 return UNK, info
             ce = evaluate_control(db, ci, a, b, cutoff, persist=persist)
@@ -623,7 +659,7 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                 deps["evidence"] |= {e["evidence_id"] for e in t["evidence"]}
             info = {"control_implementation_id": ci.control_implementation_id, "control_state": ce["state"],
                     "reason_codes": ce["reason_codes"], "control_evaluation_id": ce.get("evaluation_id"),
-                    "precedence_rule": ce["precedence_rule"]}
+                    "precedence_rule": ce["precedence_rule"], **exact}
             leaves.append({"control_key": key, **info})
             return LEAF_MAP[ce["state"]], info
 
@@ -642,11 +678,18 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                 return SAT, {"occurrences": [], "note": "No occurrence due in segment"}
             vals, info = [], []
             for o in due:
-                if o.disputed:
+                h = occ_hist[o.occurrence_id]  # as known at the cutoff, never today's projection
+                fulfilled_at = h["fulfilled_at"]
+                on_time = fulfilled_at is not None and ensure_utc(fulfilled_at) <= ensure_utc(o.due_at)
+                if h["problem"]:
+                    # Unresolved history prevents a deterministic result: REQUIRES_REVIEW (ZA-TIM-001 §9), never a
+                    # substitute read of the current row.
+                    v, r = REV, h["problem"]
+                elif h["disputed"]:
                     v, r = REV, "SOURCE_CONFLICT"
-                elif o.fulfilled_at and ensure_utc(o.fulfilled_at) <= ensure_utc(o.due_at) and o.evidence_ids:
+                elif on_time and h["evidence_ids"]:
                     v, r = SAT, None
-                elif ensure_utc(o.due_at) <= min(b, now) and not (o.fulfilled_at and ensure_utc(o.fulfilled_at) <= ensure_utc(o.due_at)):
+                elif ensure_utc(o.due_at) <= min(b, now) and not on_time:
                     v, r = UNSAT, "OCCURRENCE_MISSED"
                 else:
                     v, r = UNK, "OCCURRENCE_PENDING"
@@ -656,8 +699,9 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
 
         trace = eval_expression(expr.ast, leaf_fn, comp_fn, occ_fn)
         state = SEGMENT_STATE[trace["result"]]
-        treat = [{"exception_id": x.exception_id, "state": x.state, "target_type": x.target_type, "valid": [x.valid_from, x.valid_to]}
-                 for x in exceptions if x.state == "APPROVED" and _overlap(x.valid_from, x.valid_to, a, b)]
+        treat = [{"exception_id": x.exception_id, "state": "APPROVED", "target_type": x.target_type, "valid": [x.valid_from, x.valid_to]}
+                 for x in exceptions
+                 if exc_hist[x.exception_id]["state"] == "APPROVED" and _overlap(x.valid_from, x.valid_to, a, b)]
         reasons = sorted({r for l in leaves for r in l.get("reason_codes", [])})
         segments.append({"segment_range": [a, b], "expression_version_id": expr.expression_version_id,
                          "expression_result": trace["result"], "assurance_state": state, "leaf_evaluations": leaves,
@@ -675,8 +719,21 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
     treatments = []
     for x in exceptions:
         if _overlap(x.valid_from, x.valid_to, period_from, period_to):
-            treatments.append({"exception_id": x.exception_id, "state": x.state, "valid": [x.valid_from, x.valid_to],
-                               "note": f"{period_state} + {x.state} EXCEPTION — underlying state unchanged"})
+            h = exc_hist[x.exception_id]
+            t = {"exception_id": x.exception_id, "state": h["state"], "valid": [x.valid_from, x.valid_to],
+                 "note": f"{period_state} + {h['state'] or 'UNRESOLVED'} EXCEPTION — underlying state unchanged"}
+            if h["problem"]:
+                t["history_problem"] = h["problem"]
+            treatments.append(t)
+    # Where each exception's and occurrence's historical state came from (TIM-REQ-015), and every gap in that history.
+    historical_state = {
+        "exceptions": [{"exception_id": k, **{f: v[f] for f in ("state", "source", "problem", "event_ids")}}
+                       for k, v in exc_hist.items()],
+        "occurrences": [{"occurrence_id": k, **{f: v[f] for f in ("fulfilled_at", "evidence_ids", "disputed", "source",
+                                                                   "problem", "event_ids")}}
+                        for k, v in occ_hist.items()]}
+    history_problems = sorted({v["problem"] for v in (*exc_hist.values(), *occ_hist.values()) if v["problem"]})
+    period_reasons = sorted(set(period_reasons) | set(history_problems))
     result = {"tenant_id": tenant_id, "entity_id": obl.entity_id, "obligation_lineage_id": obligation_lineage_id,
               "obligation_revision_id": obl.revision_id, "obligation_definition": odef.key,
               "subject": {"subject_id": subject.subject_id, "display_name": subject.display_name, "type": subject.subject_type},
@@ -685,7 +742,13 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
               "dependency_manifest": deps_json, "dependency_digest": dep_digest, "reason_codes": period_reasons,
               "exception_treatments": _jsonable(treatments), "rollup_engine_version": codes.ROLLUP_ENGINE_VERSION,
               "precedence_explanation": _explain(period_state, segments),
-              "legal_date_policy": "Assurance periods are UTC instants; legal dates convert at UTC start-of-day (explicit policy)."}
+              "legal_date_policy": "Assurance periods are UTC instants; legal dates convert at UTC start-of-day (explicit policy).",
+              "evaluation_instant_source": "SNAPSHOT_CREATED_AT" if evaluated_at is not None else "REQUEST_TIME",
+              "historical_state": _jsonable(historical_state), "history_problems": history_problems}
+    if evaluated_at is not None:
+        # Echoed only when the caller fixed it (a reproduction): identical inputs keep byte-identical output
+        # (tests/test_snapshot_determinism.py). A persisted snapshot returns the same instant as its created_at.
+        result["evaluation_instant"] = now
     if not persist:
         return result
     seq = next_record_seq(db)
@@ -696,7 +759,8 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                              segments=result["segments"], dependency_manifest=deps_json, dependency_digest=dep_digest,
                              snapshot_hash=digest({"state": period_state, "segments": result["segments"], "deps": dep_digest,
                                                    "period": [period_from, period_to], "cutoff": cutoff}),
-                             exception_treatments=result["exception_treatments"], reason_codes=period_reasons, created_by=actor_id)
+                             exception_treatments=result["exception_treatments"], reason_codes=period_reasons, created_by=actor_id,
+                             created_at=now)  # the evaluation instant, stored so /reproduce rebuilds with the same one
     db.add(snap)
     db.flush()
     prior = db.execute(select(AssuranceSnapshot).where(AssuranceSnapshot.tenant_id == tenant_id,
@@ -740,6 +804,124 @@ def _compensation_status_at(db, tenant_id: str, comps, cutoff: int) -> dict:
             out[c.compensation_id] = ("PENDING_APPROVAL", "EVENT_HISTORY")
         else:
             out[c.compensation_id] = (c.status, "PROJECTION_NO_HISTORY")
+    return out
+
+
+# Historical exception and occurrence state (audit F2; STA-REQ-021, TIM-REQ-006/015). The rows assurance_exception_revision
+# and assurance_obligation_occurrence are current-state projections updated in place (migration 0010 allows only their
+# lifecycle columns to change); what was true at a record cutoff is in their append-only event tables (0008). A snapshot
+# reads the events recorded by its cutoff, never today's projection. Where that history is missing or does not prove
+# itself, the gap is reported (problem code) and the projection is NOT substituted.
+EXCEPTION_TRANSITIONS = {("PENDING_APPROVAL", "APPROVED"), ("PENDING_APPROVAL", "REJECTED"), ("APPROVED", "REVOKED")}
+BASELINE_SOURCE = "BASELINE_0008"  # migration 0008 backfill: the state at migration time, stamped at the row's record_seq
+
+
+def _same_instant(a, b) -> bool:
+    return (a is None and b is None) or (a is not None and b is not None and ensure_utc(a) == ensure_utc(b))
+
+
+def _ordered_unambiguously(events) -> bool:
+    """One object's events must have distinct record sequences: within one sequence their order is not knowable."""
+    seqs = [e.record_seq for e in events]
+    return len(seqs) == len(set(seqs))
+
+
+def exception_states_at(db: Session, tenant_id: str, exceptions, cutoff: int) -> dict[str, dict]:
+    """Each exception's lifecycle state as known at ``cutoff``, from assurance_exception_event only.
+
+    {exception_id: {"state", "source", "problem", "event_ids"}}: ``state`` is the to_state of the last event recorded by
+    the cutoff; ``source`` is EVENT_HISTORY, or BASELINE_0008 when that event is the migration 0008 baseline (state at
+    migration time, not necessarily at the row's own record sequence). ``state`` is None, with a ``problem``, when the
+    history is missing (EXCEPTION_HISTORY_MISSING) or does not prove itself (EXCEPTION_HISTORY_INCONSISTENT: no event by
+    the cutoff although the row was recorded by then, an ambiguous order, a broken from_state chain, a transition the
+    lifecycle does not allow, identity fields that differ from the immutable row, or a projection that disagrees with a
+    fully known history)."""
+    from .governance import MIGRATION_BASELINE_EVENT as _BASELINE
+    ids = [x.exception_id for x in exceptions]
+    from ..models import ExceptionEvent
+    events = db.execute(select(ExceptionEvent).where(ExceptionEvent.tenant_id == tenant_id,
+                                                     ExceptionEvent.exception_id.in_(ids or ["-"]))
+                        .order_by(ExceptionEvent.record_seq, ExceptionEvent.event_id)).scalars().all()
+    out = {}
+    for x in exceptions:
+        own = [e for e in events if e.exception_id == x.exception_id]
+        known = [e for e in own if e.record_seq <= cutoff]
+        res = {"state": None, "source": None, "problem": None, "event_ids": [e.event_id for e in known]}
+        out[x.exception_id] = res
+        if not own:
+            res["problem"] = "EXCEPTION_HISTORY_MISSING"
+            continue
+        ok = bool(known) and _ordered_unambiguously(own)
+        if ok:
+            first = known[0]
+            ok = first.event_type in ("REQUESTED", _BASELINE) and first.from_state is None and \
+                (first.event_type == _BASELINE or first.to_state == "PENDING_APPROVAL")
+        for prev, e in zip(known, known[1:]):
+            ok = ok and e.event_type != _BASELINE and e.from_state == prev.to_state and \
+                (e.from_state, e.to_state) in EXCEPTION_TRANSITIONS and e.event_type == e.to_state
+        ok = ok and all(e.target_type == x.target_type and e.target_id == x.target_id
+                        and _same_instant(e.valid_from, x.valid_from) and _same_instant(e.valid_to, x.valid_to)
+                        for e in known)
+        if ok and len(known) == len(own) and known[-1].to_state != x.state:
+            ok = False  # the whole history is known, yet the projection says otherwise
+        if not ok:
+            res["problem"] = "EXCEPTION_HISTORY_INCONSISTENT"
+            continue
+        res["state"] = known[-1].to_state
+        res["source"] = BASELINE_SOURCE if known[-1].event_type == _BASELINE else "EVENT_HISTORY"
+    return out
+
+
+def occurrence_states_at(db: Session, tenant_id: str, occs, cutoff: int) -> dict[str, dict]:
+    """Each occurrence's fulfilment and dispute as known at ``cutoff``, from assurance_obligation_occurrence_event.
+
+    {occurrence_id: {"fulfilled_at", "evidence_ids", "disputed", "source", "problem", "event_ids"}}.
+      * fulfilment and its evidence references come from the FULFILLED event recorded by the cutoff (or the 0008
+        BASELINE event, labelled BASELINE_0008), never from the projection;
+      * ``disputed``: the row's ``disputed`` column, immutable since insertion (0010 immutable_columns), or a DISPUTED
+        event recorded by the cutoff;
+      * no events at all: an occurrence that is still unfulfilled is reconstructed exactly (fulfil_occurrence always
+        writes its FULFILLED event and the projection can only go from unfulfilled to fulfilled), source NO_EVENTS; a
+        fulfilled one has no recorded fulfilment time, so OCCURRENCE_HISTORY_MISSING;
+      * OCCURRENCE_HISTORY_INCONSISTENT: no event by the cutoff although the row was recorded by then, an ambiguous order,
+        a first event other than SCHEDULED/BASELINE, more than one fulfilment, a fulfilment event without a fulfilment
+        time, schedule fields that differ from the immutable row, or a projection that disagrees with a fully known
+        history."""
+    from .governance import MIGRATION_BASELINE_EVENT as _BASELINE
+    ids = [o.occurrence_id for o in occs]
+    from ..models import ObligationOccurrenceEvent as OccEvent
+    events = db.execute(select(OccEvent).where(OccEvent.tenant_id == tenant_id, OccEvent.occurrence_id.in_(ids or ["-"]))
+                        .order_by(OccEvent.record_seq, OccEvent.event_id)).scalars().all()
+    out = {}
+    for o in occs:
+        own = [e for e in events if e.occurrence_id == o.occurrence_id]
+        known = [e for e in own if e.record_seq <= cutoff]
+        res = {"fulfilled_at": None, "evidence_ids": [], "disputed": bool(o.disputed), "source": None, "problem": None,
+               "event_ids": [e.event_id for e in known]}
+        out[o.occurrence_id] = res
+        if not own:
+            if o.fulfilled_at is None and not o.evidence_ids:
+                res["source"] = "NO_EVENTS"
+            else:
+                res["problem"] = "OCCURRENCE_HISTORY_MISSING"
+            continue
+        fulfils = [e for e in own if e.event_type == "FULFILLED" or (e.event_type == _BASELINE and e.fulfilled_at)]
+        ok = bool(known) and _ordered_unambiguously(own) and known[0].event_type in ("SCHEDULED", _BASELINE) \
+            and len(fulfils) <= 1 and all(e.event_type != _BASELINE for e in known[1:]) \
+            and all(e.fulfilled_at is not None for e in own if e.event_type == "FULFILLED") \
+            and all(_same_instant(e.window_from, o.window_from) and _same_instant(e.due_at, o.due_at) for e in own)
+        done = next((e for e in known if e in fulfils), None)
+        if ok and len(known) == len(own):  # the whole history is known: the projection must agree with it
+            ok = _same_instant(o.fulfilled_at, done.fulfilled_at if done else None) and \
+                list(o.evidence_ids or []) == list((done.evidence_ids or []) if done else [])
+        if not ok:
+            res["problem"] = "OCCURRENCE_HISTORY_INCONSISTENT"
+            continue
+        res["disputed"] = res["disputed"] or any(e.event_type == "DISPUTED" for e in known)
+        if done is not None:
+            res["fulfilled_at"], res["evidence_ids"] = done.fulfilled_at, list(done.evidence_ids or [])
+        res["source"] = BASELINE_SOURCE if known[0].event_type == _BASELINE and (done is None or done is known[0]) \
+            else "EVENT_HISTORY"
     return out
 
 

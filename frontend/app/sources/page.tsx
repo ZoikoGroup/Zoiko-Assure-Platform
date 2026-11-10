@@ -12,7 +12,8 @@ export default function Sources() {
   return (
     <>
       <PageHeader spec="WF-DOM-01 · ZA-DOM-001 §4 · ZA-RUL-001" title="Sources & Provisions"
-        subtitle="Instruments, their atomic requirement versions and provisions, and the catalogue coverage built on them. Extraction stays a non-binding proposal until a qualified legal reviewer encodes and verifies it." />
+        subtitle="Regulatory instruments, their requirements and catalogue coverage."
+        help="Instruments, their atomic requirement versions and provisions, and the catalogue coverage built on them. Extraction stays a non-binding proposal until a qualified legal reviewer encodes and verifies it." />
       <Tabs id={tabsId} tabs={["Requirements & provisions", "Catalogue & coverage"]} value={tab} onChange={setTab} />
       <TabPanel id={tabsId} value={tab}>
         {tab === "Requirements & provisions" && <RequirementList onOpen={setOpen} />}

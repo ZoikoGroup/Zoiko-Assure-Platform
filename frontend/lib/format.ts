@@ -17,3 +17,11 @@ export const short = (h?: string | null, n = 10) => (h ? (h.length > n ? h.slice
 export function isoLocal(d: Date) {
   return d.toISOString().slice(0, 16);
 }
+
+/** File size for people: "56 B", "5.4 KB", "2.1 MB". */
+export function fmtBytes(n?: number | null): string {
+  if (n == null || isNaN(n)) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}

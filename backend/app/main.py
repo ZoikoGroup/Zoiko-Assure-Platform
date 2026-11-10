@@ -50,7 +50,15 @@ async def lifespan(_: FastAPI):
     else:  # isolated SQLite test runs only (ZA_ALLOW_SQLITE=1): one database, no roles, no RLS
         Base.metadata.create_all(engine)
         provision_data()
-    yield
+    # Optional Redis (app/redis_client.py): one shared pool, verified with PING. An outage or a missing REDIS_URL never
+    # stops the API unless REDIS_REQUIRED=true; it is reported by /api/health and every cache read falls back to
+    # PostgreSQL. Credentials are never logged.
+    from .redis_client import manager as redis_manager
+    redis_manager.start()
+    try:
+        yield
+    finally:
+        redis_manager.close()
 
 
 app = FastAPI(lifespan=lifespan, title="Zoiko Assure API", version="1.0.0",

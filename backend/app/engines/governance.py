@@ -98,8 +98,14 @@ def decide_exception(
     decision: str,
     reason: str | None = None,
 ) -> tuple[ExceptionRecord, ExceptionEvent]:
-    x = db.get(ExceptionRecord, exception_id)
-    if not x or x.tenant_id != tenant_id:
+    # Lock the exception row, then decide on the state read under the lock (populate_existing: the caller's earlier
+    # db.get may have cached a stale copy). Two concurrent decisions serialise here: the second one sees the first
+    # one's committed state and is refused as an invalid transition (409) instead of also succeeding. No lock is held
+    # before this one; the record-sequence row is locked after it (next_record_seq), so the order is always the same.
+    x = db.execute(select(ExceptionRecord).where(ExceptionRecord.exception_id == exception_id,
+                                                 ExceptionRecord.tenant_id == tenant_id)
+                   .with_for_update().execution_options(populate_existing=True)).scalars().first()
+    if not x:
         raise HTTPException(404, "Exception not found")
     if x.requested_by == actor_id and decision == "APPROVE":
         raise HTTPException(403, "Requester cannot approve own exception")
@@ -389,6 +395,30 @@ def record_issue_created(
     return ev
 
 
+# Issue types whose closure STA §17 lets this module verify: they are raised from an AssuranceSnapshot (engines/assurance.py
+# _issue_hooks), and "the resulting new ... AssuranceSnapshot provides the actual updated state".
+SNAPSHOT_VERIFIED_ISSUE_TYPES = frozenset({"OBLIGATION_FAILING", "PROOF_GAP", "ASSURANCE_REVIEW"})
+# Control-level issues (raise_control_issue): verified by "the resulting new ControlEvaluation" (STA §17).
+CONTROL_ISSUE_TYPES = {"FAILING": "CONTROL_FAILING", "REQUIRES_REVIEW": "CONTROL_REVIEW"}
+EVALUATION_VERIFIED_ISSUE_TYPES = frozenset(CONTROL_ISSUE_TYPES.values())
+# Issue types whose closure criteria are owned or decided elsewhere; their closure is unchanged here:
+#   INTEGRITY_INCIDENT  - evidence/ledger integrity (engines/evidence.py; evidence & security ownership)
+#   DETERMINATION_REVIEW - applicability re-review; its resolution path is the open R-02 decision (an adopted
+#                          determination cannot currently be re-attested after a changed evaluation).
+UNVERIFIED_CLOSURE_ISSUE_TYPES = frozenset({"INTEGRITY_INCIDENT", "DETERMINATION_REVIEW"})
+TERMINAL_ISSUE_STATES = frozenset({"CLOSED", "CANCELLED"})
+
+
+def _lock_issue(db: Session, tenant_id: str, issue_id: str) -> Issue:
+    """Row-lock the issue for this transaction and read its committed state, so concurrent transitions, assignments
+    and closures of one issue serialise and none is lost (a waiting request sees the other's result)."""
+    i = db.execute(select(Issue).where(Issue.issue_id == issue_id).with_for_update()
+                   .execution_options(populate_existing=True)).scalars().first()
+    if not i or i.tenant_id != tenant_id:
+        raise HTTPException(404, "Issue not found")
+    return i
+
+
 def transition_issue(
     db: Session,
     tenant_id: str,
@@ -398,14 +428,22 @@ def transition_issue(
     to_state: str,
     reason: str | None = None,
     owner_actor_id: str | None = None,
+    _verified_closure: bool = False,
 ) -> tuple[Issue, IssueEvent]:
-    i = db.get(Issue, issue_id)
-    if not i or i.tenant_id != tenant_id:
-        raise HTTPException(404, "Issue not found")
+    i = _lock_issue(db, tenant_id, issue_id)
     if to_state not in ISSUE_FLOW.get(i.state, set()):
         raise HTTPException(409, f"Invalid transition {i.state} -> {to_state}")
     if to_state == "CANCELLED" and not reason:
         raise HTTPException(422, "Cancellation reason required")
+    # ZA-GLS-001 §07: TRIAGED = "Ownership, severity and treatment path are established".
+    if to_state == "TRIAGED" and not (owner_actor_id or i.owner_actor_id):
+        raise HTTPException(409, {"error": "ISSUE_OWNER_REQUIRED",
+                                  "message": "Assign an accountable owner before triage (POST /issues/{id}/assign)."})
+    # ZA-STA-001 §17 / STA-REQ-023: closure needs remediation plus a new test/evidence cycle and the resulting new
+    # AssuranceSnapshot; ZA-GLS-001 CLOSED = "Verification confirms closure criteria were met".
+    if to_state == "CLOSED" and not _verified_closure and i.issue_type not in UNVERIFIED_CLOSURE_ISSUE_TYPES:
+        raise HTTPException(409, {"error": "VERIFICATION_REQUIRED",
+                                  "message": "Close with POST /issues/{id}/close and the verifying AssuranceSnapshot."})
     prior = i.state
     i.state = to_state
     if owner_actor_id is not None:
@@ -427,6 +465,233 @@ def transition_issue(
           actor=actor, tenant_id=tenant_id, prior=prior, new=to_state, reason=reason, record_seq=seq)
     emit(db, event_type="assurance.issue_transitioned", aggregate_type="Issue", aggregate_id=issue_id,
          tenant_id=tenant_id, record_seq=seq, payload={"from_state": prior, "to_state": to_state})
+    return i, ev
+
+
+def assign_issue(db: Session, *, tenant_id: str, actor: Any, issue_id: str, owner_actor_id: str,
+                 reason: str) -> tuple[Issue, IssueEvent]:
+    """Record the accountable owner of an open issue (STA §17 "owner"; GLS TRIAGED "Ownership ... established").
+
+    The owner is a human principal of the same organisation. The change is an ASSIGNED event (append-only, 0008),
+    the projection's owner column and an audit record, in one transaction. Re-assigning the same owner is refused,
+    so a retried request records nothing twice. No due date or escalation is set: ZA-WRK-001 §06 requires a versioned
+    deadline policy/calendar reference, which does not exist yet. No outbox event: ZA-EVT-001 catalogues none."""
+    from ..models import Actor
+    i = _lock_issue(db, tenant_id, issue_id)
+    if i.state in TERMINAL_ISSUE_STATES:
+        raise HTTPException(409, {"error": "ISSUE_TERMINAL", "message": f"A {i.state} issue cannot be reassigned."})
+    owner = db.get(Actor, owner_actor_id)
+    if owner is None or owner.tenant_id != tenant_id:  # another organisation's principal reads as unknown
+        raise HTTPException(422, {"error": "OWNER_NOT_FOUND", "message": "The owner is not a principal of this organisation."})
+    if owner.actor_type != "HUMAN":
+        raise HTTPException(422, {"error": "OWNER_NOT_HUMAN",
+                                  "message": "An accountable issue owner is a human principal."})
+    if i.owner_actor_id == owner_actor_id:
+        raise HTTPException(409, {"error": "ISSUE_OWNER_UNCHANGED", "message": "The issue already has this owner."})
+    prior_owner = i.owner_actor_id
+    i.owner_actor_id = owner_actor_id
+    seq = next_record_seq(db)
+    actor_id = getattr(actor, "actor_id", actor)
+    ev = IssueEvent(issue_id=i.issue_id, tenant_id=tenant_id, event_type="ASSIGNED", from_state=i.state,
+                    to_state=i.state, actor_id=actor_id, reason=reason, owner_actor_id=owner_actor_id, record_seq=seq)
+    db.add(ev)
+    audit(db, action="issue.assign", object_type="Issue", object_id=issue_id, actor=actor, tenant_id=tenant_id,
+          prior=prior_owner, new=owner_actor_id, reason=reason, record_seq=seq)
+    return i, ev
+
+
+def _remediation_started_seq(db: Session, issue: Issue) -> int | None:
+    """record_seq of the event that opened the current remediation cycle: the latest event reaching IN_REMEDIATION.
+    A migration-0008 baseline event in IN_REMEDIATION counts too: it is the recorded start for an issue that was
+    already in remediation, so a verifying retest must still come after it."""
+    return db.execute(select(IssueEvent.record_seq).where(
+        IssueEvent.tenant_id == issue.tenant_id, IssueEvent.issue_id == issue.issue_id,
+        IssueEvent.to_state == "IN_REMEDIATION")
+        .order_by(IssueEvent.record_seq.desc()).limit(1)).scalar()
+
+
+def closure_problems(db: Session, issue: Issue, snapshot_id: str) -> list[tuple[int, str, str]]:
+    """Why ``snapshot_id`` does not verify closure of ``issue`` (empty: it does), as (status, code, message).
+
+    ZA-STA-001 §17 closure rule: "Closure requires remediation plus a new test/evidence cycle ... The resulting new
+    ... AssuranceSnapshot provides the actual updated state"; STA-REQ-023; ZA-GLS-001 CLOSED "Verification confirms
+    closure criteria were met". The verifying snapshot must:
+      1. belong to this organisation and the same obligation as the snapshot that raised the issue;
+      2. know about the remediation (record cutoff at or after the start of the current remediation cycle);
+      3. depend on a TestRun or evidence recorded after remediation started (the new test/evidence cycle);
+      4. show the obligation PROVEN (proof now exists; a FAILING, REQUIRES_REVIEW or NOT_PROVEN result does not
+         confirm that the condition was remediated)."""
+    from ..models import AssuranceSnapshot, EvidenceArtifact, TestRun
+    out: list[tuple[int, str, str]] = []
+    source = db.get(AssuranceSnapshot, issue.source_ref_id) if issue.source_ref_type == "AssuranceSnapshot" else None
+    if source is None or source.tenant_id != issue.tenant_id:
+        return [(409, "ISSUE_SOURCE_UNRESOLVABLE", "The snapshot that raised this issue cannot be found.")]
+    snap = db.get(AssuranceSnapshot, snapshot_id)
+    if snap is None or snap.tenant_id != issue.tenant_id:
+        return [(404, "VERIFICATION_NOT_FOUND", "Verification snapshot not found.")]
+    if snap.obligation_lineage_id != source.obligation_lineage_id:
+        out.append((422, "VERIFICATION_SCOPE_MISMATCH", "The verification snapshot is for a different obligation."))
+    started = _remediation_started_seq(db, issue)
+    if started is None:
+        return out + [(409, "REMEDIATION_NOT_RECORDED", "No remediation cycle is recorded for this issue.")]
+    if snap.record_cutoff_seq < started:
+        out.append((409, "VERIFICATION_PREDATES_REMEDIATION",
+                    "The verification snapshot was computed from knowledge recorded before remediation started."))
+    deps = snap.dependency_manifest or {}
+    run_ids, evidence_ids = list(deps.get("test_runs") or []), list(deps.get("evidence") or [])
+    newer_runs = db.execute(select(TestRun.test_run_id).where(
+        TestRun.tenant_id == issue.tenant_id, TestRun.test_run_id.in_(run_ids or ["-"]),
+        TestRun.record_seq > started)).scalars().all()
+    newer_evidence = db.execute(select(EvidenceArtifact.evidence_id).where(
+        EvidenceArtifact.tenant_id == issue.tenant_id, EvidenceArtifact.evidence_id.in_(evidence_ids or ["-"]),
+        EvidenceArtifact.record_seq > started)).scalars().all()
+    if not newer_runs and not newer_evidence:
+        out.append((409, "RETEST_REQUIRED", "The verification snapshot uses no TestRun or evidence recorded after "
+                                            "remediation started; a new test/evidence cycle is required."))
+    if snap.state != "PROVEN":
+        out.append((409, "VERIFICATION_NOT_PROVEN", f"The verification snapshot is {snap.state}, not PROVEN."))
+    return out
+
+
+def _new_inputs_after(db: Session, tenant_id: str, run_ids, evidence_ids, started: int) -> bool:
+    from ..models import EvidenceArtifact, TestRun
+    runs = db.execute(select(TestRun.test_run_id).where(
+        TestRun.tenant_id == tenant_id, TestRun.test_run_id.in_(list(run_ids) or ["-"]),
+        TestRun.record_seq > started)).first()
+    evidence = db.execute(select(EvidenceArtifact.evidence_id).where(
+        EvidenceArtifact.tenant_id == tenant_id, EvidenceArtifact.evidence_id.in_(list(evidence_ids) or ["-"]),
+        EvidenceArtifact.record_seq > started)).first()
+    return runs is not None or evidence is not None
+
+
+def control_closure_problems(db: Session, issue: Issue, evaluation_id: str) -> list[tuple[int, str, str]]:
+    """Why ``evaluation_id`` does not verify closure of a control-level ``issue`` (empty: it does).
+
+    STA §17: "Closure requires remediation plus a new test/evidence cycle ... The resulting new ControlEvaluation ...
+    provides the actual updated state"; STA-REQ-023; GLS CLOSED. The verifying ControlEvaluation must be of the same
+    control implementation (control + scope) in this organisation, computed at a record cutoff at or after the start of
+    the current remediation cycle, from a TestRun or evidence recorded after remediation started, and OPERATING
+    (STA §06: DEGRADED and NOT_EVALUATED are not affirmative proof; FAILING and REQUIRES_REVIEW are not remediated)."""
+    from ..models import ControlEvaluation
+    source = db.get(ControlEvaluation, issue.source_ref_id) if issue.source_ref_type == "ControlEvaluation" else None
+    if source is None or source.tenant_id != issue.tenant_id:
+        return [(409, "ISSUE_SOURCE_UNRESOLVABLE", "The control evaluation that raised this issue cannot be found.")]
+    ce = db.get(ControlEvaluation, evaluation_id)
+    if ce is None or ce.tenant_id != issue.tenant_id:
+        return [(404, "VERIFICATION_NOT_FOUND", "Verification control evaluation not found.")]
+    out: list[tuple[int, str, str]] = []
+    if ce.control_implementation_id != source.control_implementation_id:
+        out.append((422, "VERIFICATION_SCOPE_MISMATCH", "The verification evaluation is of a different control."))
+    started = _remediation_started_seq(db, issue)
+    if started is None:
+        return out + [(409, "REMEDIATION_NOT_RECORDED", "No remediation cycle is recorded for this issue.")]
+    if ce.record_cutoff_seq < started:
+        out.append((409, "VERIFICATION_PREDATES_REMEDIATION",
+                    "The verification evaluation was computed from knowledge recorded before remediation started."))
+    deps = (ce.inputs or {}).get("deps") or {}
+    if not _new_inputs_after(db, issue.tenant_id, deps.get("runs") or [], deps.get("evidence") or [], started):
+        out.append((409, "RETEST_REQUIRED", "The verification evaluation uses no TestRun or evidence recorded after "
+                                            "remediation started; a new test/evidence cycle is required."))
+    if ce.state != "OPERATING":
+        out.append((409, "VERIFICATION_NOT_OPERATING", f"The verification evaluation is {ce.state}, not OPERATING."))
+    return out
+
+
+def raise_control_issue(db: Session, *, ci, evaluation) -> Issue | None:
+    """Create or link the issue for a newly stored ControlEvaluation (STA §17):
+
+      FAILING          "Create/link issue unless an existing open issue already covers exact control/scope/root cause."
+      REQUIRES_REVIEW  "Create review issue/task with conflicting source references and owner."
+
+    Any other state raises nothing here (NOT_EVALUATED: STA §17 requires a source/cadence policy that does not exist).
+
+    Identity of the condition (the dedupe key): issue type + control implementation (the control and its governed scope;
+    ControlImplementation is "unique per control + governed scope + implementation variant", DOM §7.1) + subject + the
+    evaluation's own controlled reason codes, as recorded, as the root cause. No new classification is applied.
+    An active (not CLOSED / CANCELLED) issue with the same identity is linked: an audit record names the new evaluation,
+    and no second issue is created. Runs in the evaluation's transaction, so the issue exists exactly when the
+    evaluation is committed; serialised per organisation (engines/locks.py), so concurrent evaluations of one condition
+    never create two active issues. The issue references the immutable ControlEvaluation, which holds the conflicting
+    source/evidence references and the full trace. Severity and priority keep the model defaults: no control-issue
+    severity policy is specified."""
+    import hashlib
+
+    from ..models import Actor, ControlDefinition
+    from .locks import xact_lock
+    kind = CONTROL_ISSUE_TYPES.get(evaluation.state)
+    if kind is None:
+        return None
+    causes = sorted(set(evaluation.reason_codes or []))
+    cause_id = hashlib.sha256("|".join(causes).encode()).hexdigest()[:16]
+    key = f"{kind}:{ci.control_implementation_id}:{ci.subject_id}:{cause_id}"
+    # One lock per organisation, taken before any record-sequence write, so every path acquires the same locks in the
+    # same order (several control issues raised by one snapshot cannot deadlock with another snapshot).
+    xact_lock(db, "control-issue", ci.tenant_id)
+    active = db.execute(select(Issue).where(Issue.tenant_id == ci.tenant_id, Issue.dedupe_key == key,
+                                            Issue.state.notin_(sorted(TERMINAL_ISSUE_STATES)))
+                        .order_by(Issue.created_at, Issue.issue_id)).scalars().first()
+    if active is not None:
+        audit(db, action="issue.evaluation_linked", object_type="Issue", object_id=active.issue_id, actor="system",
+              tenant_id=ci.tenant_id, new=active.state, record_seq=next_record_seq(db),
+              reason=f"ControlEvaluation {evaluation.evaluation_id} ({evaluation.state}; {', '.join(causes)}) is "
+                     f"covered by this open issue")
+        return active
+    cd = db.get(ControlDefinition, ci.control_definition_id)
+    owner = None
+    if kind == "CONTROL_REVIEW":  # STA §17: review issue "with ... owner": the control implementation's owner
+        a = db.get(Actor, ci.owner_actor_id) if ci.owner_actor_id else None
+        owner = a.actor_id if a is not None and a.tenant_id == ci.tenant_id and a.actor_type == "HUMAN" else None
+    title = f"{'Control FAILING' if kind == 'CONTROL_FAILING' else 'Control requires review'}: {cd.title if cd else ci.control_definition_id}"
+    iss = Issue(tenant_id=ci.tenant_id, title=title[:300], issue_type=kind, source_ref_type="ControlEvaluation",
+                source_ref_id=evaluation.evaluation_id, dedupe_key=key, owner_actor_id=owner)
+    db.add(iss)
+    db.flush()
+    refs = ""
+    if kind == "CONTROL_REVIEW":
+        conflicting = sorted({e["evidence_id"] for t in (evaluation.inputs or {}).get("tests", [])
+                              for e in t.get("evidence", []) if e.get("condition") == "CONFLICTING"})
+        refs = f"; conflicting evidence {conflicting}" if conflicting else ""
+    ev = record_issue_created(db, issue=iss, actor_id="system",
+                              reason=(f"ControlEvaluation {evaluation.evaluation_id} {evaluation.state} for control "
+                                      f"implementation {ci.control_implementation_id}; reason codes {causes}{refs}")[:2000])
+    emit(db, event_type="issue.created", aggregate_type="Issue", aggregate_id=iss.issue_id, tenant_id=ci.tenant_id,
+         record_seq=ev.record_seq, payload={"issue_id": iss.issue_id, "issue_type": kind,
+                                            "control_implementation_id": ci.control_implementation_id,
+                                            "control_evaluation_id": evaluation.evaluation_id})
+    return iss
+
+
+def close_issue(db: Session, *, tenant_id: str, actor: Any, issue_id: str, verification_snapshot_id: str | None = None,
+                reason: str, verification_control_evaluation_id: str | None = None) -> tuple[Issue, IssueEvent]:
+    """PENDING_VERIFICATION -> CLOSED, verified by the result STA §17 names for the issue's level: a new
+    AssuranceSnapshot for obligation issues (closure_problems), a new ControlEvaluation for control issues
+    (control_closure_problems). Closure changes the issue only: no control, obligation, snapshot, test or evidence
+    record is written (STA-REQ-023). The verifying result is recorded in the event, the audit record and the catalogued
+    ``issue.closed`` outbox event."""
+    i = _lock_issue(db, tenant_id, issue_id)
+    if i.issue_type in SNAPSHOT_VERIFIED_ISSUE_TYPES:
+        kind, ref = "AssuranceSnapshot", verification_snapshot_id
+    elif i.issue_type in EVALUATION_VERIFIED_ISSUE_TYPES:
+        kind, ref = "ControlEvaluation", verification_control_evaluation_id
+    else:
+        raise HTTPException(409, {"error": "VERIFICATION_NOT_DEFINED",
+                                  "message": f"Verified closure is not defined for {i.issue_type} issues."})
+    if not ref:
+        raise HTTPException(422, {"error": "VERIFICATION_KIND_MISMATCH",
+                                  "message": f"{i.issue_type} issues are verified by a {kind}."})
+    if i.state != "PENDING_VERIFICATION":
+        raise HTTPException(409, f"Invalid transition {i.state} -> CLOSED")
+    problems = closure_problems(db, i, ref) if kind == "AssuranceSnapshot" else control_closure_problems(db, i, ref)
+    if problems:
+        status = 404 if any(p[0] == 404 for p in problems) else 422 if any(p[0] == 422 for p in problems) else 409
+        raise HTTPException(status, {"error": problems[0][1], "message": "; ".join(p[2] for p in problems),
+                                     "problems": [{"code": c, "message": m} for _, c, m in problems]})
+    actor_id = getattr(actor, "actor_id", actor)
+    i, ev = transition_issue(db, tenant_id=tenant_id, actor_id=actor_id, actor=actor, issue_id=issue_id,
+                             to_state="CLOSED", reason=f"{reason} [verified by {kind} {ref}]", _verified_closure=True)
+    key = "verification_snapshot_id" if kind == "AssuranceSnapshot" else "verification_control_evaluation_id"
+    emit(db, event_type="issue.closed", aggregate_type="Issue", aggregate_id=issue_id, tenant_id=tenant_id,
+         record_seq=ev.record_seq, payload={"issue_id": issue_id, "issue_type": i.issue_type, key: ref})
     return i, ev
 
 
@@ -517,6 +782,9 @@ def release_legal_hold(
 # ==============================================================================
 
 MIGRATION_BASELINE_ACTOR = "system:migration:0008"
+# The event_type migration 0008 gave its backfilled events. Read-only marker: no application code writes it
+# (tests/test_governance_projections.py); readers such as assurance.exception_states_at refer to it by this name.
+MIGRATION_BASELINE_EVENT = "BASELINE"
 
 
 def event_view(e) -> dict:
@@ -529,7 +797,7 @@ def event_view(e) -> dict:
     are not rewritten; any correction of them needs an approved forward correction."""
     from ..platform import to_dict
     d = to_dict(e)
-    if d.get("event_type") == "BASELINE":
+    if d.get("event_type") == MIGRATION_BASELINE_EVENT:
         d["provenance"] = {"kind": "MIGRATION_BASELINE", "recorded_by": MIGRATION_BASELINE_ACTOR,
                            "note": "Created by migration 0008 from the record's state at migration time; actor_id, "
                                    "record_seq and timestamps are copied from that record, not observed as an event."}
@@ -663,8 +931,13 @@ def fulfil_occurrence(
     fulfilled_at: datetime,
     evidence_ids: list[str],
 ) -> tuple[ObligationOccurrence, ObligationOccurrenceEvent]:
-    o = db.get(ObligationOccurrence, occurrence_id)
-    if not o or o.tenant_id != tenant_id:
+    # Lock, then re-read (as decide_exception): a concurrent second fulfilment waits for the first to commit, sees it
+    # fulfilled and is refused with 409, rather than passing the check on a stale read and then failing on the
+    # lifecycle_final trigger (migration 0010) with a raw database error.
+    o = db.execute(select(ObligationOccurrence).where(ObligationOccurrence.occurrence_id == occurrence_id,
+                                                      ObligationOccurrence.tenant_id == tenant_id)
+                   .with_for_update().execution_options(populate_existing=True)).scalars().first()
+    if not o:
         raise HTTPException(404, "Occurrence not found")
     if o.fulfilled_at:
         raise HTTPException(409, "Occurrence already fulfilled; history is immutable")
