@@ -16,9 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, or_, select
 
 from .. import codes, pagination
+from ..cache import cached_catalog_read
 from ..db import CELL_ID
 from ..engines import catalog as cat
-from ..engines import release_verification
+from ..engines import corrections, release_verification
 from ..models import (ApplicabilityEvaluation, AuditEvent, ContentRelease, ControlDefinition, FactDefinition,
                       FrameworkMapping, Instrument, ObligationDefinition, Provision, RegulatorySource,
                       RequirementVersion, RuleVersion, SetVersion)
@@ -410,17 +411,21 @@ def traceability_validation(ctx: Ctx = Depends(authorize(*CONTENT_READERS))):
 # ---------------------------------------------------------------- obligation definitions and other catalogue reads
 @router.get("/obligation-definitions")
 def odefs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
-    out = []
-    for o in ctx.db.execute(select(ObligationDefinition)).scalars():
-        d = to_dict(o)
-        inst = ctx.db.get(Instrument, o.instrument_id)
-        d["instrument"] = inst.identifier
-        rv = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == o.obligation_definition_id,
-                                                      RuleVersion.status == "PUBLISHED").order_by(RuleVersion.version.desc())).scalars().first()
-        d["current_rule_version"] = to_dict(rv) if rv else None
-        d["provisions"] = [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.provision_id.in_(o.provision_ids or ["-"]))).scalars()]
-        out.append(d)
-    return out
+    """Global catalogue content, identical for every authorised caller. Authorised first (the dependency); then
+    optionally served from the record-watermark-keyed cache (app/cache.py, ZA_CATALOG_CACHE)."""
+    def build():
+        out = []
+        for o in ctx.db.execute(select(ObligationDefinition)).scalars():
+            d = to_dict(o)
+            inst = ctx.db.get(Instrument, o.instrument_id)
+            d["instrument"] = inst.identifier
+            rv = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == o.obligation_definition_id,
+                                                          RuleVersion.status == "PUBLISHED").order_by(RuleVersion.version.desc())).scalars().first()
+            d["current_rule_version"] = to_dict(rv) if rv else None
+            d["provisions"] = [to_dict(p) for p in ctx.db.execute(select(Provision).where(Provision.provision_id.in_(o.provision_ids or ["-"]))).scalars()]
+            out.append(d)
+        return out
+    return cached_catalog_read(ctx.db, "obligation_definitions", build)
 
 
 @router.get("/obligation-definitions/{odef_id}/trace")
@@ -526,20 +531,31 @@ def sets(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
 
 @router.get("/controls")
 def control_defs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
-    out = []
-    for c in ctx.db.execute(select(ControlDefinition)).scalars():
-        d = to_dict(c)
-        d["framework_mappings"] = [to_dict(m) for m in ctx.db.execute(select(FrameworkMapping).where(
-            FrameworkMapping.control_definition_id == c.control_definition_id)).scalars()]
-        out.append(d)
-    return out
+    """Global control definitions and framework mappings; authorised first, optionally cached (app/cache.py)."""
+    def build():
+        out = []
+        for c in ctx.db.execute(select(ControlDefinition)).scalars():
+            d = to_dict(c)
+            d["framework_mappings"] = [to_dict(m) for m in ctx.db.execute(select(FrameworkMapping).where(
+                FrameworkMapping.control_definition_id == c.control_definition_id)).scalars()]
+            out.append(d)
+        return out
+    return cached_catalog_read(ctx.db, "control_definitions", build)
+
+
+def shadow_summary_for(ctx: Ctx, summary: dict | None) -> dict | None:
+    """The cross-organisation shadow counts, withheld from organisation principals (corrections.shadow_summary_for)."""
+    return corrections.shadow_summary_for(ctx.actor.tenant_id, summary)
 
 
 @router.get("/releases")
 def releases(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Customer-visible changelog of signed releases with correction flags (API-001 §17). The cross-organisation
+    ``shadow_summary`` is withheld from organisation readers (shadow_summary_for)."""
     out = []
     for r in ctx.db.execute(select(ContentRelease).order_by(ContentRelease.published_at.desc())).scalars():
-        d = to_dict(r)
+        d = to_dict(r) | corrections.correction_flags(ctx.db, r)
+        d["shadow_summary"] = shadow_summary_for(ctx, r.shadow_summary)
         if ctx.actor.tenant_id:  # tenant-scoped impact view: their own impacted subjects only
             rvs = r.manifest.get("rule_versions", [])
             ids = [x["rule_version_id"] for x in rvs]
@@ -547,6 +563,42 @@ def releases(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
                 ApplicabilityEvaluation.tenant_id == ctx.actor.tenant_id,
                 ApplicabilityEvaluation.rule_version_id.in_(ids or ["-"])).count()
         out.append(d)
+    return out
+
+
+@router.get("/releases/{release_id}/impact")
+def release_impact(release_id: str, as_of_record_seq: int | None = Query(default=None, ge=0),
+                   ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """Correction notice and tenant-specific impact report for one signed release (API-001 §17 "Tenant-authorized
+    impact summary after release/shadow processing. No other-tenant aggregate detail"; FR-WRK-003; GLS-001 Correction
+    Notice; app/engines/corrections.py).
+
+    Everyone with catalogue read sees the release's global part: correction flags, the signed correction statement and
+    the content it carries. An organisation reader also gets its own impact, computed read-only from its own records as
+    known at ``as_of_record_seq`` (default: now), so an earlier report can be reproduced. Content and platform staff get no
+    tenant impact at all (INV-14: no standing tenant data access); the release's ``shadow_summary`` is their aggregate
+    view, and it is null for an organisation reader, because it counts every organisation's subjects (§17 "No
+    other-tenant aggregate detail"; shadow_summary_for). Nothing is changed by reading a notice."""
+    r = ctx.db.get(ContentRelease, release_id)
+    if not r:
+        raise HTTPException(404, "content release not found")
+    scope, problems = corrections.release_scope(ctx.db, r)
+    out = {"content_release_id": r.content_release_id, "label": r.label, "status": r.status,
+           "manifest_hash": r.manifest_hash, "published_at": to_dict(r)["published_at"],
+           "release_record_seq": r.cell_received_seq, **corrections.correction_flags(ctx.db, r),
+           "scope": scope, "scope_problems": problems, "shadow_summary": shadow_summary_for(ctx, r.shadow_summary),
+           "tenant_impact": None}
+    if ctx.actor.tenant_id:
+        now = current_watermark(ctx.db)["record_seq"]
+        seq = now if as_of_record_seq is None else as_of_record_seq
+        if seq > now:
+            raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                      "message": f"as_of_record_seq is beyond the current record sequence {now}"})
+        if seq < r.cell_received_seq:
+            raise HTTPException(422, {"error": "RECORD_SEQ_BEFORE_RELEASE",
+                                      "message": "The release was not yet known at that record sequence."})
+        out["tenant_impact"] = corrections.tenant_impact(ctx.db, tenant_id=ctx.actor.tenant_id, release=r,
+                                                         as_of_seq=seq)
     return out
 
 

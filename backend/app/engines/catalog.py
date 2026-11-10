@@ -319,6 +319,64 @@ def requirement_content_digest(rv: RequirementVersion, provisions: list[Provisio
     return sha256_hex(canonical_json(payload))
 
 
+# ---------------------------------------------------------------- source-mapping release binding (RUL §12, RUL-REQ-008)
+# ZA-RUL-001 §12: source mappings are outside the executable (AST) hash, but "source mappings required for legal
+# interpretation remain release-bound", and anything outside the executable hash must be "separately integrity-protected
+# in release manifest". The RuleVersion row keeps the exact records the release was built from (written once; immutable
+# from migration 0004); each manifest rule-version entry binds them, so the release signature covers them:
+#   source_mappings_profile  the hashed form below (versioned like CONTENT_PROFILE);
+#   source_mappings          [{source_mapping_id, sha256}] per record, sorted by ID: §12 "Whitespace/order: Never legally
+#                            meaningful", so the order records are stored in does not change the binding;
+#   source_mappings_sha256   one digest over that list.
+# Every stored field of a record is bound (§08 fields, reviewer notes included: §12 lets reviewer notes sit outside the
+# executable hash only if integrity-protected in the manifest). Same convention as `ast_sha256` / `content_sha256`:
+# SHA-256 over the platform canonical JSON profile v1; no other algorithm or format is assumed.
+SOURCE_MAPPINGS_PROFILE = "za-source-mappings-v1"
+
+
+def source_mapping_digest(record: Any) -> str:
+    from ..platform import canonical_json
+    return sha256_hex(canonical_json({"profile": SOURCE_MAPPINGS_PROFILE, "source_mapping": record}))
+
+
+def source_mapping_binding(records: list | None) -> dict:
+    """The manifest fields binding these source-mapping records (deterministic for the same records in any order)."""
+    from ..platform import canonical_json
+    entries = sorted(({"source_mapping_id": r.get("source_mapping_id") if isinstance(r, dict) else None,
+                       "sha256": source_mapping_digest(r)} for r in (records or [])),
+                     key=lambda e: (str(e["source_mapping_id"]), e["sha256"]))
+    return {"source_mappings_profile": SOURCE_MAPPINGS_PROFILE, "source_mappings": entries,
+            "source_mappings_sha256": sha256_hex(canonical_json({"profile": SOURCE_MAPPINGS_PROFILE,
+                                                                 "source_mappings": entries}))}
+
+
+def source_mapping_binding_check(entry: dict, records: list | None) -> dict:
+    """Compare a manifest rule-version entry's binding with the records stored now. status:
+      NOT_BOUND        the release predates the binding (nothing to compare; cannot be proven);
+      UNKNOWN_PROFILE  bound under a profile this code does not implement;
+      MATCH            the stored records are exactly the bound ones;
+      MISMATCH         with missing (bound, no longer stored), unbound (stored, never bound) and altered (same ID,
+                       different content: an altered or substituted record) mapping IDs, or a malformed binding."""
+    if not any(k in entry for k in ("source_mappings_profile", "source_mappings", "source_mappings_sha256")):
+        return {"status": "NOT_BOUND"}
+    if entry.get("source_mappings_profile") != SOURCE_MAPPINGS_PROFILE:
+        return {"status": "UNKNOWN_PROFILE", "profile": entry.get("source_mappings_profile")}
+    bound, now = entry.get("source_mappings"), source_mapping_binding(records)
+    if not isinstance(bound, list) or not all(isinstance(b, dict) for b in bound):
+        return {"status": "MISMATCH", "malformed": True, "missing": [], "unbound": [], "altered": []}
+    by_id = lambda rows: {r.get("source_mapping_id"): sorted(x.get("sha256") for x in rows
+                                                             if x.get("source_mapping_id") == r.get("source_mapping_id"))
+                          for r in rows}
+    b, n = by_id(bound), by_id(now["source_mappings"])
+    missing = sorted(str(k) for k in b.keys() - n.keys())
+    unbound = sorted(str(k) for k in n.keys() - b.keys())
+    altered = sorted(str(k) for k in b.keys() & n.keys() if b[k] != n[k])
+    aggregate = entry.get("source_mappings_sha256") == now["source_mappings_sha256"]
+    ok = aggregate and not (missing or unbound or altered)
+    return {"status": "MATCH" if ok else "MISMATCH", "missing": missing, "unbound": unbound, "altered": altered,
+            "aggregate_matches": aggregate}
+
+
 def release_binding(db, odef: ObligationDefinition) -> list[dict]:
     """The exact requirement versions, source snapshots and provisions a rule release of `odef` is built on. Refuses
     (409, nothing written) when any is missing, not VERIFIED/PUBLISHED, or not grounded in an intact source snapshot."""
@@ -361,6 +419,137 @@ def release_binding(db, odef: ObligationDefinition) -> list[dict]:
                                                         "PUBLISHED requirement version grounded in an intact source "
                                                         "snapshot (INV-06, INV-09, FR-REG-001/002).", problems=problems)
     return binding
+
+
+# ZA-RUL-001 §08 "SourceMapping field / Requirement", enforced at publication (RUL-REQ-020 fail closed; §15 "Source
+# completeness"). mapping_type: "DIRECT_TEXT, INTERPRETIVE, DEFINitional, CROSS_REFERENCE, TRANSITIONAL or approved
+# controlled code" (the specification prints DEFINitional; no further code is approved, so none is accepted).
+# interpretation_rationale: "Required when mapping is not a direct mechanical encoding". authoritative_reference:
+# "Article/section/paragraph locator or equivalent authoritative citation". reviewer, review_date, scope_note and
+# rights_class are deliberately not checked here: their per-mapping meaning awaits the RUL specification owner.
+MAPPING_TYPES = ("DIRECT_TEXT", "INTERPRETIVE", "DEFINITIONAL", "CROSS_REFERENCE", "TRANSITIONAL")
+
+
+def _blank(v: Any) -> bool:
+    return not isinstance(v, str) or not v.strip()
+
+
+def mapping_field_problems(m: dict, index: int) -> list[dict]:
+    """The §08 field problems of one mapping record, all of them (never only the first)."""
+    ref = {"source_mapping_id": m.get("source_mapping_id"), "mapping_index": index}
+    out = []
+    t = m.get("mapping_type")
+    if t is None or (isinstance(t, str) and not t.strip()):
+        out.append({"code": "RULE_SOURCE_MAPPING_TYPE_MISSING", "field": "mapping_type", **ref,
+                    "message": f"mapping_type is required; one of {', '.join(MAPPING_TYPES)}"})
+    elif t not in MAPPING_TYPES:
+        out.append({"code": "RULE_SOURCE_MAPPING_TYPE_INVALID", "field": "mapping_type", "value": t if isinstance(t, str) else repr(t),
+                    **ref, "message": f"mapping_type must be one of {', '.join(MAPPING_TYPES)}"})
+    elif t != "DIRECT_TEXT" and _blank(m.get("interpretation_rationale")):
+        # Only for a valid non-direct type: whether an unknown or missing type needs a rationale is not decidable.
+        out.append({"code": "RULE_SOURCE_MAPPING_RATIONALE_REQUIRED", "field": "interpretation_rationale",
+                    "mapping_type": t, **ref,
+                    "message": f"{t} is not a direct mechanical encoding: interpretation_rationale is required"})
+    if _blank(m.get("authoritative_reference")):
+        out.append({"code": "RULE_SOURCE_MAPPING_REFERENCE_REQUIRED", "field": "authoritative_reference", **ref,
+                    "message": "authoritative_reference (article/section/paragraph locator) is required"})
+    return out
+
+
+def validate_draft_source_mappings(db, draft: RuleDraft, canonical_ast: dict) -> None:
+    """ZA-RUL-001 §08, §11: validate source mappings on a draft before release.
+    Refuses unresolved mappings, duplicate mapping IDs, missing requirement versions/provisions,
+    provision mismatches, instrument mismatches, tampered fingerprints, and §08 field violations (mapping_type,
+    interpretation_rationale, authoritative_reference). Every problem found is reported in one 409; nothing is written
+    (the publication calls this before it takes a record sequence)."""
+    problems = draft_source_mapping_problems(db, draft, canonical_ast)
+    if problems:
+        raise _conflict("RELEASE_CONTENT_NOT_VERIFIED", "Rule source mappings failed verification (ZA-RUL-001 §08, §11).",
+                        problems=problems)
+
+
+def draft_source_mapping_problems(db, draft: RuleDraft, ast: dict, *, release: bool = True) -> list[dict]:
+    """Every source-mapping problem of a draft (the checks validate_draft_source_mappings refuses on), as data. Reads only.
+
+    ZA-RUL-001 §11 stage 2 "Reference resolution" (source mappings "resolve") is static validation, and §18 an ERROR
+    "Blocks review/release": the §08 fields, IDs, AST references, grounding, requirement version / provision existence,
+    their relationship, the instrument and the cited source fingerprint are checked at every stage (release=False).
+    Whether the cited requirement version / provision is VERIFIED or PUBLISHED is checked with release=True only: INV-09
+    ties VERIFIED review to reaching RELEASED, and the established workflow reviews a rule while its requirement is still
+    under verification, the publication refusing until it is verified (an open question for the RUL owner: whether
+    §11 stage 2 "release-compatible" means this state at static validation). With release=True the result is exactly
+    the publication gate's. A malformed reference in the AST is rules.validate's RUL_SCHEMA_INVALID, not looked up here."""
+    seen_ids: set[str] = set()
+    problems = []
+    records = {}
+    for index, m in enumerate(draft.source_mappings or []):
+        if not isinstance(m, dict):
+            problems.append({"code": "RULE_SOURCE_MAPPING_MALFORMED", "mapping_index": index,
+                             "message": "Source mapping record is not a dict"})
+            continue
+        problems += mapping_field_problems(m, index)
+        mid = m.get("source_mapping_id")
+        if not mid:
+            problems.append({"code": "RULE_SOURCE_MAPPING_ID_MISSING", "message": "Source mapping missing ID"})
+            continue
+        if mid in seen_ids:
+            problems.append({"code": "RULE_SOURCE_MAPPING_DUPLICATE", "source_mapping_id": mid,
+                             "message": f"Duplicate source mapping ID: {mid}"})
+        seen_ids.add(mid)
+        records[mid] = m
+
+    used_refs: set[str] = set()
+    for node, refs in _walk(ast):
+        own = node.get("source_mappings")
+        if isinstance(own, list):
+            used_refs |= {r for r in own if isinstance(r, str) and r.strip()}
+    unresolved = sorted(used_refs - seen_ids)
+    for ref in unresolved:
+        problems.append({"code": "RULE_SOURCE_MAPPING_UNRESOLVED", "source_mapping_id": ref,
+                         "message": f"Executable AST node cites source mapping '{ref}' not carried by rule"})
+
+    for mid, m in records.items():
+        rv_id = m.get("requirement_version_id")
+        pid = m.get("provision_id")
+        if not (rv_id or pid):
+            problems.append({"code": "RULE_SOURCE_MAPPING_UNGROUNDED", "source_mapping_id": mid,
+                             "message": f"Source mapping '{mid}' has no requirement_version_id or provision_id"})
+        if rv_id:
+            rv = db.get(RequirementVersion, rv_id)
+            if rv is None:
+                problems.append({"code": "RULE_SOURCE_MAPPING_REQUIREMENT_MISSING", "source_mapping_id": mid,
+                                 "requirement_version_id": rv_id, "message": f"Linked requirement version '{rv_id}' not found"})
+            else:
+                # INV-06 / INV-09: binding content rests on verified requirement versions only. A mapping that cites a
+                # version still under review, superseded or withdrawn would ground a released rule in content that is
+                # not (or no longer) the verified basis.
+                if release and rv.lifecycle not in RELEASABLE:
+                    problems.append({"code": "RULE_SOURCE_MAPPING_NOT_VERIFIED", "source_mapping_id": mid,
+                                     "requirement_version_id": rv_id, "lifecycle": rv.lifecycle,
+                                     "message": f"Linked requirement version '{rv_id}' is {rv.lifecycle}, not VERIFIED/PUBLISHED"})
+                odef = db.get(ObligationDefinition, draft.obligation_definition_id)
+                if odef and rv.instrument_id != odef.instrument_id:
+                    problems.append({"code": "RULE_SOURCE_MAPPING_INSTRUMENT_MISMATCH", "source_mapping_id": mid,
+                                     "requirement_version_id": rv_id, "message": "Source mapping instrument mismatch"})
+                src_fp = m.get("source_fingerprint")
+                if src_fp:
+                    src = db.get(RegulatorySource, rv.source_id)
+                    if src and src.fingerprint != src_fp:
+                        problems.append({"code": "RULE_SOURCE_MAPPING_FINGERPRINT_MISMATCH", "source_mapping_id": mid,
+                                         "message": "Source mapping cited fingerprint does not match source snapshot"})
+        if pid:
+            p = db.get(Provision, pid)
+            if p is None:
+                problems.append({"code": "RULE_SOURCE_MAPPING_PROVISION_MISSING", "source_mapping_id": mid,
+                                 "provision_id": pid, "message": f"Linked provision '{pid}' not found"})
+            elif release and p.lifecycle not in RELEASABLE:
+                problems.append({"code": "RULE_SOURCE_MAPPING_NOT_VERIFIED", "source_mapping_id": mid, "provision_id": pid,
+                                 "lifecycle": p.lifecycle, "message": f"Linked provision '{pid}' is {p.lifecycle}, not VERIFIED/PUBLISHED"})
+            elif rv_id and p.requirement_version_id != rv_id:
+                problems.append({"code": "RULE_SOURCE_MAPPING_PROVISION_MISMATCH", "source_mapping_id": mid,
+                                 "provision_id": pid, "requirement_version_id": rv_id,
+                                 "message": f"Provision '{pid}' does not belong to requirement '{rv_id}'"})
+    return problems
 
 
 def publish_bound(ctx, binding: list[dict], *, content_release_id: str, record_seq: int) -> dict:
@@ -472,7 +661,7 @@ def release_bound_requirements(db, rule: RuleVersion) -> list[dict] | None:
     return None if cr is None else (cr.manifest or {}).get("requirement_versions")
 
 
-def trace_rule_version(db, rule: RuleVersion) -> dict:
+def trace_rule_version(db, rule: RuleVersion, as_of_record_seq: int | None = None) -> dict:
     """Rule version -> obligation definition -> provisions -> requirement versions -> source snapshots, plus how the
     rule's predicates and required facts map to source content. RELEASE_BOUND: the signed release names the exact
     requirement versions and source fingerprints. DEFINITION_DERIVED: the release predates that binding, so the chain
@@ -483,28 +672,121 @@ def trace_rule_version(db, rule: RuleVersion) -> dict:
         basis, entries = "RELEASE_BOUND", bound
     else:
         basis, entries = "DEFINITION_DERIVED", _derive(db, odef)
-    requirements = []
+    requirements, problems = [], []
     for b in entries:
-        rv = db.get(RequirementVersion, b["requirement_version_id"])
+        rv_id = b["requirement_version_id"]
+        rv = db.get(RequirementVersion, rv_id)
         src = db.get(RegulatorySource, b["source_id"]) if b.get("source_id") else None
-        provs = db.execute(select(Provision).where(Provision.provision_id.in_(b.get("provision_ids") or ["-"]))
+        bound_pids = list(b.get("provision_ids") or [])
+        provs = db.execute(select(Provision).where(Provision.provision_id.in_(bound_pids or ["-"]))
                            .order_by(Provision.locator, Provision.provision_id)).scalars().all()
+        # The exact content this release bound, recomputed from the rows now stored (DAT-REQ-012; RUL-REQ-026): a later
+        # correction is a new requirement version, so the bound version's text must still hash to the bound digest.
+        # None: the binding predates content digests, or the chain is DEFINITION_DERIVED (nothing was bound).
+        content_matches = None
+        if basis == "RELEASE_BOUND" and b.get("content_sha256") and rv is not None and len(provs) == len(bound_pids):
+            content_matches = requirement_content_digest(rv, list(provs)) == b["content_sha256"]
+        fingerprint_matches = bool(src and b.get("source_fingerprint") == src.fingerprint)
+        missing_pids = sorted(set(bound_pids) - {p.provision_id for p in provs})
+        if rv is None:
+            problems.append(_problem("REQUIREMENT_VERSION_MISSING", "INCOMPLETE", requirement_version_id=rv_id))
+        if src is None:
+            problems.append(_problem("SOURCE_SNAPSHOT_MISSING", "INCOMPLETE", requirement_version_id=rv_id,
+                                     source_id=b.get("source_id")))
+        elif not fingerprint_matches:
+            problems.append(_problem("SOURCE_FINGERPRINT_MISMATCH", "MISMATCH", requirement_version_id=rv_id,
+                                     source_id=src.source_id))
+        if missing_pids:
+            problems.append(_problem("PROVISION_MISSING", "INCOMPLETE", requirement_version_id=rv_id,
+                                     provision_ids=missing_pids))
+        if content_matches is False:
+            problems.append(_problem("REQUIREMENT_CONTENT_MISMATCH", "MISMATCH", requirement_version_id=rv_id))
+        if basis == "RELEASE_BOUND" and not b.get("content_sha256"):
+            problems.append(_problem("CONTENT_DIGEST_NOT_BOUND", "UNVERIFIABLE", requirement_version_id=rv_id))
         requirements.append({
-            "requirement": requirement_ref(db, rv) if rv else {"requirement_version_id": b["requirement_version_id"],
-                                                                "missing": True},
+            "requirement": requirement_ref(db, rv) if rv else {"requirement_version_id": rv_id, "missing": True},
             "source": source_ref(src), "bound_source_fingerprint": b.get("source_fingerprint"),
-            "fingerprint_matches_binding": bool(src and b.get("source_fingerprint") == src.fingerprint),
-            "provisions": [provision_ref(p) for p in provs]})
+            "fingerprint_matches_binding": fingerprint_matches,
+            "bound_content_sha256": b.get("content_sha256"), "content_matches_binding": content_matches,
+            "provisions": [provision_ref(p) for p in provs], "missing_provision_ids": missing_pids})
+    if basis == "DEFINITION_DERIVED":
+        # Read from the definition's provision links as they are now, so it cannot prove what the rule was built on.
+        problems.append(_problem("NOT_RELEASE_BOUND", "UNVERIFIABLE", content_release_id=rule.content_release_id))
+    cr = db.get(ContentRelease, rule.content_release_id) if rule.content_release_id else None
+    problems += _rule_problems(db, rule)  # includes SOURCE_MAPPINGS_MISMATCH against the release's mapping binding
+    entry = next((e for e in ((cr.manifest or {}).get("rule_versions") or []) if isinstance(e, dict)
+                  and e.get("rule_version_id") == rule.rule_version_id), None) if cr and isinstance(cr.manifest, dict) else None
+    if entry is not None and source_mapping_binding_check(entry, rule.source_mappings)["status"] in ("NOT_BOUND",
+                                                                                                  "UNKNOWN_PROFILE"):
+        # The release predates source-mapping binding (ZA-RUL-001 §12): the records cannot be proven to be the released ones.
+        problems.append(_problem("SOURCE_MAPPINGS_NOT_BOUND", "UNVERIFIABLE", content_release_id=rule.content_release_id))
     fact_keys = list(rule.required_facts or [])
     fdefs = {f.key: f for f in db.execute(select(FactDefinition).where(FactDefinition.key.in_(fact_keys or ["-"]))).scalars()}
     return {"binding_basis": basis, "rule_version_id": rule.rule_version_id, "rule_version": rule.version,
             "content_release_id": rule.content_release_id, "ast_hash": rule.ast_hash,
+            "content_release": release_ref(db, cr, as_of_record_seq),
             "obligation_definition": {"obligation_definition_id": odef.obligation_definition_id, "key": odef.key,
                                       "title": odef.title, "coverage_mode": odef.coverage_mode} if odef else None,
             "requirements": requirements,
             "required_facts": [{"key": k, "fact_definition_id": fdefs[k].fact_definition_id if k in fdefs else None,
                                 "version": fdefs[k].version if k in fdefs else None} for k in fact_keys],
-            "source_mapping_coverage": mapping_coverage(rule)}
+            "source_mapping_coverage": mapping_coverage(rule),
+            "integrity": integrity_verdict(problems),
+            **({"perspective": {"as_of_record_seq": as_of_record_seq,
+                                "note": "Requirement and provision lifecycle codes are their current values; their "
+                                        "changes are recorded in the audit trail."}} if as_of_record_seq is not None else {})}
+
+
+# ---------------------------------------------------------------- historical integrity (read-only verdicts)
+# How a historical chain that cannot be fully proven is reported, never repaired or substituted (TIM-REQ-007,
+# APP-REQ-012, DAT-REQ-012). A problem's `class` is one of:
+#   MISMATCH      a stored record no longer matches what the decision recorded (hash, fingerprint, reference);
+#   INCOMPLETE    a record the decision depends on cannot be found;
+#   UNVERIFIABLE  the decision predates the binding needed to prove it (reported, not an error).
+# The verdict is the most severe class present, else INTACT. INTACT never asserts that a release signature is
+# trusted: signature trust is undecided (decision K1; engines/release_verification.py), so it is stated separately.
+_SEVERITY = ("MISMATCH", "INCOMPLETE", "UNVERIFIABLE")
+SIGNATURE_NOTE = ("Release signatures are present but not cryptographically verified: the content-release trust anchor "
+                  "is undecided (decision K1).")
+
+
+def _problem(code: str, cls: str, **ids) -> dict:
+    return {"code": code, "class": cls, **{k: v for k, v in ids.items() if v is not None}}
+
+
+def integrity_verdict(problems: list[dict]) -> dict:
+    status = next((s for s in _SEVERITY if any(p["class"] == s for p in problems)), "INTACT")
+    return {"status": status, "problems": problems, "signature_verified": False, "signature_note": SIGNATURE_NOTE}
+
+
+def _rule_problems(db, rule: RuleVersion) -> list[dict]:
+    """The RuleVersion's own hash and release binding, checked as the evaluator checks them before input freeze, but as a
+    read: the result is reported and nothing is refused or signalled here (the evaluation paths fail closed)."""
+    from .applicability import _integrity_failure  # local import: applicability imports nothing from this module
+    try:
+        failure = _integrity_failure(db, rule)
+    except (KeyError, TypeError, AttributeError, ValueError):
+        failure = ("MALFORMED_CONTENT", rule.rule_version_id)
+    if failure is None:
+        return []
+    check, artifact = failure
+    cls = "INCOMPLETE" if check in ("SET_VERSION_MISSING",) or (check == "RELEASE_NOT_PUBLISHED" and
+                                                                db.get(ContentRelease, artifact) is None) else "MISMATCH"
+    return [_problem("RULE_INTEGRITY_FAILED", cls, check=check, artifact_id=artifact, rule_version_id=rule.rule_version_id)]
+
+
+def release_ref(db, cr: ContentRelease | None, as_of_record_seq: int | None = None) -> dict | None:
+    """A content release and its place in the correction chain: the release it corrects, and the later releases that
+    name it as corrected, as known at `as_of_record_seq` (received by the cell by then), or now if None."""
+    if cr is None:
+        return None
+    q = select(ContentRelease.content_release_id).where(ContentRelease.correction_of_release_id == cr.content_release_id)
+    if as_of_record_seq is not None:
+        q = q.where(ContentRelease.cell_received_seq <= as_of_record_seq)
+    corrected_by = db.execute(q.order_by(ContentRelease.published_at, ContentRelease.content_release_id)).scalars().all()
+    return {"content_release_id": cr.content_release_id, "label": cr.label, "status": cr.status,
+            "published_at": cr.published_at, "manifest_hash": cr.manifest_hash,
+            "correction_of_release_id": cr.correction_of_release_id, "corrected_by_release_ids": list(corrected_by)}
 
 
 def _derive(db, odef: ObligationDefinition | None) -> list[dict]:
@@ -541,7 +823,8 @@ def _downstream(db, provs: list[Provision]) -> list[dict]:
                         "rule_version_id": rule.rule_version_id, "version": rule.version,
                         "content_release_id": rule.content_release_id,
                         "binding_basis": "RELEASE_BOUND" if bound is not None else "DEFINITION_DERIVED",
-                        "release_binds": sorted({b["requirement_version_id"] for b in bound or []})}})
+                        "release_binds": sorted({b["requirement_version_id"] for b in bound or []})},
+                    "control_keys": sorted({r["control_key"] for r in _template_roles(db, o)})})
     return out
 
 
@@ -581,7 +864,15 @@ def trace_obligation_definition(db, odef: ObligationDefinition) -> dict:
             "requirements": [{"requirement": requirement_ref(db, rv) if (rv := db.get(RequirementVersion, d["requirement_version_id"])) else None,
                               "source": source_ref(db.get(RegulatorySource, d["source_id"])) if d["source_id"] else None,
                               "provision_ids": d["provision_ids"]} for d in derived],
-            "current_rule": trace_rule_version(db, rule) if rule else None}
+            "current_rule": trace_rule_version(db, rule) if rule else None,
+            # Requirement -> definition -> control roles: the controls the default SatisfactionExpression template
+            # maps this obligation to (DOM §6.1 SatisfactionExpressionTemplate "over control roles"; STA §07).
+            "control_roles": _template_roles(db, odef)}
+
+
+def _template_roles(db, odef: ObligationDefinition) -> list[dict]:
+    from .satisfaction import control_roles
+    return control_roles(db, odef.satisfaction_template) if odef.satisfaction_template else []
 
 
 # ---------------------------------------------------------------- obligation definition authoring
@@ -607,40 +898,49 @@ def is_released(db, odef_id: str) -> bool:
 
 
 def validate_template(db, template: dict | None) -> None:
-    """A SatisfactionExpression template (ZA-STA-001 STA-REQ-009/010): the node types the evaluator executes, CONTROL
-    leaves naming catalogue control definitions. COMPENSATION is refused in a catalogue template: its compensation_id
-    names one organisation's governed approval, which global content cannot reference (DOM-INV-11)."""
+    """A SatisfactionExpression template (ZA-STA-001 STA-REQ-009/010, §07): the node types the evaluator executes
+    (engines/assurance.py expression_problems), the §07 required metadata, unique node IDs and distinct sibling leaves
+    (engines/satisfaction.py metadata_problems, shared with organisation expression versions), and CONTROL leaves naming
+    catalogue control definitions as control roles. Global content cannot reference one organisation's records
+    (DOM-INV-11), so COMPENSATION (an organisation's approval) and exact control_implementation_id bindings are refused.
+    Every problem is reported at once: 422 {error, message, problems[]}."""
     from ..models import ControlDefinition
+    from .assurance import expression_problems
+    from .satisfaction import leaves, metadata_problems
     if template is None:
         return
-    keys, count = set(), [0]
+    problems: list[dict] = []
 
-    def walk(n, path):
+    def walk(n, path, count):
         count[0] += 1
         if count[0] > MAX_TEMPLATE_NODES:
-            raise HTTPException(422, f"Satisfaction template exceeds {MAX_TEMPLATE_NODES} nodes.")
-        if not isinstance(n, dict) or n.get("node_type") not in TEMPLATE_NODES:
-            raise HTTPException(422, f"Satisfaction template node at {path} must be one of {sorted(TEMPLATE_NODES)}"
-                                     + (" (COMPENSATION is tenant-governed and cannot appear in catalogue content)"
-                                        if isinstance(n, dict) and n.get("node_type") == "COMPENSATION" else ""))
-        nt = n["node_type"]
-        if nt == "CONTROL":
-            if not isinstance(n.get("control_key"), str) or not n["control_key"]:
-                raise HTTPException(422, f"CONTROL node at {path} needs a control_key.")
-            keys.add(n["control_key"])
-        elif nt in ("ALL", "ANY", "K_OF_N"):
-            kids = n.get("children")
-            if not isinstance(kids, list) or not kids:
-                raise HTTPException(422, f"{nt} node at {path} needs at least one child.")
-            if nt == "K_OF_N" and not (isinstance(n.get("k"), int) and not isinstance(n.get("k"), bool)
-                                       and 1 <= n["k"] <= len(kids)):
-                raise HTTPException(422, f"K_OF_N node at {path} needs an integer k between 1 and {len(kids)}.")
-            for i, c in enumerate(kids):
-                walk(c, f"{path}.children[{i}]")
-    walk(template, "$")
-    known = {k for (k,) in db.execute(select(ControlDefinition.key).where(ControlDefinition.key.in_(sorted(keys))))}
-    if keys - known:
-        raise HTTPException(422, f"Unknown control definition key(s): {sorted(keys - known)}")
+            problems.append({"code": "TEMPLATE_TOO_LARGE", "path": None,
+                             "message": f"Satisfaction template exceeds {MAX_TEMPLATE_NODES} nodes."})
+            return
+        if isinstance(n, dict) and n.get("node_type") == "COMPENSATION":
+            problems.append({"code": "COMPENSATION_NOT_ALLOWED", "path": path,
+                             "message": "COMPENSATION is tenant-governed and cannot appear in catalogue content"})
+            return
+        if isinstance(n, dict) and n.get("node_type") not in TEMPLATE_NODES:
+            problems.append({"code": "UNSUPPORTED_NODE", "path": path,
+                             "message": f"node_type must be one of {sorted(TEMPLATE_NODES)}"})
+            return
+        for i, c in enumerate((n.get("children") or []) if isinstance(n, dict) else []):
+            walk(c, f"{path}.children[{i}]", count)
+    walk(template, "$", [0])
+    if not problems:
+        problems += [{"code": "TEMPLATE_STRUCTURE_INVALID", "path": None, "message": m}
+                     for m in expression_problems(template)]
+    if not problems:
+        problems += metadata_problems(template, bindings_allowed=False)
+        keys = sorted({n["control_key"] for _, n in leaves(template)})
+        known = {k for (k,) in db.execute(select(ControlDefinition.key).where(ControlDefinition.key.in_(keys or ["-"])))}
+        if set(keys) - known:
+            problems.append({"code": "UNKNOWN_CONTROL_DEFINITION", "path": None,
+                             "message": f"Unknown control definition key(s): {sorted(set(keys) - known)}"})
+    if problems:
+        raise HTTPException(422, {"error": problems[0]["code"], "message": "; ".join(p["message"] for p in problems[:10]),
+                                  "problems": problems})
 
 
 def _linkable(db, instrument_id: str, requirement_version_id: str, provision_id: str) -> Provision:
@@ -717,6 +1017,45 @@ def lock_definition(db, odef_id: str) -> ObligationDefinition:
     return o
 
 
+def lock_release_content(db, odef: ObligationDefinition, draft: RuleDraft) -> dict:
+    """Row-lock, for the rest of the publication's transaction, every requirement version and provision the release
+    validates or changes, and return their committed state (populate_existing refreshes copies this session holds).
+
+    Locked: the definition's linked provisions and the provisions the draft's mappings cite; their requirement versions
+    and those the mappings cite; every other version of the same requirement keys, with all their provisions (the
+    publication supersedes older PUBLISHED versions in publish_bound, after it has taken the record sequence, so it must
+    already hold them). Requirement versions first, then provisions, each in ID order: a deterministic order shared by
+    every publication, taken after the draft and definition rows and before the rule scope, the decision scopes and the
+    record sequence (the established lock order). Content review (verify: version, then sequence) and provision edits
+    (provision, then sequence) take no lock against this order, so no cycle can form.
+
+    Effect: a concurrent change to these rows (a supersession by another publication, or any lifecycle change made
+    below the API) either commits before this publication reads them, so the validation below sees it, or waits until
+    this publication has committed. READ COMMITTED alone gives neither."""
+    from sqlalchemy import or_
+    pids = {p for p in (odef.provision_ids or []) if isinstance(p, str)}
+    rv_ids: set[str] = set()
+    for m in draft.source_mappings or []:
+        if isinstance(m, dict):
+            if isinstance(m.get("requirement_version_id"), str):
+                rv_ids.add(m["requirement_version_id"])
+            if isinstance(m.get("provision_id"), str):
+                pids.add(m["provision_id"])
+    rv_ids |= set(db.execute(select(Provision.requirement_version_id).where(Provision.provision_id.in_(pids or ["-"]))).scalars())
+    keys = set(db.execute(select(RequirementVersion.requirement_key)
+                          .where(RequirementVersion.requirement_version_id.in_(rv_ids or ["-"]))).scalars())
+    versions = db.execute(select(RequirementVersion).where(or_(RequirementVersion.requirement_version_id.in_(rv_ids or ["-"]),
+                                                               RequirementVersion.requirement_key.in_(keys or ["-"])))
+                          .order_by(RequirementVersion.requirement_version_id).with_for_update()
+                          .execution_options(populate_existing=True)).scalars().all()
+    locked_rv = [v.requirement_version_id for v in versions]
+    provisions = db.execute(select(Provision).where(or_(Provision.provision_id.in_(pids or ["-"]),
+                                                        Provision.requirement_version_id.in_(locked_rv or ["-"])))
+                            .order_by(Provision.provision_id).with_for_update()
+                            .execution_options(populate_existing=True)).scalars().all()
+    return {"requirement_version_ids": locked_rv, "provision_ids": [p.provision_id for p in provisions]}
+
+
 def _require_unreleased(db, o: ObligationDefinition) -> None:
     if is_released(db, o.obligation_definition_id):
         raise _conflict("OBLIGATION_DEFINITION_RELEASED", "The definition is part of a signed release; its links are "
@@ -773,7 +1112,7 @@ def definition_view(db, o: ObligationDefinition) -> dict:
                       "source": {"source_id": src.source_id, "fingerprint": src.fingerprint, "locator": src.locator}
                       if src else None, "missing": p is None})
     return {**to_dict(o), "instrument": {"instrument_id": o.instrument_id, "identifier": inst.identifier if inst else None},
-            "links": links, "released": rule is not None,
+            "links": links, "control_roles": _template_roles(db, o), "released": rule is not None,
             "current_rule_version": None if rule is None else {
                 "rule_version_id": rule.rule_version_id, "version": rule.version,
                 "content_release_id": rule.content_release_id}}
@@ -871,6 +1210,44 @@ def validate(db) -> dict:
         for ref in cov["orphaned_records"]:
             issues.append(_issue("RULE_SOURCE_MAPPING_ORPHANED", "WARNING", "Source mapping record no rule node uses.",
                                  source_mapping_id=ref, **rid))
+        seen_sm: set[str] = set()
+        for m in (rule.source_mappings or []):
+            if isinstance(m, dict) and (sm_id := m.get("source_mapping_id")):
+                if sm_id in seen_sm:
+                    issues.append(_issue("RULE_SOURCE_MAPPING_DUPLICATE", "ERROR",
+                                         "Rule carries duplicate source mapping ID.",
+                                         source_mapping_id=sm_id, **rid))
+                seen_sm.add(sm_id)
+                rv_id = m.get("requirement_version_id")
+                pid = m.get("provision_id")
+                src_fp = m.get("source_fingerprint")
+                if rv_id is not None:
+                    if rv_id not in rvs:
+                        issues.append(_issue("RULE_SOURCE_MAPPING_REQUIREMENT_MISSING", "ERROR",
+                                             "Source mapping links a requirement version that does not exist.",
+                                             source_mapping_id=sm_id, requirement_version_id=rv_id, **rid))
+                    else:
+                        m_rv = rvs[rv_id]
+                        rule_odef = db.get(ObligationDefinition, rule.obligation_definition_id)
+                        if rule_odef and m_rv.instrument_id != rule_odef.instrument_id:
+                            issues.append(_issue("RULE_SOURCE_MAPPING_INSTRUMENT_MISMATCH", "ERROR",
+                                                 "Source mapping links a requirement version from a different instrument.",
+                                                 source_mapping_id=sm_id, requirement_version_id=rv_id, **rid))
+                        if src_fp is not None:
+                            src_rec = sources.get(m_rv.source_id)
+                            if src_rec and src_rec.fingerprint != src_fp:
+                                issues.append(_issue("RULE_SOURCE_MAPPING_FINGERPRINT_MISMATCH", "ERROR",
+                                                     "Source mapping fingerprint does not match source snapshot.",
+                                                     source_mapping_id=sm_id, requirement_version_id=rv_id, **rid))
+                if pid is not None:
+                    if pid not in prov_ids:
+                        issues.append(_issue("RULE_SOURCE_MAPPING_PROVISION_MISSING", "ERROR",
+                                             "Source mapping links a provision that does not exist.",
+                                             source_mapping_id=sm_id, provision_id=pid, **rid))
+                    elif rv_id is not None and prov_ids[pid].requirement_version_id != rv_id:
+                        issues.append(_issue("RULE_SOURCE_MAPPING_PROVISION_MISMATCH", "ERROR",
+                                             "Source mapping provision does not belong to the requirement version named.",
+                                             source_mapping_id=sm_id, provision_id=pid, requirement_version_id=rv_id, **rid))
         bound = release_bound_requirements(db, rule)
         if bound is None:
             issues.append(_issue("RELEASE_REQUIREMENTS_UNBOUND", "WARNING", "The rule's signed release does not name the "

@@ -4,9 +4,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 
 from .. import codes, pagination
 from ..db import CELL_ID
@@ -23,8 +23,30 @@ PRINCIPAL_TYPES = Literal["HUMAN", "EXTERNAL_AUDITOR", "AGENT", "SERVICE"]
 
 
 @router.get("/health")
-def health():
-    return {"status": "ok", "cell_id": CELL_ID, "dictionary_version": codes.DICTIONARY_VERSION}
+def health(response: Response):
+    """Liveness and dependency health. ``status``: ``ok`` (every dependency in use is healthy), ``degraded`` (the API
+    and PostgreSQL work but optional Redis is configured and unavailable or misconfigured: reads fall back to
+    PostgreSQL), or ``unavailable`` (PostgreSQL, or Redis with REDIS_REQUIRED=true, is down; HTTP 503). Redis that is
+    not configured is ``disabled`` and does not degrade the status. No URL, host or credential is ever returned."""
+    from .. import redis_client
+    from ..db import engine
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        postgres = {"state": "healthy"}
+    except Exception as e:  # noqa: BLE001 - report the class only; never connection details
+        postgres = {"state": "unavailable", "reason": type(e).__name__}
+    redis = redis_client.manager.status()
+    redis_bad = redis["state"] in (redis_client.UNAVAILABLE, redis_client.MISCONFIGURED)
+    if postgres["state"] != "healthy" or (redis_bad and redis.get("required")):
+        status = "unavailable"
+        response.status_code = 503
+    elif redis_bad:
+        status = "degraded"
+    else:
+        status = "ok"
+    return {"status": status, "cell_id": CELL_ID, "dictionary_version": codes.DICTIONARY_VERSION,
+            "components": {"application": {"state": "healthy"}, "postgresql": postgres, "redis": redis}}
 
 
 @router.get("/dictionary")

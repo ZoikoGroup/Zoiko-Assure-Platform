@@ -19,7 +19,8 @@ export default function Entities() {
   return (
     <>
       <PageHeader spec="ZA-DOM-001 §5 · ZA-APP-001" title="Entities & Facts"
-        subtitle={`${org?.tenant.legal_name ?? "Your organisation"}'s legal entities and the subjects within them (business units, activities, products, AI assets) that obligations attach to. Open a subject to see its facts and which requirements apply.`}
+        subtitle={`${org?.tenant.legal_name ?? "Your organisation"}'s legal entities and the subjects obligations attach to.`}
+        help="Subjects are business units, activities, products and AI assets within a legal entity. Open a subject to see its facts and which requirements apply."
         actions={<button className="btn-primary" disabled={!can("manage_facts")} title={why("manage_facts")} onClick={() => setOpen(true)}>Register subject</button>} />
       <PermissionNote perms={["manage_facts"]} />
       <ErrorBox error={error} />

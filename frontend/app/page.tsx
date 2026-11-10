@@ -1,48 +1,32 @@
 "use client";
 
 import { useEffect } from "react";
+import type { ReactNode } from "react";
 import { ArrowRight, Braces, ChevronRight, FlaskConical, Inbox, Library } from "lucide-react";
 import Link from "next/link";
 import { useApi } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
+import { useCan } from "@/lib/roles";
 import { SuperAdminDashboard } from "@/components/PlatformAdmin";
-import { useSyntheticDataBadge } from "@/components/Shell";
 import SCREEN_ACCESS from "@/lib/screen-access.json";
-import { ErrorBox, Notice, PageHeader, usePageTitle } from "@/components/ui";
+import { Badge, EmptyState, ErrorBox, LoadingSkeleton, Notice, PageHeader, usePageTitle } from "@/components/ui";
 
-/* The Organization Command Center. A figure is read from the backend (dashboard projection, controls, IPE anomalies,
-   organisation record) wherever the backend records that same thing. Nothing here derives applicability or assurance
-   state in the browser, and nothing is a compliance score. Where the backend has no equivalent record, the reference
-   design's synthetic demonstration figures are shown, each marked SYNTHETIC and never presented as this organisation's
-   results or decisions. */
+/* The Organization Command Center. Every figure is read from the backend (dashboard projection, controls, IPE
+   anomalies, organisation record) and links to the screen where it is worked. Nothing here derives applicability or
+   assurance state in the browser, nothing is a compliance score, and nothing is demonstration data: where the backend
+   records no figure, none is shown. */
 const TITLE = "Organization Command Center";
-
-/* Synthetic demonstration data from the reference design (fictional "Orion" entities). Not records of any organisation. */
-const DEMO_PRIORITIES = [
-  { priority: "P0", id: "OBL-2047", task: "statutory filing", entity: "Orion UK", due: "Today", owner: "Legal" },
-  { priority: "P0", id: "CTL-1012", task: "control test failed", entity: "Orion US", due: "Today", owner: "Controls" },
-  { priority: "P1", id: "EVD-0881", task: "IPE validation needed", entity: "Orion EU", due: "Tomorrow", owner: "Evidence" },
-  { priority: "P1", id: "REG-0234", task: "impact review", entity: "All 4 entities", due: "Nov 02", owner: "Analyst" },
-  { priority: "P1", id: "AGT-0148", task: "proposal held", entity: "Orion US", due: "Today", owner: "AI Owner" },
-] as const;
-const DEMO_COVERAGE = { verified: 64, paths: 81, untested: 11, unknown: 6 };
-
-/* Where each decision queue is worked. Links only: the backend has no count for these queues as named. */
-const DECISION_QUEUES = [
-  { label: "Waiting on legal applicability", href: "/applicability", opens: "Decisions & Attestations" },
-  { label: "Attestation draft reviews", href: "/applicability", opens: "Decisions & Attestations" },
-  { label: "Exceptions expiring soon", href: "/governance", opens: "Findings & Actions" },
-];
 
 type Tone = "bad" | "warn" | "info" | "ink";
 const VALUE_TONE: Record<Tone, string> = { bad: "text-red-700", warn: "text-yellow-700", info: "text-teal-700", ink: "text-slate-900" };
-type Kpi = { key: string; label: string; hint: string; tone: Tone; href: string; value?: number; failed?: boolean; synthetic?: boolean; detail?: string };
+type Kpi = { key: string; label: string; hint: string; tone: Tone; href: string; value?: number; failed?: boolean; detail?: string };
 
 const PANEL = "rounded-xl border border-slate-200 bg-white shadow-[0_1px_3px_rgba(15,23,42,0.06)]";
 const list = (pairs: [string, number][]) => pairs.map(([k, v]) => `${v} ${k}`).join(" · ");
 const tally = (codes: string[]) => Object.entries(codes.reduce((m: Record<string, number>, c) => ({ ...m, [c]: (m[c] ?? 0) + 1 }), {}));
 const utcTime = (v: string) => { const t = new Date(v); return isNaN(t.getTime()) ? v : t.toISOString().slice(11, 16); };
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export default function Dashboard() {
   const { me } = useAuth();
@@ -71,22 +55,25 @@ function AccessAdminHome({ orgName }: { orgName: string }) {
   useEffect(() => { setTitle(TITLE); return () => setTitle(""); }, [setTitle]);
   return (
     <>
-      <PageHeader kicker={orgName} title={TITLE} subtitle="Enterprise assurance | evidence-backed, entity-scoped" />
+      <PageHeader kicker={orgName} title={TITLE} subtitle="Your organisation's current assurance position." />
       <Notice>Your roles administer who can access {orgName || "this organization"}, not its regulatory records, so there are no figures to show here.
         Manage people, roles and sessions in <Link href="/admin/users" className="font-semibold text-teal-700 hover:underline">Team &amp; Access</Link>.</Notice>
     </>
   );
 }
 
+/** One open item from the organisation's own records, and where it is worked. */
+type Attention = { key: string; level: "high" | "medium"; what: string; detail: string; href: string };
+
 function CommandCenterView() {
   const { me } = useAuth();
+  const { can } = useCan();
   const dash = useApi<any>("/dashboard");
   const org = useApi<any>(holds(SCREEN_ACCESS.shell.entity_scope.perms, me?.permissions) ? "/org/tenant" : null);
   const controls = useApi<any[]>("/controls");
   const anomalies = useApi<any[]>("/ipe/anomalies");
   const { setTitle } = usePageTitle();
   useEffect(() => { setTitle(TITLE); return () => setTitle(""); }, [setTitle]);
-  useSyntheticDataBadge();
 
   const d = dash.data;
   const orgName: string = org.data?.tenant.legal_name ?? me?.tenant_name ?? "";
@@ -97,10 +84,11 @@ function CommandCenterView() {
   const ctlOff = (controls.data ?? []).filter((c) => c.current_state.state !== "OPERATING");
   const ev = (d?.evidence_conditions ?? {}) as Record<string, number>;
   const notCurrent = Object.entries(ev).filter(([k, v]) => v > 0 && k !== "CURRENT" && k !== "ERASED");  // erasure is a governed act, not a gap
-  const openIpe = (anomalies.data ?? []).filter((a) => !a.disposition_code).length;
+  const openAnomalies = (anomalies.data ?? []).filter((a) => !a.disposition_code);
   const proposed = d?.determinations.PROPOSED ?? 0, inReview = d?.determinations.IN_REVIEW ?? 0;
   // Recorded occurrences of adopted obligations with no fulfilment yet, and how many are past due (GET /dashboard).
   const occ = d?.obligation_occurrences as { unfulfilled: number; overdue: number; rule: string } | undefined;
+  const issues = d?.open_issues as { total: number; by_severity: Record<string, number> } | undefined;
 
   const kpis: Kpi[] = [
     { key: "obligations", label: "Obligations due / late", tone: occ?.overdue ? "bad" : "warn", href: "/obligations",
@@ -110,104 +98,148 @@ function CommandCenterView() {
       value: controls.data ? ctlOff.length : undefined, failed: !!controls.error,
       hint: ctlOff.every((c) => ["FAILING", "NOT_EVALUATED"].includes(c.current_state.state)) ? "failed or untested" : "not operating",
       detail: ctlOff.length ? `${list(tally(ctlOff.map((c) => c.current_state.state)))} (24-hour convenience view)` : undefined },
-    { key: "evidence", label: "Evidence assurance gaps", hint: "proof / IPE review", tone: "warn", href: "/evidence",
-      value: d && anomalies.data ? notCurrent.reduce((a, [, v]) => a + v, 0) + openIpe : undefined, failed: !!(dash.error || anomalies.error),
-      detail: d && anomalies.data ? `Evidence not CURRENT: ${list(notCurrent) || "none"} · IPE anomalies awaiting disposition: ${openIpe}` : undefined },
-    { key: "changes", label: "Changes needing review", hint: "not legal decisions", tone: "warn", href: "/regulatory", value: 8, synthetic: true },
+    { key: "evidence", label: "Evidence gaps", hint: "not current / IPE review", tone: "warn", href: "/evidence",
+      value: d && anomalies.data ? notCurrent.reduce((a, [, v]) => a + v, 0) + openAnomalies.length : undefined, failed: !!(dash.error || anomalies.error),
+      detail: d && anomalies.data ? `Evidence not CURRENT: ${list(notCurrent) || "none"} · IPE anomalies awaiting disposition: ${openAnomalies.length}` : undefined },
+    { key: "issues", label: "Open issues", tone: issues?.by_severity?.CRITICAL || issues?.by_severity?.HIGH ? "bad" : "warn", href: "/governance",
+      value: issues?.total, failed: !!dash.error,
+      hint: issues ? `${(issues.by_severity.CRITICAL ?? 0) + (issues.by_severity.HIGH ?? 0)} critical or high` : "findings in remediation",
+      detail: issues ? `Open issues by severity: ${list(Object.entries(issues.by_severity))}` : undefined },
     { key: "approvals", label: "Approvals pending", hint: "human sign-off", tone: "info", href: "/applicability",
       value: d ? proposed + inReview : undefined, failed: !!dash.error,
       detail: d ? `Applicability determinations awaiting adoption: ${proposed} proposed · ${inReview} in review` : undefined },
-    { key: "agents", label: "Agent actions held", hint: "policy gates", tone: "ink", href: "/ai", value: 3, synthetic: true },
+    { key: "facts", label: "Fact requests", hint: "facts needed to decide", tone: "info", href: "/fact-requests",
+      value: d?.open_fact_requests, failed: !!dash.error,
+      detail: d ? `Open fact requests raised by UNCERTAIN applicability evaluations: ${d.open_fact_requests}` : undefined },
   ];
+
+  // What needs someone now, straight from the records above. Each row says what it is and opens where it is worked.
+  const attention: Attention[] = [
+    ...(occ?.overdue ? [{ key: "occ", level: "high" as const, what: `${plural(occ.overdue, "obligation occurrence")} past due`, detail: "Record fulfilment with evidence", href: "/obligations" }] : []),
+    ...ctlOff.filter((c) => c.current_state.state === "FAILING").map((c) => ({ key: c.control_implementation_id, level: "high" as const,
+      what: c.definition?.title ?? c.method, detail: `Control failing · ${c.subject}`, href: `/controls/${c.control_implementation_id}` })),
+    ...openAnomalies.map((a) => ({ key: a.anomaly_id, level: (["CRITICAL", "HIGH"].includes(a.severity) ? "high" : "medium") as Attention["level"],
+      what: `IPE anomaly: ${a.anomaly_class.replace(/_/g, " ").toLowerCase()}`, detail: `${a.severity} · awaiting disposition`, href: "/ipe" })),
+    ...(issues?.total ? [{ key: "issues", level: (issues.by_severity.CRITICAL || issues.by_severity.HIGH ? "high" : "medium") as Attention["level"],
+      what: `${plural(issues.total, "open issue")}`, detail: list(Object.entries(issues.by_severity).filter(([, v]) => v > 0)), href: "/governance" }] : []),
+    ...(proposed + inReview ? [{ key: "det", level: "medium" as const, what: `${plural(proposed + inReview, "applicability determination")} awaiting adoption`,
+      detail: "Needs an authorised human to attest", href: "/applicability" }] : []),
+    ...(d?.open_fact_requests ? [{ key: "facts", level: "medium" as const, what: `${plural(d.open_fact_requests, "fact request")} open`,
+      detail: "Missing facts keep applicability UNCERTAIN", href: "/fact-requests" }] : []),
+    ...ctlOff.filter((c) => c.current_state.state === "NOT_EVALUATED").map((c) => ({ key: c.control_implementation_id, level: "medium" as const,
+      what: c.definition?.title ?? c.method, detail: `Not yet tested · ${c.subject}`, href: `/controls/${c.control_implementation_id}` })),
+    ...notCurrent.map(([k, v]) => ({ key: `ev-${k}`, level: (k === "INVALID" ? "high" : "medium") as Attention["level"],
+      what: `${plural(v, "evidence record")} ${k.toLowerCase()}`, detail: "Cannot support current-period proof", href: "/evidence" })),
+  ];
+  const attentionLoading = (!d && !dash.error) || (!controls.data && !controls.error) || (!anomalies.data && !anomalies.error);
+
+  // The actions this person's roles allow, as shortcuts to the screens that perform them.
+  const shortcuts = [
+    { perm: "submit_evidence", label: "Upload evidence", href: "/evidence" },
+    { perm: "attest", label: "Review determinations", href: "/applicability" },
+    { perm: "manage_facts", label: "Provide requested facts", href: "/fact-requests" },
+    { perm: "manage_controls", label: "Implement a control", href: "/controls" },
+    { perm: "manage_issues", label: "Work open issues", href: "/governance" },
+    { perm: "approve_exception", label: "Decide exceptions", href: "/governance" },
+    { perm: "package", label: "Build an audit package", href: "/packages" },
+    { perm: "manage_ai", label: "Register an AI asset", href: "/ai" },
+  ].filter((s) => can(s.perm));
+
+  const totals = (d?.assurance_totals ?? null) as Record<string, number> | null;
 
   return (
     <div className="pt-1">
-      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
+      <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
         <div className="min-w-0">
-          <h1 className="text-[26px] font-semibold leading-tight text-slate-800 sm:text-[30px]">{TITLE}</h1>
-          <p className="mt-1.5 text-[14px] text-slate-600">Enterprise assurance | evidence-backed, entity-scoped</p>
+          <h1 className="text-[26px] font-semibold leading-tight text-slate-800 sm:text-[28px]">{TITLE}</h1>
+          <p className="mt-1 text-[14px] text-slate-600">What needs your team&apos;s attention, from your organisation&apos;s own records.</p>
         </div>
-        <div className="min-w-0 sm:max-w-[40%] sm:pt-2 sm:text-right">
+        <div className="min-w-0 sm:max-w-[40%] sm:pt-1 sm:text-right">
           <div title={`Organization ${orgName}`} className="truncate text-[15px] font-bold uppercase tracking-[0.04em] text-teal-700">{orgName}</div>
           <div title={readAt ? `Dashboard ${readAt}` : undefined} className="mt-1 text-[13px] text-slate-600">
             {d ? `As of ${utcTime(d.as_of.valid_at)} UTC` : dash.error ? "Records unavailable" : "Reading records…"}
+            {jurisdictions.length ? ` · ${jurisdictions.join(", ")}` : ""}
+            {" · "}<Link href="/entities" className="font-semibold text-teal-700 hover:underline">Entities</Link>
           </div>
         </div>
       </div>
 
-      <section aria-label="Dashboard scope"
-        className="mb-6 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
-        <span className="rounded-md bg-slate-100 px-2.5 py-1 text-[12px] font-semibold uppercase tracking-[0.03em] text-slate-700">Org / All authorized entities</span>
-        <span className="text-[14px] text-slate-600">Jurisdictions: {jurisdictions.length ? jurisdictions.join(" • ") : org.loading ? "…" : "—"}</span>
-        <span aria-hidden className="hidden h-5 w-px bg-slate-200 sm:block" />
-        <span title="Each live figure is the latest recorded position when this page was read, not a total over a period." className="text-[14px] text-slate-600">
-          Reporting: Current position
-        </span>
-        <Link href="/entities" title="Entities & Scope: the legal entities in this organization"
-          className="ml-auto rounded text-[14px] font-semibold text-teal-700 hover:text-teal-800 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600">
-          Change scope
-        </Link>
-      </section>
-
       <ErrorBox error={dash.error ?? controls.error ?? anomalies.error} />
+      {(dash.error || controls.error || anomalies.error) && (
+        <div className="-mt-1 mb-3"><button className="btn-ghost" onClick={() => { dash.reload(); controls.reload(); anomalies.reload(); }}>Retry</button></div>
+      )}
 
       <ul aria-label="Key figures" className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
         {kpis.map((k) => <li key={k.key} className="min-w-0"><KpiCard k={k} /></li>)}
       </ul>
 
       <div className="grid grid-cols-1 gap-x-4 gap-y-6 xl:grid-cols-3">
-        <Priorities className="xl:col-span-2" orgName={orgName} />
+        <section aria-labelledby="attention-h" className={`${PANEL} flex flex-col px-5 pb-4 pt-5 sm:px-6 xl:col-span-2`}>
+          <h2 id="attention-h" className="text-[18px] font-semibold leading-7 text-slate-900">Needs attention</h2>
+          {attentionLoading ? <LoadingSkeleton rows={4} className="px-0" />
+            : attention.length === 0 ? <EmptyState compact title="Nothing needs attention right now" description="No failing or untested controls, open issues, pending determinations, fact requests or evidence gaps are recorded." />
+            : (
+              <ul className="mt-2 divide-y divide-slate-100">
+                {attention.slice(0, 8).map((r) => (
+                  <li key={r.key}>
+                    <Link href={r.href} className="group flex items-center gap-3 rounded py-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
+                      <span className={`inline-flex w-14 shrink-0 justify-center rounded px-1.5 text-[11px] font-semibold leading-[18px] ${r.level === "high" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-800"}`}>
+                        {r.level === "high" ? "High" : "Medium"}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-[14px] font-semibold text-slate-900 group-hover:text-teal-800">{r.what}</span>
+                        <span className="block truncate text-[12px] text-slate-500">{r.detail}</span>
+                      </span>
+                      <ChevronRight size={16} aria-hidden className="shrink-0 text-slate-400 group-hover:text-teal-700" />
+                    </Link>
+                  </li>
+                ))}
+                {attention.length > 8 && <li className="pt-3 text-[12px] text-slate-500">and {attention.length - 8} more — open each area from the figures above.</li>}
+              </ul>
+            )}
+        </section>
+
         <div className="grid content-start gap-6 md:grid-cols-2 xl:flex xl:flex-col">
-          <section aria-labelledby="coverage-h" className={`${PANEL} relative px-6 pb-6 pt-[26px]`}>
-            <h2 id="coverage-h" className="text-[18px] font-semibold leading-6 text-slate-900">Assurance coverage, not a score</h2>
-            <SyntheticTag className={ON_BORDER} />
-            <dl className="mt-4 space-y-2.5 text-[14px] leading-[22px]">
-              <div className="flex flex-wrap items-baseline gap-x-2 font-semibold text-green-700">
-                <dt>Verified proof paths</dt><dd className="tabular-nums">{DEMO_COVERAGE.verified} / {DEMO_COVERAGE.paths}</dd>
-              </div>
-              <div className="flex flex-wrap items-baseline gap-x-2 font-semibold text-yellow-700">
-                <dt>Untested / unmapped</dt><dd className="tabular-nums">{DEMO_COVERAGE.untested}</dd>
-              </div>
-              <div className="flex flex-wrap items-baseline gap-x-2">
-                <dt className="text-slate-600">Unknown / under review</dt><dd className="font-semibold tabular-nums text-slate-900">{DEMO_COVERAGE.unknown}</dd>
-              </div>
-            </dl>
+          <section aria-labelledby="coverage-h" className={`${PANEL} px-6 pb-5 pt-5`}>
+            <h2 id="coverage-h" className="text-[18px] font-semibold leading-6 text-slate-900">Obligation assurance</h2>
+            <p className="mt-0.5 text-[12px] text-slate-500" title={d?.denominator_rule}>Adopted obligations by latest assurance state. Not a score.</p>
+            {totals ? (
+              <dl className="mt-3 space-y-2 text-[14px]">
+                {(["PROVEN", "NOT_PROVEN", "FAILING", "REQUIRES_REVIEW", "NO_SNAPSHOT"] as const).map((k) => (
+                  <div key={k} className="flex items-center justify-between gap-2">
+                    <dt>{k === "NO_SNAPSHOT" ? <span className="text-[13px] text-slate-600">No period snapshot yet</span> : <Badge code={k} />}</dt>
+                    <dd className="font-semibold tabular-nums text-slate-900">{totals[k] ?? 0}</dd>
+                  </div>
+                ))}
+                <div className="pt-1"><Link href="/assurance" className="text-[13px] font-semibold text-teal-700 hover:underline">Open assurance reports</Link></div>
+              </dl>
+            ) : dash.error ? <p className="mt-3 text-[13px] text-slate-500">Unavailable</p> : <LoadingSkeleton rows={3} className="px-0" />}
           </section>
 
-          <section aria-labelledby="decisions-h" className={`${PANEL} px-6 pb-3 pt-[26px] xl:flex-1`}>
-            <h2 id="decisions-h" className="text-[18px] font-semibold leading-6 text-slate-900">Decision integrity</h2>
-            <ul className="mt-1 divide-y divide-slate-100">
-              {DECISION_QUEUES.map((q) => (
-                <li key={q.label}>
-                  <Link href={q.href} title={`Open ${q.opens}`}
-                    className="group flex items-center justify-between gap-3 rounded py-3.5 text-[15px] text-slate-700 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
-                    {q.label}<ChevronRight size={16} aria-hidden className="shrink-0 text-slate-400 group-hover:text-teal-700" />
-                  </Link>
-                </li>
-              ))}
-            </ul>
+          <section aria-labelledby="actions-h" className={`${PANEL} px-6 pb-3 pt-5 xl:flex-1`}>
+            <h2 id="actions-h" className="text-[18px] font-semibold leading-6 text-slate-900">Your actions</h2>
+            {shortcuts.length ? (
+              <ul className="mt-1 divide-y divide-slate-100">
+                {shortcuts.map((q) => (
+                  <li key={q.label}>
+                    <Link href={q.href}
+                      className="group flex items-center justify-between gap-3 rounded py-3 text-[14px] text-slate-700 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
+                      {q.label}<ChevronRight size={16} aria-hidden className="shrink-0 text-slate-400 group-hover:text-teal-700" />
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            ) : <p className="mt-2 pb-3 text-[13px] text-slate-500">Your role can view records but has no actions to take here.</p>}
           </section>
         </div>
       </div>
 
-      <p className="mt-6 max-w-4xl text-[12px] leading-5 text-slate-600">
-        Figures marked <span className="font-semibold">SYNTHETIC</span> are demonstration data from the reference design, not records of {orgName || "your organization"}.
-        The other figures are read from your organization&apos;s records{readAt ? ` (${readAt})` : ""}. {d?.language_note}
-      </p>
+      {(readAt || d?.language_note) && (
+        <p className="mt-6 max-w-4xl text-[12px] leading-5 text-slate-500">
+          Figures are your organisation&apos;s records{readAt ? ` (${readAt})` : ""}. {d?.language_note}
+        </p>
+      )}
     </div>
-  );
-}
-
-/* A panel's SYNTHETIC tag sits on its top border, so the panel's own layout stays as designed. */
-const ON_BORDER = "absolute -top-2 right-5 bg-white";
-
-/** Marks a figure or panel as synthetic demonstration data, never this organisation's records. */
-function SyntheticTag({ className = "" }: { className?: string }) {
-  return (
-    <span title="Synthetic demonstration data, not a record of your organization"
-      className={`inline-flex shrink-0 items-center rounded border border-dashed border-slate-300 px-1.5 text-[10px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-600 ${className}`}>
-      Synthetic<span className="sr-only"> demonstration data, not a record of your organization</span>
-    </span>
   );
 }
 
@@ -215,12 +247,11 @@ function KpiCard({ k }: { k: Kpi }) {
   const loading = k.value === undefined && !k.failed;
   return (
     <Link href={k.href} title={k.detail}
-      className="flex h-full min-h-[118px] flex-col rounded-xl border border-slate-200 bg-white px-4 pb-2 pt-[18px] shadow-[0_1px_3px_rgba(15,23,42,0.06)] transition-[border-color,box-shadow] hover:border-slate-300 hover:shadow-[0_4px_12px_rgba(15,23,42,0.08)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600">
+      className="flex h-full min-h-[108px] flex-col rounded-xl border border-slate-200 bg-white px-4 pb-2 pt-4 shadow-[0_1px_3px_rgba(15,23,42,0.06)] transition-[border-color,box-shadow] hover:border-slate-300 hover:shadow-[0_4px_12px_rgba(15,23,42,0.08)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600">
       <span className="text-[14px] font-semibold leading-[19px] text-slate-800">{k.label}</span>
       <span className="mt-1 flex items-center justify-between gap-2">
         {loading ? <span role="status" aria-label="Loading" className="skeleton my-1 h-6 w-10" />
-          : <span className={`text-[30px] font-bold leading-8 tabular-nums ${k.value ? VALUE_TONE[k.tone] : "text-slate-900"}`}>{k.value === undefined ? "—" : String(k.value).padStart(2, "0")}</span>}
-        {k.synthetic && <SyntheticTag />}
+          : <span className={`text-[28px] font-bold leading-8 tabular-nums ${k.value ? VALUE_TONE[k.tone] : "text-slate-900"}`}>{k.value === undefined ? "—" : k.value}</span>}
       </span>
       <span className="mt-1 text-[13px] leading-[17px] text-slate-500">{k.failed ? "Unavailable" : k.hint}</span>
       {k.detail && <span className="sr-only">. {k.detail}</span>}
@@ -228,62 +259,11 @@ function KpiCard({ k }: { k: Kpi }) {
   );
 }
 
-function PriorityPill({ p }: { p: "P0" | "P1" }) {
-  return <span className={`inline-flex rounded px-1.5 text-[11px] font-semibold leading-[18px] ${p === "P0" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-800"}`}>{p}</span>;
-}
-
-/** Priorities requiring your team: synthetic demonstration rows, a table from sm up and a stacked list on phones. */
-function Priorities({ className = "", orgName }: { className?: string; orgName: string }) {
-  return (
-    <section aria-labelledby="priorities-h" className={`${PANEL} relative flex flex-col px-5 pb-5 pt-5 sm:px-6 sm:pt-6 ${className}`}>
-      <h2 id="priorities-h" className="text-[20px] font-semibold leading-7 text-slate-900">Priorities requiring your team</h2>
-      <SyntheticTag className={ON_BORDER} />
-      <table className="mt-5 hidden w-full table-fixed border-collapse sm:table">
-        <caption className="sr-only">Synthetic demonstration priorities from the reference design, not records of {orgName || "your organization"}</caption>
-        <colgroup><col className="w-[65px]" /><col /><col className="w-[17%]" /><col className="w-[14%]" /><col className="w-[12%]" /></colgroup>
-        <thead>
-          <tr className="border-b border-slate-200">
-            {["Priority", "Record / Task", "Entity", "Due", "Owner"].map((h) => (
-              <th key={h} scope="col" className="pb-3.5 pr-3 text-left text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{h}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {DEMO_PRIORITIES.map((r) => (
-            <tr key={r.id} className="border-b border-slate-100 last:border-0">
-              <td className="py-4 pr-3"><PriorityPill p={r.priority} /></td>
-              <td className="py-4 pr-3 text-[14px] font-semibold leading-[21px] text-slate-900">
-                {r.id}<span aria-hidden className="mx-1 font-normal text-slate-400">•</span><span className="sr-only">, </span>{r.task}
-              </td>
-              <td className="py-4 pr-3 text-[14px] leading-[21px] text-slate-700">{r.entity}</td>
-              <td className="py-4 pr-3 text-[14px] leading-[21px] text-slate-700">{r.due}</td>
-              <td className="py-4 text-[14px] leading-[21px] text-slate-700">{r.owner}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <ul aria-label="Synthetic demonstration priorities" className="mt-3 divide-y divide-slate-100 sm:hidden">
-        {DEMO_PRIORITIES.map((r) => (
-          <li key={r.id} className="flex items-start gap-2.5 py-3">
-            <span className="pt-0.5"><PriorityPill p={r.priority} /></span>
-            <div className="min-w-0">
-              <div className="text-[14px] font-semibold leading-[21px] text-slate-900">
-                {r.id}<span aria-hidden className="mx-1 font-normal text-slate-400">•</span><span className="sr-only">, </span>{r.task}
-              </div>
-              <div className="mt-0.5 text-[13px] text-slate-600">{r.entity} · Due {r.due} · {r.owner}</div>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function ContentOpsHome({ name }: { name: string }) {
+function ContentOpsHome({ name }: { name: string }): ReactNode {
   return (
     <>
       <PageHeader kicker="Zoiko content operations" title={`Welcome, ${name.replace(/\s*\(.*\)/, "")}`}
-        subtitle="Your workspace is the shared regulatory content and rules that customer organisations receive. You are not a member of any customer organisation." />
+        subtitle="Shared regulatory content and rules that customer organisations receive." />
       <Notice>Zoiko content-operations staff have no standing access to customer data (INV-14).</Notice>
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         {[{ href: "/regulatory", label: "Regulatory Inbox", hint: "Ingest sources and propose extractions", icon: Inbox },

@@ -32,14 +32,14 @@ const NAV_ITEMS: NavGroup[] = [
   { group: "Applicability", items: [
     { href: "/entities", label: "Entities & Facts", icon: Building2 },
     { href: "/applicability", label: "Applicability Review", icon: Scale },
-    { href: "/fact-requests", label: "Fact Requests", icon: HelpCircle },
+    { href: "/fact-requests", label: "My Work & Approvals", icon: HelpCircle },
     { href: "/applicability/trace", label: "Applicability Trace", icon: GitBranch },
   ] },
   { group: "Assurance", items: [
     { href: "/obligations", label: "Obligation Dossiers", icon: ClipboardCheck },
     { href: "/controls", label: "Controls & Tests", icon: SlidersHorizontal },
     { href: "/assurance", label: "Assurance Periods", icon: CalendarRange },
-    { href: "/governance", label: "Exceptions & Issues", icon: Flag },
+    { href: "/governance", label: "Findings & Actions", icon: Flag },
   ] },
   { group: "Evidence", items: [
     { href: "/evidence", label: "Evidence Records", icon: Archive },

@@ -11,7 +11,8 @@ export default function Regulatory() {
   return (
     <>
       <PageHeader spec="ZA-ARCH-001 §7 · ZA-DOM-001 §4" title="Regulatory Inbox"
-        subtitle="Incoming regulatory sources with rights records. Extraction is a governed, non-binding proposal until a qualified reviewer encodes and verifies it." />
+        subtitle="Incoming regulatory sources and proposed extractions."
+        help="Each source carries a rights record. Extraction is a governed, non-binding proposal until a qualified reviewer encodes and verifies it. Sources are ingested by Zoiko's content team." />
       <PermissionNote perms={["content_author"]} />
       <Inbox />
     </>

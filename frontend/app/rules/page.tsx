@@ -16,7 +16,8 @@ export default function Rules() {
   return (
     <>
       <PageHeader spec="ZA-RUL-001 §§10-17" title="Rule Authoring"
-        subtitle="Typed rule ASTs and decision tables, static validation, golden vectors, shadow impact, separation-of-duties review and signed release."
+        subtitle="Applicability rules: drafts, review and signed releases."
+        help="Rules are typed ASTs and decision tables with static validation, golden vectors, shadow impact, separation-of-duties review and signed release. They are authored by Zoiko's content team."
         actions={<button className="btn-primary" disabled={!can("content_author")} title={why("content_author")} onClick={() => setOpen(true)}>New draft</button>} />
       <PermissionNote perms={["content_author"]} />
       <ErrorBox error={drafts.error || versions.error} />

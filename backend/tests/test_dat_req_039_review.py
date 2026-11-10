@@ -60,6 +60,19 @@ KNOWN_CATALOGUED = {
     # superseded when a newer version of the same requirement is released).
     "requirement.version_published", "requirement.version_superseded", "rule.draft_created",
     "rule.review_requested", "rule.shadow_completed", "rule.validation_failed", "rule.verified",
+    # ZA-EVT-001 assurance catalogue: "issue.closed  Issue workflow closed; no direct assurance mutation implied"
+    # (checked against the specification text on 5 November 2026; emitted on verified closure).
+    "issue.closed",
+    # ZA-EVT-001: "issue.created  Issue/remediation case created from control/assurance condition" (checked against the
+    # specification text on 5 November 2026; emitted when a control evaluation raises a control-level issue).
+    "issue.created",
+    # ZA-EVT-001: "determination.rejected  Authorized customer rejected proposed determination" and "obligation.revised
+    # Bitemporal obligation revision recorded" (checked against the specification text on 6 November 2026; emitted on a
+    # REJECT attestation and on the CLOSED obligation revision an adopted non-APPLIES determination records).
+    "determination.rejected", "obligation.revised",
+    # ZA-EVT-001 "rule.superseded: Prior RuleVersion no longer current for new binding evaluations" (checked against the
+    # specification text on 6 November 2026; emitted when a newer RuleVersion in force is published).
+    "rule.superseded",
     "security.content_signature_failed", "temporal.retroactive_change_detected"}
 assert REVIEWED_CATALOGUED <= KNOWN_CATALOGUED and not KNOWN_CATALOGUED & KNOWN_UNCATALOGUED
 

@@ -98,13 +98,17 @@ def _control_key(client) -> str:
 # ------------------------------------------------------------------------------------------------ creation
 def test_a_definition_is_created_with_explicit_validated_links_and_is_traceable(client, content):
     v, s = content["verified"], content["source"]
+    # ZA-STA-001 §07 required metadata: a CONTROL leaf carries its requirement rationale.
     template = {"node_type": "ALL", "node_id": "t_root", "children": [
-        {"node_type": "CONTROL", "node_id": "t_1", "control_key": _control_key(client)}]}
+        {"node_type": "CONTROL", "node_id": "t_1", "control_key": _control_key(client),
+         "rationale": "The register duty is met by this control."}]}
     r = _create(client, f"ODA_{TAG}_CREATE", _links(v), satisfaction_template=template, reason="New register duty")
     assert r.status_code == 201, r.text
     d = r.json()
     assert (d["released"], d["current_rule_version"], d["instrument"]["identifier"]) == (False, None, INSTR)
     assert d["provision_ids"] == [p for _, p in _links(v)] and d["satisfaction_template"] == template
+    assert [(r["node_id"], r["control_key"], r["binding"], r["known"]) for r in d["control_roles"]] == \
+        [("t_1", _control_key(client), "SELECTOR", True)]
     assert [(x["requirement_version"]["requirement_version_id"], x["provision_id"], x["source"]["fingerprint"])
             for x in d["links"]] == [(rv, p, s["fingerprint"]) for rv, p in _links(v)]
     assert client.get(f"{URL}/{d['obligation_definition_id']}", headers=H("actor-cco")).json() == d  # read by orgs too

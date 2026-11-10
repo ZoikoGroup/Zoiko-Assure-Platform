@@ -15,7 +15,8 @@ export default function Connectors() {
   return (
     <>
       <PageHeader spec="FR-CON-001..004 · INV-11 · WF-EVT-03" title="Connectors"
-        subtitle="Inbound source connectors and their certification, and the outbound event outbox. Customer-visible connector status is read only from the certification registry." />
+        subtitle="Source connectors, their certification, and outbound events."
+        help="Customer-visible connector status is read only from the certification registry." />
       <PermissionNote perms={["manage_connectors"]} />
       {tenantUser ? (
         <>

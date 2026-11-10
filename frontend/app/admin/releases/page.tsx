@@ -9,7 +9,8 @@ export default function ContentReleases() {
   return (
     <>
       <PageHeader spec="ZA-ARCH-001 §7 · ZA-RUL-001" title="Content Releases"
-        subtitle="Signed regulatory content releases. Each manifest is canonicalised, hashed and Ed25519-signed, and can be verified independently of the database." />
+        subtitle="Signed regulatory content releases delivered to your organisation."
+        help="Each release manifest is canonicalised, hashed and Ed25519-signed, so it can be verified independently of the database." />
       <Releases />
     </>
   );

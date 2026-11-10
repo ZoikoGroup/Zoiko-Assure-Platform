@@ -531,9 +531,9 @@ def test_concurrent_or_repeated_adoption_creates_exactly_one_obligation(client, 
 
 
 def test_readoption_after_closure_never_backdates_over_the_closed_interval(client, applies):
-    """The lifecycle step itself (engines/applicability.py _close_obligation / _activate_obligation). Through the API an
-    adopted determination currently cannot reach closure (docs/backend-remediation-report.md, R-02), so the transition
-    is exercised at the engine boundary with explicit valid times."""
+    """The lifecycle step itself (engines/applicability.py _close_obligation / _activate_obligation), exercised at the
+    engine boundary with explicit valid times. Closure through the API (re-review of a flagged adopted determination) is
+    covered by tests/test_obligation_lifecycle_integrity.py."""
     from app.db import AdminSession
     from app.engines import applicability as appl
     from app.models import ObligationDefinition, Subject
@@ -543,7 +543,9 @@ def test_readoption_after_closure_never_backdates_over_the_closed_interval(clien
     closed_at = start + timedelta(days=10)
     with AdminSession() as db:
         subject, odef = db.get(Subject, SUBJ), db.get(ObligationDefinition, applies["odef_id"])
-        appl._close_obligation(db, TEN, SUBJ, applies["odef_id"], next_record_seq(db), closed_at)
+        appl._close_obligation(db, TEN, SUBJ, applies["odef_id"], next_record_seq(db), closed_at,
+                               closing_determination=SimpleNamespace(revision_id="probe-close-1"),
+                               closing_attestation=SimpleNamespace(attestation_id="probe-close-att-1"))
         db.commit()
         # Re-adopted under a determination whose valid time starts BEFORE the closure: clamped to the closure.
         det = SimpleNamespace(tenant_id=TEN, revision_id="probe-det-1", valid_from=start + timedelta(days=5))
@@ -562,7 +564,9 @@ def test_readoption_after_closure_never_backdates_over_the_closed_interval(clien
     later = closed_at + timedelta(days=20)
     with AdminSession() as db:
         subject, odef = db.get(Subject, SUBJ), db.get(ObligationDefinition, applies["odef_id"])
-        appl._close_obligation(db, TEN, SUBJ, applies["odef_id"], next_record_seq(db), closed_at + timedelta(days=15))
+        appl._close_obligation(db, TEN, SUBJ, applies["odef_id"], next_record_seq(db), closed_at + timedelta(days=15),
+                               closing_determination=SimpleNamespace(revision_id="probe-close-2"),
+                               closing_attestation=SimpleNamespace(attestation_id="probe-close-att-2"))
         appl._activate_obligation(db, SimpleNamespace(tenant_id=TEN, revision_id="probe-det-2", valid_from=later),
                                   SimpleNamespace(attestation_id="probe-att-2"), subject, odef, next_record_seq(db), CCO)
         db.commit()

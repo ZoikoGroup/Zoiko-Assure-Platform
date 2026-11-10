@@ -14,7 +14,8 @@ export default function RetentionAndLegalHolds() {
   return (
     <>
       <PageHeader spec="WF-EVD-04 · WF-PRI-05 · PRI-REQ-023" title="Retention & Legal Holds"
-        subtitle="Evidence under legal hold and evidence whose payload has been erased. Holds block erasure. Place or release a hold, or erase a payload, from the evidence record; each action is recorded on the tenant's evidence ledger." />
+        subtitle="Evidence under legal hold, and evidence whose payload has been erased."
+        help="Holds block erasure. Place or release a hold, or erase a payload, from the evidence record; each action is recorded on your organisation's evidence ledger." />
       <ErrorBox error={error} />
       <div className="space-y-4">
         <Card title={`Active legal holds · ${held.length}`}>

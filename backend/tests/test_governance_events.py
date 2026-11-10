@@ -379,6 +379,14 @@ def test_issue_lifecycle_events_and_projection(client):
     assert events[0]["event_type"] == "CREATED"
     assert events[0]["to_state"] == "OPEN"
 
+    # ZA-GLS-001 TRIAGED = "Ownership, severity and treatment path are established": triage needs an owner.
+    r_no_owner = client.post(f"/api/issues/{iss_id}/transition", json={"state": "TRIAGED"}, headers=H("actor-owner"))
+    assert r_no_owner.status_code == 409 and r_no_owner.json()["detail"]["error"] == "ISSUE_OWNER_REQUIRED"
+    r_assign = client.post(f"/api/issues/{iss_id}/assign", json={"owner_actor_id": "actor-owner",
+                                                                 "reason": "Control owner accountable"},
+                           headers=H("actor-owner"))
+    assert r_assign.status_code == 200 and r_assign.json()["owner_actor_id"] == "actor-owner"
+
     # Transition OPEN -> TRIAGED
     r_tr1 = client.post(f"/api/issues/{iss_id}/transition", json={"state": "TRIAGED", "reason": "Triaged by team"}, headers=H("actor-owner"))
     assert r_tr1.status_code == 200
@@ -393,8 +401,9 @@ def test_issue_lifecycle_events_and_projection(client):
     r_ev2 = client.get(f"/api/issues/{iss_id}/events", headers=H("actor-owner"))
     assert r_ev2.status_code == 200
     events2 = r_ev2.json()
-    assert len(events2) == 3
-    assert [e["to_state"] for e in events2] == ["OPEN", "TRIAGED", "IN_REMEDIATION"]
+    assert len(events2) == 4
+    assert [(e["event_type"], e["to_state"]) for e in events2] == [
+        ("CREATED", "OPEN"), ("ASSIGNED", "OPEN"), ("TRIAGED", "TRIAGED"), ("IN_REMEDIATION", "IN_REMEDIATION")]
 
     # Invalid transition (IN_REMEDIATION directly to CLOSED is forbidden by ISSUE_FLOW)
     r_bad = client.post(f"/api/issues/{iss_id}/transition", json={"state": "CLOSED", "reason": "Premature closure"}, headers=H("actor-owner"))

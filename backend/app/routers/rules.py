@@ -4,12 +4,13 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from .. import codes
 from ..engines import applicability as appl
 from ..engines import catalog, keys, rules
+from ..engines.corrections import shadow_summary_for as _shadow_for
 from ..models import (ApplicabilityEvaluation, ContentRelease, ObligationDefinition, RuleDraft, RuleVersion, Subject,
                       new_id, utcnow)
 from ..platform import audit, canonical_json, emit, next_record_seq, sha256_hex, to_dict
@@ -40,12 +41,33 @@ def _compiled(d: RuleDraft) -> tuple[dict | None, list]:
     return d.ast, []
 
 
-def _validate(ctx: Ctx, d: RuleDraft) -> dict:
+def _validate(ctx: Ctx, d: RuleDraft, *, mappings: bool = True) -> dict:
+    """Static validation of the draft's current content (ZA-RUL-001 §11 stages 1-8): rules.validate on the compiled AST
+    and, with `mappings`, stage 2 "Reference resolution" of the draft's source mappings (catalog.
+    draft_source_mapping_problems(release=False): the §08 fields, IDs, AST references, grounding, requirement version /
+    provision existence and relationship, instrument and source fingerprint; whether the cited content is VERIFIED stays
+    the publication gate's). Every issue is an ERROR (§18: "Blocks review/release"); a mapping issue
+    keeps its RULE_SOURCE_MAPPING_* code and fields and lists the AST nodes citing the mapping. `mappings=False` is for
+    the golden-vector workbench (a DRAFT "Can run sandbox vectors only", §10) and for publish, which runs the same
+    mapping check as its own RELEASE_CONTENT_NOT_VERIFIED gate."""
     ast, dt_issues = _compiled(d)
     if ast is None:
         return {"ok": False, "issues": dt_issues, "error_count": len(dt_issues)}
     rep = rules.validate(ast, appl.load_fact_defs(ctx.db), appl.load_sets(ctx.db))
-    rep["issues"] = dt_issues + rep["issues"]
+    # A row issue both report, once; a table limit the compiler already reported is not repeated by the AST check.
+    dt_limits = {i.get("limit") for i in dt_issues if i.get("limit")}
+    rep["issues"] = dt_issues + [i for i in rep["issues"] if i not in dt_issues and i.get("limit") not in dt_limits]
+    if mappings:
+        citing: dict[str, list] = {}
+        for node, _ in catalog._walk(ast):
+            own = node.get("source_mappings")
+            for ref in own if isinstance(own, list) else ():
+                if isinstance(ref, str):
+                    citing.setdefault(ref, []).append(node.get("node_id"))
+        for p in catalog.draft_source_mapping_problems(ctx.db, d, ast, release=False):
+            node_ids = citing.get(p.get("source_mapping_id"), [])
+            rep["issues"].append({"severity": "ERROR", "node_id": node_ids[0] if node_ids else None, **p,
+                                  **({"node_ids": node_ids} if node_ids else {})})
     rep["error_count"] = sum(1 for i in rep["issues"] if i["severity"] == "ERROR")
     rep["ok"] = rep["error_count"] == 0
     rep["compiled_ast"] = ast
@@ -60,6 +82,7 @@ def list_drafts(ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS))):
     for d in ctx.db.execute(select(RuleDraft).order_by(RuleDraft.updated_at.desc())).scalars():
         x = to_dict(d)
         x["obligation_definition"] = ctx.db.get(ObligationDefinition, d.obligation_definition_id).key
+        x["shadow_report"] = _shadow_for(ctx.actor.tenant_id, d.shadow_report)  # cross-organisation counts (API-001 §17)
         out.append(x)
     return out
 
@@ -71,6 +94,7 @@ def get_draft(draft_id: str, ctx: Ctx = Depends(authorize(*READ, *CONTENT_READER
         raise HTTPException(404)
     x = to_dict(d)
     x["obligation_definition"] = ctx.db.get(ObligationDefinition, d.obligation_definition_id).key
+    x["shadow_report"] = _shadow_for(ctx.actor.tenant_id, d.shadow_report)  # cross-organisation counts (API-001 §17)
     x["compiled_ast"], _ = _compiled(d)
     return x
 
@@ -95,9 +119,9 @@ def create_draft(body: DraftIn, ctx: Ctx = Depends(authorize("content_author", p
 
 @router.put("/drafts/{draft_id}")
 def update_draft(draft_id: str, body: DraftIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
-    d = ctx.db.get(RuleDraft, draft_id)
-    if not d:
-        raise HTTPException(404)
+    # Locked like the approvals: an edit and an approval are ordered, so the review reset below always sees, and clears,
+    # an approval committed just before it (unlocked, the reset could miss it and leave an approval of older content).
+    d = _locked_draft(ctx, draft_id)
     if d.status in ("PUBLISHED", "RELEASE_READY"):
         raise HTTPException(409, "Frozen artifact; create a new draft")
     for k, v in body.model_dump().items():
@@ -129,7 +153,7 @@ def validate(draft_id: str, ctx: Ctx = Depends(authorize("content_author", platf
 @router.post("/drafts/{draft_id}/test")
 def test_vectors(draft_id: str, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     d = ctx.db.get(RuleDraft, draft_id)
-    rep = _validate(ctx, d)
+    rep = _validate(ctx, d, mappings=False)
     if not rep["ok"]:
         raise HTTPException(422, {"error": "RUL_SCHEMA_INVALID", "validation": rep})
     vr = rules.run_golden_vectors(rep["compiled_ast"], d.golden_vectors, appl.load_fact_defs(ctx.db), appl.load_sets(ctx.db))
@@ -146,11 +170,18 @@ class SandboxIn(BaseModel):
 
 @router.post("/drafts/{draft_id}/sandbox")
 def sandbox(draft_id: str, body: SandboxIn, ctx: Ctx = Depends(authorize(*CONTENT_STAFF, platform=True))):
-    """Run the exact draft artifact on synthetic fixtures only (WF-RUL-04); no customer data access."""
+    """Run the exact draft artifact on synthetic fixtures only (WF-RUL-04); no customer data access. Nothing is written.
+    A draft over a ZA-RUL-001 §11 complexity limit fails validation (422); should the runtime guard still refuse it,
+    the answer is the structured RUL-REQ-029 refusal (EVALUATOR_UNAVAILABLE / RUL_RESOURCE_LIMIT), never an outcome."""
     d = ctx.db.get(RuleDraft, draft_id)
-    rep = _validate(ctx, d)
+    if d is None:
+        raise HTTPException(404, "rule draft not found")
+    rep = _validate(ctx, d, mappings=False)
     if not rep["ok"]:
         raise HTTPException(422, {"validation": rep})
+    over = rules.resource_limit_violations(rep["compiled_ast"])
+    if over:  # before any vector or fixture is evaluated
+        raise appl.draft_resource_limit_refusal(d.draft_id, d.revision, over)
     vr = rules.run_golden_vectors(rep["compiled_ast"], [{"vector_id": "sandbox", "facts": body.facts,
                                                          "effective_at": body.effective_at, "expected_outcome": "APPLIES"}],
                                   appl.load_fact_defs(ctx.db), appl.load_sets(ctx.db))
@@ -158,20 +189,28 @@ def sandbox(draft_id: str, body: SandboxIn, ctx: Ctx = Depends(authorize(*CONTEN
     for k, v in body.facts.items():
         facts[k] = {"known": False, "reason": v["unknown"]} if isinstance(v, dict) and "unknown" in v else \
             {"known": True, "value": v, "revision_id": "synthetic"}
-    out = rules.evaluate(rep["compiled_ast"], facts, {k: x["data_type"] for k, x in appl.load_fact_defs(ctx.db).items()},
-                         appl.load_sets(ctx.db), {"effective_at": body.effective_at})
+    try:
+        out = rules.evaluate(rep["compiled_ast"], facts,
+                             {k: x["data_type"] for k, x in appl.load_fact_defs(ctx.db).items()},
+                             appl.load_sets(ctx.db), {"effective_at": body.effective_at})
+    except rules.RuleResourceLimitError as e:  # the evaluator's own guard (RUL-REQ-029)
+        raise appl.draft_resource_limit_refusal(d.draft_id, d.revision, e.violations) from None
+    except rules.RuleError as e:  # invariant breach: a content error, never an outcome (as appl.evaluate)
+        raise HTTPException(500, {"error": e.code, "message": e.message, "node_id": e.node_id}) from None
     return {**out, "evaluator_build": codes.EVALUATOR_BUILD, "draft_revision": d.revision, "vector_probe": vr["results"][0]}
 
 
 @router.post("/drafts/{draft_id}/submit-review")
 def submit_review(draft_id: str, ctx: Ctx = Depends(authorize("content_author", platform=True))):
-    d = ctx.db.get(RuleDraft, draft_id)
+    # Locked like edits and approvals: the content validated here is the content that enters review (rule.review_requested
+    # "Exact revision frozen for reviewer"); an edit committing in between would otherwise enter review unvalidated.
+    d = _locked_draft(ctx, draft_id)
     rep = _validate(ctx, d)
     d.validation_report = rep
     if not rep["ok"]:
-        d.status = "VALIDATION_FAILED"
+        d.status = "VALIDATION_FAILED"  # §10: "Static/type/lint error; cannot advance"
         ctx.db.commit()
-        raise HTTPException(409, "Validation errors block review")
+        raise _validation_refusal(rep, "review")
     vr = rules.run_golden_vectors(rep["compiled_ast"], d.golden_vectors, appl.load_fact_defs(ctx.db), appl.load_sets(ctx.db))
     d.vector_report = vr
     if not vr["all_passed"] or vr["missing_mandatory_classes"]:
@@ -184,13 +223,44 @@ def submit_review(draft_id: str, ctx: Ctx = Depends(authorize("content_author", 
     return to_dict(d)
 
 
+def _locked_draft(ctx: Ctx, draft_id: str) -> RuleDraft:
+    """The draft row, locked and re-read (as publish does): a concurrent edit commits before this read or waits until
+    this transaction ends, so what is validated below is exactly what the approval is recorded against."""
+    d = ctx.db.execute(select(RuleDraft).where(RuleDraft.draft_id == draft_id).with_for_update()
+                       .execution_options(populate_existing=True)).scalars().first()
+    if d is None:
+        raise HTTPException(404, "rule draft not found")
+    return d
+
+
+def _require_valid_for_approval(ctx: Ctx, d: RuleDraft, stage: str) -> None:
+    """Revalidate the draft's current content before an approval (ZA-RUL-001 §10: VALIDATION_FAILED "cannot advance";
+    the Qualified Legal Reviewer may not "Bypass technical validation"). The draft's status, stored validation report
+    and earlier approvals prove nothing about its current content: an IN_REVIEW draft may have been validated by an
+    older validator (e.g. before inherits_mapping stopped counting as a mapping, RUL-REQ-008, or before source mappings
+    were resolved at review). Same static validation as validate, submit-review and shadow (_validate: the AST and the
+    §11 stage 2 source-mapping resolution); a refusal writes nothing and lists every issue with the node_id and, for a
+    mapping, the source_mapping_id it concerns."""
+    rep = _validate(ctx, d)
+    if not rep["ok"]:
+        raise _validation_refusal(rep, stage)
+
+
+def _validation_refusal(rep: dict, stage: str) -> HTTPException:
+    """409 {"error": the first ERROR's code (ZA-RUL-001 §18 RUL_* or a RULE_SOURCE_MAPPING_* code), "message",
+    "validation": the full report, each issue with its node_id / source_mapping_id}."""
+    errors = [i for i in rep["issues"] if i["severity"] == "ERROR"]
+    return HTTPException(409, {"error": errors[0]["code"], "message": f"Validation errors block {stage}", "validation": rep})
+
+
 @router.post("/drafts/{draft_id}/peer-approve")
 def peer_approve(draft_id: str, ctx: Ctx = Depends(authorize("content_peer_review", platform=True))):
-    d = ctx.db.get(RuleDraft, draft_id)
+    d = _locked_draft(ctx, draft_id)
     if d.status != "IN_REVIEW":
         raise HTTPException(409, "Draft not in review")
     if ctx.actor.actor_id == d.author_id:
         raise HTTPException(403, "Separation of duties: author cannot peer-approve")
+    _require_valid_for_approval(ctx, d, "peer approval")
     d.peer_reviewer_id = ctx.actor.actor_id
     ctx.db.commit()
     return to_dict(d)
@@ -198,11 +268,12 @@ def peer_approve(draft_id: str, ctx: Ctx = Depends(authorize("content_peer_revie
 
 @router.post("/drafts/{draft_id}/legal-approve")
 def legal_approve(draft_id: str, ctx: Ctx = Depends(authorize("content_legal_review", human=True, platform=True))):
-    d = ctx.db.get(RuleDraft, draft_id)
+    d = _locked_draft(ctx, draft_id)
     if d.status != "IN_REVIEW" or not d.peer_reviewer_id:
         raise HTTPException(409, "Requires IN_REVIEW with peer approval")
     if ctx.actor.actor_id in (d.author_id, d.peer_reviewer_id):
         raise HTTPException(403, "Separation of duties")
+    _require_valid_for_approval(ctx, d, "legal approval")
     d.legal_reviewer_id = ctx.actor.actor_id
     d.status = "VERIFIED"
     emit(ctx.db, event_type="rule.verified", aggregate_type="RuleDraft", aggregate_id=draft_id, payload={"revision": d.revision})
@@ -220,10 +291,15 @@ def shadow(draft_id: str, ctx: Ctx = Depends(authorize("content_author", "conten
     if d.status not in ("VERIFIED", "IN_REVIEW"):
         raise HTTPException(409, "Shadow requires a reviewed candidate")
     rep = _validate(ctx, d)
+    if not rep["ok"]:  # §15: only a candidate that passes static validation (incl. source completeness) is shadowed
+        raise _validation_refusal(rep, "shadow impact")
     odef = ctx.db.get(ObligationDefinition, d.obligation_definition_id)
-    with system_scope(ctx.db, "shadow impact — aggregate buckets only"):
-        d.shadow_report = appl.shadow_impact(ctx.db, odef=odef, candidate_ast=rep["compiled_ast"],
-                                             candidate_required=rep["required_facts"]) | {"completed_at": utcnow().isoformat()}
+    try:
+        with system_scope(ctx.db, "shadow impact — aggregate buckets only"):
+            d.shadow_report = appl.shadow_impact(ctx.db, odef=odef, candidate_ast=rep["compiled_ast"],
+                                                 candidate_required=rep["required_facts"]) | {"completed_at": utcnow().isoformat()}
+    except rules.RuleResourceLimitError as e:  # refused before any subject's facts are read (RUL-REQ-029)
+        raise appl.draft_resource_limit_refusal(d.draft_id, d.revision, e.violations) from None
     emit(ctx.db, event_type="rule.shadow_completed", aggregate_type="RuleDraft", aggregate_id=draft_id, payload=d.shadow_report)
     ctx.db.commit()
     return d.shadow_report
@@ -233,17 +309,36 @@ class PublishIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     label: str
     changelog: str
+    # ZA-RUL-001 WF-RUL-03: "Correction classification requires explicit correction reason/notice plan". Required for a
+    # CORRECTION release, refused for any other; it is signed into the release manifest (the customer correction notice).
+    correction_reason: str | None = Field(default=None, max_length=2000)
 
 
 @router.post("/drafts/{draft_id}/publish")
 def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("content_release", human=True, platform=True))):
-    """Fail-closed publication gates + signed ContentRelease (§15)."""
-    d = ctx.db.get(RuleDraft, draft_id)
+    """Fail-closed publication gates + signed ContentRelease (§15).
+
+    A CORRECTION release is the customer correction notice (PRD-001 §12, FR-WRK-003, GLS-001): it must correct an
+    existing published release of the same obligation definition and state its reason, both signed into the manifest.
+    The corrected release is never modified (WRK-REQ-043)."""
+    # Row-locked and re-read: two concurrent publications of one draft serialise here, and the second sees PUBLISHED.
+    d = ctx.db.execute(select(RuleDraft).where(RuleDraft.draft_id == draft_id).with_for_update()
+                       .execution_options(populate_existing=True)).scalars().first()
+    if d is None:
+        raise HTTPException(404, "rule draft not found")
     if d.status != "VERIFIED":
         raise HTTPException(409, "Only VERIFIED drafts can be released")
+    is_correction = d.change_class == "CORRECTION"
+    correction_reason = (body.correction_reason or "").strip()
+    if is_correction and not correction_reason:
+        raise HTTPException(422, {"error": "CORRECTION_REASON_REQUIRED",
+                                  "message": "A CORRECTION release needs correction_reason (ZA-RUL-001 WF-RUL-03)."})
+    if not is_correction and body.correction_reason is not None:
+        raise HTTPException(422, {"error": "CORRECTION_REASON_NOT_APPLICABLE",
+                                  "message": f"correction_reason applies only to CORRECTION releases, not {d.change_class}."})
     if ctx.actor.actor_id in (d.author_id, d.peer_reviewer_id, d.legal_reviewer_id):
         raise HTTPException(403, "Separation of duties: release manager must be distinct")
-    rep = _validate(ctx, d)
+    rep = _validate(ctx, d, mappings=False)  # the mappings are checked below, as the RELEASE_CONTENT_NOT_VERIFIED gate
     if not rep["ok"]:
         missing = [i["message"] for i in rep["issues"] if i.get("code") == "RUL_SET_REF_INVALID"]
         if missing:
@@ -262,13 +357,32 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
     # INV-06 / INV-09 / FR-REG-001/002 release gate, before anything is written: every provision this release binds
     # belongs to a VERIFIED or PUBLISHED requirement version grounded in an intact source snapshot (app/engines/catalog.py).
     # The definition is row-locked first, the same lock link edits take, so the binding signed below is the committed
-    # link set and no link edit can commit alongside this publication (DAT-REQ-012).
-    binding = catalog.release_binding(ctx.db, catalog.lock_definition(ctx.db, d.obligation_definition_id))
+    # link set and no link edit can commit alongside this publication (DAT-REQ-012). Then every requirement version and
+    # provision the release validates or changes is row-locked and re-read (catalog.lock_release_content), so the
+    # release gate and the source-mapping validation below judge exactly the rows that are bound and signed, and no
+    # concurrent supersession or withdrawal can change them before this release commits.
+    odef_locked = catalog.lock_definition(ctx.db, d.obligation_definition_id)
+    catalog.lock_release_content(ctx.db, odef_locked, d)
+    binding = catalog.release_binding(ctx.db, odef_locked)
     set_hashes = {s: sets[s]["hash"] for s in rep["set_refs"]}
     canon = rules.canonicalize(rep["compiled_ast"])
+    catalog.validate_draft_source_mappings(ctx.db, d, canon)
     h = rules.ast_hash(canon, set_hashes)
     prev = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == d.obligation_definition_id)
                           .order_by(RuleVersion.version.desc())).scalars().first()
+    if is_correction and (prev is None or prev.content_release_id is None):
+        raise HTTPException(409, {"error": "CORRECTION_TARGET_MISSING",
+                                  "message": "A CORRECTION must correct a published release of this obligation "
+                                             "definition; none exists."})
+    # Impact targets, read and locked BEFORE the record sequence is taken (lock order: engines/applicability.
+    # lock_decisions). The rule scope is held exclusively first, so an evaluation of this definition in progress
+    # commits before the targets are read (and is re-evaluated), and none can start until this release commits.
+    appl.lock_rule_scope(ctx.db, d.obligation_definition_id, exclusive=True)
+    odef = ctx.db.get(ObligationDefinition, d.obligation_definition_id)
+    with system_scope(ctx.db, "rule-release impact targeting across subjects' home cells"):
+        targets = _impact_targets(ctx.db, odef)
+        appl.lock_decisions(ctx.db, [(s.tenant_id, s.subject_id, odef.obligation_definition_id) for s in targets])
+        candidates = _unevaluated_candidates(ctx.db, odef)
     seq = next_record_seq(ctx.db)
     # Both rows are written once, with final values: published catalogue rows are immutable (DAT-REQ-012, migration 0004).
     rv_id, cr_id = new_id(), new_id()
@@ -285,7 +399,10 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
     manifest = {"label": body.label, "rule_versions": [{"rule_version_id": rv.rule_version_id, "ast_sha256": h,
                                                        "rule_schema_version": rv.rule_schema_version,
                                                        "operator_set_version": rv.operator_set_version,
-                                                       "valid_from": d.valid_from, "valid_to": d.valid_to}],
+                                                       "valid_from": d.valid_from, "valid_to": d.valid_to,
+                                                       # ZA-RUL-001 §12: source mappings "remain release-bound" (the
+                                                       # records stored on the immutable RuleVersion, signed below)
+                                                       **catalog.source_mapping_binding(rv.source_mappings)}],
                 "set_refs": rv.set_refs, "golden_vector_result": {"total": vr["total"], "passed": vr["passed"]},
                 "reviewers": {"author": d.author_id, "peer": d.peer_reviewer_id, "legal": d.legal_reviewer_id},
                 "change_class": d.change_class, "supersedes": prev.rule_version_id if prev else None,
@@ -293,6 +410,9 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
                 # ZA-RUL-001 §02: the release is the signed package of the RequirementVersion(s) it rests on, each with
                 # the exact source snapshot fingerprint and the provisions linked (FR-REG-001).
                 "requirement_versions": binding}
+    if is_correction:
+        manifest["correction"] = {"corrects_release_id": prev.content_release_id,
+                                  "corrects_rule_version_id": prev.rule_version_id, "reason": correction_reason}
     import json
     manifest = json.loads(canonical_json(manifest))
     mb = canonical_json(manifest)
@@ -307,33 +427,109 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
     d.status = "PUBLISHED"
     emit(ctx.db, event_type="content_release.published", aggregate_type="ContentRelease", aggregate_id=cr.content_release_id,
          record_seq=seq, payload={"manifest_hash": cr.manifest_hash, "rule_version_id": rv.rule_version_id, "label": body.label})
-    if d.change_class == "CORRECTION":
+    if is_correction:
+        # ZA-EVT-001 CONTENT_RELEASE payload profile: release ID, signed manifest hash, rule/requirement IDs, legal valid
+        # range, correction/supersession refs.
         emit(ctx.db, event_type="content_release.corrected", aggregate_type="ContentRelease",
-             aggregate_id=cr.content_release_id, payload={"corrects": cr.correction_of_release_id})
+             aggregate_id=cr.content_release_id, record_seq=seq,
+             payload={"content_release_id": cr.content_release_id, "manifest_hash": cr.manifest_hash,
+                      "rule_version_ids": [rv.rule_version_id],
+                      "requirement_version_ids": [b["requirement_version_id"] for b in binding],
+                      "valid_from": d.valid_from.isoformat(), "valid_to": d.valid_to.isoformat() if d.valid_to else None,
+                      "corrects": cr.correction_of_release_id, "supersedes": prev.rule_version_id})
     audit(ctx.db, action="content.publish", object_type="ContentRelease", object_id=cr.content_release_id, actor=ctx.actor,
-          new="PUBLISHED", record_seq=seq)
+          new="PUBLISHED", record_seq=seq,
+          reason=(f"correction of release {cr.correction_of_release_id} (rule version {prev.rule_version_id}): "
+                  f"{correction_reason}") if is_correction else None)
+    # ZA-EVT-001 "rule.superseded: Prior RuleVersion no longer current for new binding evaluations". Only once the new
+    # version is in force: a future-effective version leaves its predecessor current until then (TIM-REQ-026), and
+    # nothing yet records that later activation (content_release.activated is a cell-activation event not modelled).
+    if prev is not None and d.valid_from <= date.today():
+        emit(ctx.db, event_type="rule.superseded", aggregate_type="RuleVersion", aggregate_id=prev.rule_version_id,
+             record_seq=seq, payload={"rule_version_id": prev.rule_version_id, "superseded_by_rule_version_id": rv.rule_version_id,
+                                      "content_release_id": cr.content_release_id, "obligation_definition_id": odef.obligation_definition_id,
+                                      "effective_from": d.valid_from.isoformat()})
     ctx.db.flush()
-    # impact: re-evaluate previously evaluated subjects in their home cell (system service actor)
-    odef = ctx.db.get(ObligationDefinition, d.obligation_definition_id)
-    reevaluated = 0
-    # Tampered content met here fails the whole publication closed (SEC-REQ-048); it is not skipped like other errors.
+    # Impact: re-evaluate the targeted subjects in their home cells (system service actor). Tampered content met here
+    # fails the whole publication closed (SEC-REQ-048); it is not skipped like other errors.
     with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=None), \
             system_scope(ctx.db, "rule-release impact re-evaluation in subjects' home cells"):
         appl.verify_rule_integrity(ctx.db, rv)
-        subj_ids = {e.subject_id for e in ctx.db.execute(select(ApplicabilityEvaluation).where(
-            ApplicabilityEvaluation.obligation_definition_id == odef.obligation_definition_id)).scalars()}
-        for sid in subj_ids:
-            s = ctx.db.get(Subject, sid)
-            try:
-                with ctx.db.begin_nested():
-                    appl.evaluate(ctx.db, tenant_id=s.tenant_id, subject=s, odef=odef, effective_at=datetime.now(timezone.utc),
-                                  record_cutoff_seq=None, trigger="RULE_CHANGED", actor_id="system:impact-scheduler")
-                reevaluated += 1
-            except HTTPException:
-                pass
+        impact = _reevaluate_targets(ctx.db, odef, rv, targets, candidates)
+    # The impact outcome is part of the release record: an incomplete impact is never left as "no impact" (ZA-RUL-001 §15).
+    audit(ctx.db, action="content.impact", object_type="ContentRelease", object_id=cr.content_release_id, actor=ctx.actor,
+          new=impact["status"], record_seq=seq, reason=_impact_summary(impact))
     ctx.db.commit()
-    return {"content_release": to_dict(cr), "rule_version": to_dict(rv), "impact_reevaluations": reevaluated,
-            "requirement_versions": requirements}
+    return {"content_release": to_dict(cr), "rule_version": to_dict(rv), "impact_reevaluations": impact["evaluated"],
+            "impact": impact, "requirement_versions": requirements}
+
+
+# ---------------------------------------------------------------- publication impact (APP §10, RUL §14/§15, TIM §17)
+def _impact_targets(db, odef: ObligationDefinition) -> list:
+    """Subjects already evaluated against the definition, in every organisation: the confirmed re-evaluation targets
+    (APP §10 "RuleVersion published/corrected"; TIM §17 "RuleVersion/content correction: evaluations/determinations/
+    obligations for affected obligation definition"). Sorted, so their locks follow the global order."""
+    ids = sorted({sid for sid in db.execute(select(ApplicabilityEvaluation.subject_id).where(
+        ApplicabilityEvaluation.obligation_definition_id == odef.obligation_definition_id)).scalars()})
+    return [db.get(Subject, sid) for sid in ids]
+
+
+def _unevaluated_candidates(db, odef: ObligationDefinition) -> int:
+    """How many subjects of the definition's subject type have never been evaluated against it. APP §10 targets
+    subjects "currently or prospectively in scope ... based on indexed coarse selectors; exact result only after engine
+    run": they are potential impact. They are counted, not evaluated, here (no subject is evaluated for the first time
+    by a content release)."""
+    from sqlalchemy import func
+    evaluated = select(ApplicabilityEvaluation.subject_id).where(
+        ApplicabilityEvaluation.obligation_definition_id == odef.obligation_definition_id)
+    return db.execute(select(func.count()).select_from(Subject).where(
+        Subject.subject_type == odef.subject_type, Subject.subject_id.not_in(evaluated))).scalar_one()
+
+
+def _reevaluate_targets(db, odef, rv: RuleVersion, targets: list, candidates: int) -> dict:
+    """Re-evaluate every target and classify the result in aggregate buckets only: APP-REQ-014 (routine impact output to
+    content operations carries no organisation, subject or fact values) and RUL §15 impact review ("APPLIES/DNP changes,
+    new UNCERTAINs and adopted-determination conflicts"). A target that could not be evaluated is counted as failed
+    with its error code, and the impact is INCOMPLETE, never "no impact" (RUL §15)."""
+    out = {"rule_version_id": rv.rule_version_id, "targeted": len(targets), "evaluated": 0, "unchanged": 0,
+           "transitions": {}, "new_uncertain": 0, "adopted_determination_conflicts": 0, "not_yet_effective": 0,
+           "failed": {}, "potential_unevaluated_subjects": candidates}
+    for s in targets:
+        prior = appl.latest_evaluation(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
+        before = appl.current_determination(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
+        try:
+            with db.begin_nested():
+                ev = appl.evaluate(db, tenant_id=s.tenant_id, subject=s, odef=odef, effective_at=datetime.now(timezone.utc),
+                                   record_cutoff_seq=None, trigger="RULE_CHANGED", actor_id="system:impact-scheduler")
+        except HTTPException as e:
+            code = e.detail.get("error") if isinstance(e.detail, dict) else None
+            code = code or f"HTTP_{e.status_code}"
+            out["failed"][code] = out["failed"].get(code, 0) + 1
+            continue
+        out["evaluated"] += 1
+        if ev.rule_version_id != rv.rule_version_id:
+            out["not_yet_effective"] += 1  # the new version is not in force at this instant (TIM-REQ-026)
+            continue
+        if prior is None or prior.outcome == ev.outcome:
+            out["unchanged"] += 1
+        else:
+            key = f"{prior.outcome}->{ev.outcome}"
+            out["transitions"][key] = out["transitions"].get(key, 0) + 1
+            if ev.outcome == "UNCERTAIN":
+                out["new_uncertain"] += 1
+        after = appl.current_determination(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
+        if after is not None and after.state == "ADOPTED" and after.needs_review and (
+                before is None or before.revision_id != after.revision_id):
+            out["adopted_determination_conflicts"] += 1
+    out["status"] = "INCOMPLETE" if out["failed"] else "COMPLETE"
+    return out
+
+
+def _impact_summary(i: dict) -> str:
+    return (f"rule version {i['rule_version_id']}: targeted {i['targeted']}; evaluated {i['evaluated']}; not yet effective "
+            f"{i['not_yet_effective']}; unchanged {i['unchanged']}; transitions {i['transitions']}; new UNCERTAIN "
+            f"{i['new_uncertain']}; adopted-determination conflicts {i['adopted_determination_conflicts']}; failed "
+            f"{i['failed']}; never-evaluated candidates {i['potential_unevaluated_subjects']}")[:2000]
 
 
 @router.get("/versions")

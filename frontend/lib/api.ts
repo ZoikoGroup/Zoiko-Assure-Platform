@@ -96,6 +96,28 @@ export async function api<T = any>(path: string, opts: RequestInit & { json?: un
   return data as T;
 }
 
+/** POSTs multipart `form` to `path`, reporting the share of bytes sent through `onProgress` (0–1). `fetch` cannot
+ *  report upload progress, so this uses XMLHttpRequest. Resolves with the server's JSON body only on a 2xx response;
+ *  otherwise rejects with the same ApiError `api()` would (status 0 = the server could not be reached). */
+export function uploadForm<T = any>(path: string, form: FormData, onProgress?: (sent: number) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API}${path}`);
+    Object.entries(authHeaders()).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    if (onProgress) xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onerror = () => reject(new ApiError(0, null));
+    xhr.onload = () => {
+      let data: any = xhr.responseText;
+      try { data = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch {}
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data as T);
+      unauthorized(xhr.status);
+      const request = xhr.getResponseHeader("x-assure-request-id") ?? xhr.getResponseHeader("x-request-id");
+      reject(new ApiError(xhr.status, data?.detail ?? data, request ? { label: "Request ID", value: request } : undefined));
+    };
+    xhr.send(form);
+  });
+}
+
 export async function download(path: string, filename: string) {
   const res = await fetch(`${API}${path}`, { headers: authHeaders() });
   if (!res.ok) {

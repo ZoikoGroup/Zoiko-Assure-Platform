@@ -21,7 +21,8 @@ export default function ApplicabilityTrace() {
   return (
     <>
       <PageHeader spec="WF-DOM-03 · ZA-APP-001 §7" title="Applicability Trace"
-        subtitle="Every evaluation is an immutable record bound to a frozen input bundle, rule version and record cutoff. Open one to see each predicate, the exact fact revision it used, and the tri-valued result." />
+        subtitle="Every applicability evaluation and the inputs it used."
+        help="Each evaluation is an immutable record bound to a frozen input bundle, rule version and record cutoff. Open one to see each predicate, the exact fact revision it used, and the tri-valued result." />
       <ErrorBox error={evals.error} />
       <Card title={`${evals.data ? rows.length : "…"} evaluation(s)`} actions={<>
         <select aria-label="Filter by subject" className="input w-44 py-1 text-xs" value={subject} onChange={(e) => setSubject(e.target.value)}>

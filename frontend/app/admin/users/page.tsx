@@ -30,7 +30,7 @@ export default function UsersAndRoles() {
     <>
       <PageHeader spec="WF-IAM-01/02 · ZA-IAM-001 §08 · §23" title="Users & Roles"
         subtitle={tenant
-          ? `Your own access and sessions, then everyone in ${me?.tenant_name ?? "your organisation"}: people, external auditors, agents and services, with their roles and authority basis.`
+          ? `Your own access and sessions, and everyone in ${me?.tenant_name ?? "your organisation"} with their roles.`
           : "Your own access and sessions, then the Zoiko staff accounts. Zoiko staff belong to no customer organisation."} />
       <div className="space-y-4">
         <YourAccess />

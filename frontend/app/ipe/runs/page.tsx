@@ -9,7 +9,8 @@ export default function SourceRuns() {
   return (
     <>
       <PageHeader spec="WF-IPE-01 · ZA-IPE-001" title="Source Runs"
-        subtitle="Each connector extraction with its frozen request, coverage window and IPE result. Open a run to inspect scope, paging, the population manifest and every IPE check." />
+        subtitle="Each connector extraction and its IPE result."
+        help="Open a run to inspect its frozen request, coverage window, scope, paging, population manifest and every IPE check." />
       <Card>
         <ErrorBox error={runs.error} />
         <Table head={["Run", "Connector", "Coverage", "Run outcome", "Completeness", "Accuracy", "Overall IPE", "Reasons"]} empty={runs.data?.length === 0} loading={!runs.data && !runs.error}>

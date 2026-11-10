@@ -77,7 +77,9 @@
   },
   "/fact-requests": {
    "reads": [
-    "/fact-requests"
+    "/fact-requests",
+    "/applicability/determinations",
+    "/exceptions"
    ],
    "perms": [
     "read"
@@ -321,5 +323,78 @@
     "read"
    ]
   }
+ },
+ "roles": {
+  "CCO": [
+   "approve_exception",
+   "assurance_review",
+   "attest",
+   "challenge",
+   "manage_facts",
+   "manage_issues",
+   "package",
+   "read",
+   "request_evaluation",
+   "request_exception"
+  ],
+  "LEGAL_REVIEWER": [
+   "attest",
+   "challenge",
+   "legal_disposition",
+   "read",
+   "request_evaluation"
+  ],
+  "REGULATORY_ANALYST": [
+   "challenge",
+   "manage_facts",
+   "read",
+   "request_evaluation"
+  ],
+  "CONTROL_OWNER": [
+   "manage_controls",
+   "manage_issues",
+   "read",
+   "request_exception",
+   "submit_evidence"
+  ],
+  "INTERNAL_AUDIT": [
+   "package",
+   "read",
+   "reevaluate_ipe",
+   "verify"
+  ],
+  "AI_GOVERNANCE_LEAD": [
+   "grant_authority",
+   "manage_ai",
+   "manage_facts",
+   "read",
+   "request_evaluation",
+   "request_policy_decision"
+  ],
+  "PLATFORM_ADMIN": [
+   "checkpoint",
+   "manage_connectors",
+   "manage_tenant",
+   "read",
+   "reevaluate_ipe"
+  ],
+  "RISK_APPROVER": [
+   "approve_compensation",
+   "approve_exception",
+   "assurance_review",
+   "read"
+  ],
+  "TENANT_SECURITY_ADMIN": [
+   "manage_role_assignments"
+  ],
+  "EXTERNAL_AUDITOR": [
+   "audit_read",
+   "verify"
+  ],
+  "TENANT_OWNER": [
+   "delegate_admin",
+   "manage_tenant",
+   "read"
+  ]
  }
 }

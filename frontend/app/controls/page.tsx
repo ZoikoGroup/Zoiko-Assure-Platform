@@ -15,7 +15,8 @@ export default function Controls() {
   return (
     <>
       <PageHeader spec="ZA-STA-001 §§6-9 · WF-STA-02" title="Controls & Tests"
-        subtitle="The controls that satisfy your obligations. Each is implemented once per scope and reused by every obligation that references it; its tests and their evidence show whether it operated."
+        subtitle="The controls that satisfy your obligations, and whether they are operating."
+        help="Each control is implemented once per scope and reused by every obligation that references it. Its tests and their evidence show whether it operated."
         actions={<button className="btn-primary" disabled={!can("manage_controls")} title={why("manage_controls")} onClick={() => setOpen(true)}>Implement control</button>} />
       <PermissionNote perms={["manage_controls"]} />
       <ErrorBox error={error} />

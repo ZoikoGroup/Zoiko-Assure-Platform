@@ -15,9 +15,11 @@ export default function Governance() {
   const tabsId = useId();
   return (
     <>
-      <PageHeader spec="WF-STA-04 · ZA-STA-001 §§12-15" title="Exceptions & Issues"
-        subtitle="Governance treatments are recorded beside assurance state and never rewrite it. Approval needs an authorised human, and an exception cannot be approved by the person who requested it." />
-      <PermissionNote perms={["approve_exception", "approve_compensation"]} />
+      <PageHeader spec="WF-STA-04 · ZA-STA-001 §§12-15" title="Findings & Actions"
+        subtitle="Exceptions, compensating controls, issues and risk acceptances."
+        help="Governance treatments are recorded beside assurance state and never rewrite it. Approval needs an authorised human, and an exception cannot be approved by the person who requested it. New exceptions and compensating controls are requested from an obligation's dossier." />
+      <PermissionNote perms={["approve_exception", "approve_compensation", "manage_issues"]}
+        actions={{ approve_exception: "Decide exceptions and risk acceptances", approve_compensation: "Decide compensating controls", manage_issues: "Move issues through remediation" }} />
       <Tabs id={tabsId} tabs={["Exceptions", "Compensations", "Issues", "Risk acceptances"]} value={tab} onChange={setTab} />
       <TabPanel id={tabsId} value={tab}>
         {tab === "Exceptions" && <Exceptions />}
@@ -129,6 +131,7 @@ function Compensations() {
 
 function Issues() {
   const { data, error, reload } = useApi<any[]>("/issues");
+  const { can, why } = useCan();
   const [cancelFor, setCancelFor] = useState<any>(null);
   const [moveFor, setMoveFor] = useState<{ i: any; state: string } | null>(null);
   const send = async (id: string, state: string, reason: string | null) => {
@@ -146,7 +149,7 @@ function Issues() {
             <td className="td">{i.priority}</td><td className="td"><Badge code={i.state} /></td>
             <td className="td mono text-[11px]">{i.source_ref_type} {i.source_ref_id?.slice(0, 8)}</td>
             <td className="td text-xs">{fmtDate(i.created_at)}</td>
-            <td className="td whitespace-nowrap">{(NEXT[i.state] || []).map((s) => <button key={s} className="btn-ghost" onClick={() => move(i, s)}>{s}</button>)}</td>
+            <td className="td whitespace-nowrap">{(NEXT[i.state] || []).map((s) => <button key={s} className="btn-ghost" disabled={!can("manage_issues")} title={why("manage_issues")} onClick={() => move(i, s)}>{s}</button>)}</td>
           </tr>
         ))}
       </Table>

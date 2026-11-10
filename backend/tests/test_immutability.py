@@ -16,7 +16,7 @@ import re
 import secrets
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 
 RUNTIME = "assure_app"
@@ -311,8 +311,22 @@ def _verified_draft(client) -> tuple[dict, str]:
     """A republication draft of a current rule version, taken through every gate before release (author, peer, legal,
     shadow). Returns the rule version it supersedes and the draft ID."""
     from conftest import H
+    from app.db import AdminSession
+    from app.engines.catalog import RELEASABLE
+    from app.models import ObligationDefinition, Provision, RequirementVersion
+
+    def republishable(odef_id: str) -> bool:
+        """Its linked provisions are all still releasable. /rules/versions is ordered by definition ID, which is random,
+        and other modules leave definitions whose requirement versions a later release SUPERSEDED (by design); the
+        verified-content gate rightly refuses to republish those, so they cannot be this test's base."""
+        with AdminSession() as db:
+            ids = db.get(ObligationDefinition, odef_id).provision_ids or []
+            provs = db.execute(select(Provision).where(Provision.provision_id.in_(ids or ["-"]))).scalars().all()
+            return bool(provs) and len(provs) == len(ids) and all(
+                p.lifecycle in RELEASABLE and db.get(RequirementVersion, p.requirement_version_id).lifecycle in RELEASABLE
+                for p in provs)
     base = next(v for v in client.get("/api/rules/versions", headers=H("actor-content-analyst")).json()
-                if v["superseded_by"] is None)
+                if v["superseded_by"] is None and republishable(v["obligation_definition_id"]))
     draft = client.post("/api/rules/drafts", headers=H("actor-content-analyst"), json={
         "obligation_definition_id": base["obligation_definition_id"], "authoring_mode": "AST",
         "ast": base["canonical_ast"], "golden_vectors": base["golden_vectors"], "source_mappings": base["source_mappings"],

@@ -345,7 +345,9 @@ def test_authorised_workflows_still_work(client, actors):
     from app.db import AdminSession
     from app.models import AuditEvent
     a = _seed_ids(client)
-    # Control Owner works an issue (manage_issues).
+    # Control Owner works an issue (manage_issues): owner first (GLS TRIAGED needs ownership established), then triage.
+    assert client.post(f"/api/issues/{a['issue']}/assign", headers=H("actor-owner"),
+                       json={"owner_actor_id": "actor-owner", "reason": "authorised workflow probe"}).status_code == 200
     r = client.post(f"/api/issues/{a['issue']}/transition", headers=H("actor-owner"), json={"state": "TRIAGED"})
     assert r.status_code == 200 and r.json()["state"] == "TRIAGED"
     # CCO requests an exception; the requester cannot approve it; a Risk Approver can.
