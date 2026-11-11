@@ -4,12 +4,14 @@ import Link, { useLinkStatus } from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Bell, Building, ChevronDown, HelpCircle, KeyRound, Loader2, LogOut, Menu, Palette, PanelLeftClose, PanelLeftOpen, ShieldCheck, UserCog } from "lucide-react";
+import { Bell, Building, ChevronDown, Loader2, LogOut, Menu, Palette, PanelLeftClose, PanelLeftOpen, ShieldCheck, UserCog } from "lucide-react";
 import { api } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
 import SCREEN_ACCESS from "@/lib/screen-access.json";
 import { isStandalone, jumpTargets, navFor, orgNav, orgSection, routeMeta } from "./nav";
+import { PlatformFrame } from "./PlatformShell";
+import { ThemeToggle } from "./ThemeToggle";
 import {
   Breadcrumb, Drawer, Dropdown, DropdownItem, ErrorBox, Field, IconButton, Modal, PageTitleProvider, SearchInput, ToastProvider,
   Tooltip, useAction, usePageTitle, useToast,
@@ -74,25 +76,35 @@ function Frame({ children }: { children: React.ReactNode }) {
       .then(([a, t]) => setWork({ issues: a.open_issues, facts: a.open_fact_requests, entities: t ? t.entities.length : null })).catch(() => {});
   }, [me]);
 
-  if (path === "/login") return <>{children}</>;
+  // Sign-in is drawn for the light theme only (fixed artwork and colours), so it keeps the light palette in either theme.
+  if (path === "/login") return <div data-theme="light" className="contents">{children}</div>;
   if (!ready || !me) return <ShellSkeleton narrow={collapsed} />;
   if (me.must_change_password) return <ForcedPasswordChange />;
   if (isStandalone(path)) return <>{children}</>;
+  // The platform Super Admin works in the Platform Control Plane chrome (components/PlatformShell.tsx).
+  if (personaOf(me) === "platform") {
+    return (
+      <SyntheticCtx.Provider value={setSynthetic}>
+        <PlatformFrame path={path} synthetic={synthetic}>{children}</PlatformFrame>
+      </SyntheticCtx.Provider>
+    );
+  }
 
   // Customer-organisation users work in the Organization Workspace chrome (dark sidebar, ORG_NAV); Zoiko staff keep theirs.
+  // The organisation sidebar is navy in both themes, so it keeps the palette it was designed with (the light theme's).
   const org = personaOf(me) === "tenant";
   return (
     <SyntheticCtx.Provider value={setSynthetic}>
-      <div className={`min-h-screen ${org ? "bg-slate-100" : ""}`}>
+      <div className={`min-h-screen ${org ? "bg-slate-100 dark:bg-canvas" : ""}`}>
         <a href="#main" className="sr-only z-[80] rounded-md bg-navy-700 px-3 py-2 text-white focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
-        <aside aria-label="Primary navigation"
+        <aside aria-label="Primary navigation" data-theme={org ? "light" : undefined}
           className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r transition-[width] duration-200 lg:flex
             ${org ? "border-navy-950 bg-navy-900" : "border-slate-200 bg-white"} ${collapsed ? "w-16" : org ? "w-[220px]" : "w-[232px]"}`}>
           {org ? <OrgSidebar narrow={collapsed} path={path} onToggle={toggle} entities={work?.entities} />
             : <SidebarBody narrow={collapsed} path={path} onToggle={toggle} />}
         </aside>
         <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[260px]">
-          <div className={`-m-4 flex h-[calc(100vh-49px)] flex-col ${org ? "bg-navy-900" : ""}`}>
+          <div data-theme={org ? "light" : undefined} className={`-m-4 flex h-[calc(100vh-49px)] flex-col ${org ? "bg-navy-900" : ""}`}>
             {org ? <OrgSidebar narrow={false} path={path} entities={work?.entities} /> : <SidebarBody narrow={false} path={path} showContext />}
           </div>
         </Drawer>
@@ -130,17 +142,19 @@ function ShellSkeleton({ narrow }: { narrow: boolean }) {
   );
 }
 
-export function Logo({ mark = false, width = 140, onDark = false }: { mark?: boolean; width?: number; onDark?: boolean }) {
+export function Logo({ mark = false, width = 140, onDark }: { mark?: boolean; width?: number; onDark?: boolean }) {
   // logo.png is a 1000px square with the wordmark centred; logo-mark.jpg is a 1000px square with the app icon centred.
   // logo-on-dark.png is logo.png with the navy recoloured white, for dark surfaces; same geometry.
-  // `width` scales the wordmark crop proportionally (140px is the sidebar size).
+  // `width` scales the wordmark crop proportionally (140px is the sidebar size). Without `onDark` the wordmark follows
+  // the theme (--za-logo-wordmark, app/theme.css); `onDark` true or false pins one file.
   const s = width / 140;
+  const file = onDark === undefined ? "var(--za-logo-wordmark)" : `url(${onDark ? "/logo-on-dark.png" : "/logo.png"})`;
   return mark ? (
     <span role="img" aria-label="Zoiko Assure" className="block h-8 w-8"
       style={{ backgroundImage: "url(/logo-mark.jpg)", backgroundSize: "90px 90px", backgroundPosition: "-29px -29px", backgroundRepeat: "no-repeat" }} />
   ) : (
     <span role="img" aria-label="Zoiko Assure" className="block"
-      style={{ width, height: 43 * s, backgroundImage: `url(${onDark ? "/logo-on-dark.png" : "/logo.png"})`, backgroundSize: `${228 * s}px ${228 * s}px`,
+      style={{ width, height: 43 * s, backgroundImage: file, backgroundSize: `${228 * s}px ${228 * s}px`,
         backgroundPosition: `${-44 * s}px ${-91 * s}px`, backgroundRepeat: "no-repeat" }} />
   );
 }
@@ -467,6 +481,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
     </>
   );
   const dot = pending > 0 && <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-brand-500" aria-hidden />;
+  const themeToggle = <ThemeToggle className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-slate-200 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400" />;
   const accountMenu = (
     <Dropdown label="Account menu" menuClassName="w-72"
       buttonClassName="flex items-center gap-2 rounded-md py-1 pl-1 pr-1.5 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
@@ -489,8 +504,6 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
           </div>
           <AccountContext />
           <DropdownItem icon={UserCog} href="/admin/users" onClick={close}>My access & permissions</DropdownItem>
-          <DropdownItem icon={KeyRound} onClick={() => { close(); setPw(true); }}>Change password</DropdownItem>
-          <DropdownItem icon={HelpCircle} href="/admin/dictionary" onClick={close}>Controlled dictionary</DropdownItem>
           <DropdownItem icon={Palette} href="/design-system" onClick={close}>Design system &amp; UI kit</DropdownItem>
           <div className="my-1 border-t border-slate-100" />
           <DropdownItem icon={LogOut} danger onClick={logout}>Sign out</DropdownItem>
@@ -499,9 +512,9 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
     </Dropdown>
   );
 
-  // Organization Workspace header: breadcrumb and synthetic-data badge, then search, Alerts, Help and the account menu.
-  // The search jumps to the screens this account may open (navigation, not record search), so it says "pages".
-  // Phones put the badge on the second line, beside the record watermark, so the breadcrumb keeps its room.
+  // Organization Workspace header: breadcrumb and synthetic-data badge, then search, Alerts, the theme toggle and the
+  // account menu. The search jumps to the screens this account may open (navigation, not record search), so it says
+  // "pages". It does not show the record watermark. Phones put the badge on the second line so the breadcrumb keeps its room.
   if (org) {
     const badge = (placement: string) => synthetic && (
       <span title="This page includes synthetic demonstration figures, each marked SYNTHETIC. Unmarked figures are read from your organization's records."
@@ -514,7 +527,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
         <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="lg:hidden" />
         <div className="min-w-0 flex-1 overflow-x-clip">
           <div className="flex min-w-0 items-center gap-3"><OrgBreadcrumb items={orgCrumbs} />{badge("hidden md:inline-flex")}</div>
-          <div className="mt-0.5 flex items-center gap-2 md:hidden">{watermark("flex w-fit")}{badge("inline-flex")}</div>
+          <div className="mt-0.5 flex items-center gap-2 md:hidden">{badge("inline-flex")}</div>
         </div>
 
         <div className="flex min-w-0 items-center gap-1 sm:gap-2">
@@ -532,13 +545,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
             {alertItems}
           </Dropdown>
 
-          <Link href="/admin/dictionary" title="Help: the controlled dictionary of statuses and terms"
-            className="hidden h-8 items-center rounded-md px-2 text-[14px] font-medium text-slate-800 hover:bg-slate-100 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 xl:inline-flex">
-            Help
-          </Link>
-
-          {watermark("hidden md:flex")}
-
+          {themeToggle}
           {accountMenu}
         </div>
         {pw && <ChangePassword onClose={() => setPw(false)} />}
@@ -567,6 +574,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
           {alertItems}
         </Dropdown>
 
+        {themeToggle}
         {accountMenu}
       </div>
       {pw && <ChangePassword onClose={() => setPw(false)} />}

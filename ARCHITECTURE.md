@@ -268,7 +268,7 @@ describes a customer carries `tenant_id` and is RLS-protected.
 app/layout.tsx
  └─ ActorProvider (lib/actor.tsx)   auth state: me, login(), logout(); redirects to /login when signed out
      └─ Shell (components/Shell.tsx) collapsible sidebar (NAV list), topbar (breadcrumb, jump-to search,
-         │                           watermark, notifications, user menu, change password)
+         │                           watermark, notifications, user menu), forced password change
          └─ page (app/<route>/page.tsx)
               ├─ useApi("/path")     lib/api.ts: fetch + Bearer token; reloads when the user changes
               ├─ api(path, {method, json})   for mutations, wrapped in useAction() for busy/error state

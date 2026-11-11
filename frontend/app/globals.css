@@ -1,6 +1,8 @@
 @import "tailwindcss";
 /* Unified Design System foundation tokens (semantic colours, typography, spacing, radii, elevation). */
 @import "./design-tokens.css";
+/* Light and dark themes for every screen (data-theme on <html>). */
+@import "./theme.css";
 
 /* Zoiko Assure brand tokens — derived from the logo (navy #154A6C, orange #D9822B, slate #5F6B70).
    Navy is the primary enterprise colour; orange is a controlled accent only. Surfaces stay neutral. */
@@ -36,14 +38,14 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-html, body { background: var(--color-canvas); color: #1a2733; }
+html, body { background: var(--color-canvas); color: var(--za-app-fg); }
 body { font-family: var(--font-sans); font-size: 14px; -webkit-font-smoothing: antialiased; }
 
 ::selection { background: var(--color-navy-100); }
 :focus-visible { outline: 2px solid var(--color-navy-500); outline-offset: 2px; }
 
 .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
-.scroll-thin::-webkit-scrollbar-thumb { background: #d5dce3; border-radius: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: var(--za-scrollbar); border-radius: 8px; }
 .no-scrollbar { scrollbar-width: none; }
 .no-scrollbar::-webkit-scrollbar { display: none; }
 
@@ -62,7 +64,7 @@ body { font-family: var(--font-sans); font-size: 14px; -webkit-font-smoothing: a
 
 /* Loading placeholder: a calm pulse, disabled for reduced motion. */
 @keyframes za-pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
-.skeleton { background: #e9edf1; border-radius: 4px; animation: za-pulse-soft 1.6s ease-in-out infinite; }
+.skeleton { background: var(--za-skeleton); border-radius: 4px; animation: za-pulse-soft 1.6s ease-in-out infinite; }
 
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }

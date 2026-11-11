@@ -1,6 +1,8 @@
 "use client";
 
 import { KeyRound } from "lucide-react";
+import { personaOf, useAuth } from "@/lib/actor";
+import { PlatformIdentity } from "@/components/PlatformIdentity";
 import { Card, EmptyState, PageHeader, StatusPill } from "@/components/ui";
 
 const CAPABILITIES = [
@@ -11,6 +13,9 @@ const CAPABILITIES = [
 ];
 
 export default function IdentityIntegrations() {
+  const { me } = useAuth();
+  // The Zoiko Super Admin has its own, platform-level view (components/PlatformIdentity.tsx); everyone else keeps this one.
+  if (me && personaOf(me) === "platform") return <PlatformIdentity />;
   return (
     <>
       <PageHeader spec="ZA-IAM-001" title="Identity Integrations"

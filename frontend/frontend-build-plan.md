@@ -66,7 +66,7 @@ Administration & Trust                  (/admin opens Users & Roles)
   /admin/releases                       Content Releases
   /admin/retention                      Retention & Legal Holds            (WF-EVD-04, WF-PRI-05; retention policies not yet enabled)
   /admin/access-log                     Privileged Access Log              (audit trail; privileged sessions not yet enabled)
-  /admin/dictionary                     Controlled Dictionary              (account menu)
+  /admin/dictionary                     Controlled Dictionary              (Jump to)
 ```
 
 **Existing components to keep:** `StatusPill`/`Badge`, `Card`, `Table`, `Tabs`, `Modal`, `Drawer`, `RuleTrace`, `ExprTrace`, `SegmentRibbon`, `AttestModal`, `AssertModal`, `RequirementViews`, `RuleTesting`.

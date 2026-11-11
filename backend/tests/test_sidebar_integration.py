@@ -39,7 +39,11 @@ FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
 ACCESS = FRONTEND / "lib" / "screen-access.json"
 NAV = FRONTEND / "components" / "nav.ts"
 # Sidebar screens that load no backend data when they open: self-service or static pages, shown to their personas.
-NO_READS = {"/", "/admin/users", "/admin/identity"}
+# Zoiko platform screens are listed here too: their reads (GET /platform/organisations) are platform- and human-only,
+# which `screen_perms` keeps out of the organisation screen list, and test_super_admin_endpoints_are_platform_only
+# covers their authorization ("/" hosted the same registry read before /organisations; /action-queue also reads the
+# caller's own GET /sessions).
+NO_READS = {"/", "/admin/users", "/admin/identity", "/organisations", "/action-queue"}
 
 TENANT, TA, TB = "tenant-zoiko-group", "tenant-sb-a", "tenant-sb-b"
 SB_OWNER, SB_TSA, SB_SUPER = "sb-owner", "sb-tsa", "sb-super"           # in the seeded tenant / the platform
