@@ -8,9 +8,10 @@ callers fall back to PostgreSQL (app/cache.py).
 Configuration (environment, or backend/.env for local development; real environment variables win):
   REDIS_URL                      redis://[user:password@]host:port[/db] or rediss://... (TLS). Unset or empty: Redis is
                                  DISABLED. There is deliberately no default, so a missing URL never connects to an
-                                 unrelated local Redis.
+                                 unrelated local Redis. No query options (``?name=value``): redis-py would let them
+                                 override the settings below, TLS verification included, so any is MISCONFIGURED.
   REDIS_TLS                      true/false. true forces TLS for a redis:// URL (the equivalent of `redis-cli --tls`);
-                                 rediss:// always uses TLS. Certificates are verified.
+                                 rediss:// always uses TLS. The certificate chain and the host name are always verified.
   REDIS_CONNECT_TIMEOUT_SECONDS  connect timeout (default 2.0)
   REDIS_SOCKET_TIMEOUT_SECONDS   per-command timeout (default 2.0)
   REDIS_HEALTH_CHECK_INTERVAL    seconds between pooled-connection liveness checks (default 30)
@@ -28,10 +29,11 @@ from __future__ import annotations
 
 import logging
 import os
+import ssl
 import threading
 import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 log = logging.getLogger("zoiko.redis")
 
@@ -44,15 +46,22 @@ class RedisConfigError(ValueError):
     """REDIS_* configuration that cannot be used. The message never contains a credential."""
 
 
+_LOGGABLE_SCHEMES = frozenset({"redis", "rediss", "unix", "http", "https"})
+
+
 def redact(url: str | None) -> str:
-    """A URL safe to log: scheme, host, port and database only (no user, no password)."""
+    """A URL safe to log: scheme, host, port and database only (no user, no password). Without ``//`` (a URL missing
+    its scheme, or ``redis:user:pw@host``) urlsplit reads the user name as the scheme and the password as the path, so
+    only a known scheme name and a numeric database path are ever repeated."""
     if not url:
         return "<unset>"
     try:
         p = urlsplit(url)
+        scheme = p.scheme if p.scheme.lower() in _LOGGABLE_SCHEMES else "?"
         host = p.hostname or "?"
         port = f":{p.port}" if p.port else ""
-        return f"{p.scheme}://***@{host}{port}{p.path or ''}"
+        db = p.path if p.path.lstrip("/").isdigit() else ""
+        return f"{scheme}://***@{host}{port}{db}"
     except ValueError:
         return "<unparseable REDIS_URL>"
 
@@ -116,6 +125,8 @@ def load_settings() -> RedisSettings | None:
         raise RedisConfigError(f"REDIS_URL has no port ({redact(url)})")
     if p.path not in ("", "/") and not p.path.lstrip("/").isdigit():
         raise RedisConfigError(f"REDIS_URL database must be a number ({redact(url)})")
+    if p.query:
+        raise _query_error(p.query, url)
     return RedisSettings(
         url=url, tls=p.scheme == "rediss" or _flag("REDIS_TLS", False),
         connect_timeout=_number("REDIS_CONNECT_TIMEOUT_SECONDS", 2.0, minimum=0.1, maximum=60),
@@ -130,6 +141,40 @@ def _connection_url(s: RedisSettings) -> str:
     if s.tls and s.url.startswith("redis://"):
         return "rediss://" + s.url[len("redis://"):]
     return s.url
+
+
+# redis-py option names an error may repeat. Any other query key is reported only as "unrecognised option", so text
+# pasted into the wrong part of the URL (a password, say) never reaches a log.
+_KNOWN_OPTIONS = frozenset({
+    "db", "username", "password", "protocol", "client_name", "decode_responses", "encoding", "readonly",
+    "socket_timeout", "socket_connect_timeout", "socket_keepalive", "retry_on_timeout", "max_connections",
+    "health_check_interval", "ssl", "ssl_cert_reqs", "ssl_check_hostname", "ssl_ca_certs", "ssl_ca_path", "ssl_ca_data",
+    "ssl_certfile", "ssl_keyfile", "ssl_password", "ssl_min_version", "ssl_ciphers", "ssl_validate_ocsp"})
+
+
+def _query_error(query: str, url: str) -> RedisConfigError:
+    """REDIS_URL query options are refused. redis-py's ConnectionPool.from_url lets them override the keyword arguments
+    start() passes, so ``?ssl_cert_reqs=none`` or ``?ssl_check_hostname=false`` would silently switch TLS verification
+    off, and an unknown option would only fail at the first connection, where it looks like an outage. Every supported
+    setting has its own REDIS_* variable. Values are never repeated; names only when they are known redis-py options."""
+    keys = [k for k, _ in parse_qsl(query, keep_blank_values=True)] or [query]
+    names = ", ".join(sorted({k if k in _KNOWN_OPTIONS else "unrecognised option" for k in keys}))
+    if any(k.strip().lower().startswith("ssl") for k in keys):
+        return RedisConfigError(f"REDIS_URL must not set TLS options ({names}): certificate and host-name verification "
+                                f"are always on ({redact(url)})")
+    return RedisConfigError(f"REDIS_URL query options are not supported ({names}); use the REDIS_* settings "
+                            f"({redact(url)})")
+
+
+def _tls_problem(pool, ssl_connection) -> str | None:
+    """Whether every connection the pool opens verifies the certificate chain and the host name, read from the pool's
+    effective settings rather than assumed from the arguments passed to it. None when both hold."""
+    kw = pool.connection_kwargs
+    if not issubclass(pool.connection_class, ssl_connection):
+        return "TLS was requested but the connection pool would not use TLS"
+    if kw.get("ssl_cert_reqs") not in ("required", ssl.CERT_REQUIRED) or kw.get("ssl_check_hostname") is not True:
+        return "TLS certificate or host-name verification would be off"
+    return None
 
 
 class RedisManager:
@@ -173,11 +218,22 @@ class RedisManager:
                     raise RuntimeError(f"Redis is required but {self.detail}") from None
                 return self.state
             s = self.settings
+            # TLS verification is set explicitly, not left to redis-py's defaults (which have changed between the releases
+            # requirements.txt allows), and then checked on the pool's effective settings: only REDIS_URL options could
+            # override it, and load_settings() refuses those, so a failure here means a redis-py behaviour change.
+            verify = {"ssl_cert_reqs": "required", "ssl_check_hostname": True} if s.tls else {}
             self._pool = redis.ConnectionPool.from_url(
                 _connection_url(s), max_connections=s.max_connections, socket_connect_timeout=s.connect_timeout,
                 socket_timeout=s.socket_timeout, health_check_interval=s.health_check_interval,
                 retry=Retry(ExponentialBackoff(cap=1.0, base=0.05), retries=2), retry_on_timeout=True,
-                decode_responses=True, **({"ssl_cert_reqs": "required"} if s.tls else {}))
+                decode_responses=True, **verify)
+            if s.tls and (problem := _tls_problem(self._pool, redis.SSLConnection)):
+                self._close_locked()
+                self.state, self.detail = MISCONFIGURED, problem
+                log.error("Redis misconfigured: %s (%s)", problem, s.safe_url)
+                if s.required:
+                    raise RuntimeError(f"Redis is required but {problem} ({s.safe_url})")
+                return self.state
             self._client = redis.Redis(connection_pool=self._pool)
         state = self.check()
         if state != HEALTHY:

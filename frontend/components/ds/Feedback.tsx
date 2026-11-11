@@ -38,8 +38,8 @@ export function Alert({ tone = "info", title, children, onDismiss, live = false,
 }
 
 /* ------------------------------------------------------------------------------------------ Modal, confirm */
-/** A modal dialog. It renders into its nearest themed ancestor (or <body>), so a transformed or filtered parent cannot
- *  trap it, and it keeps that ancestor's theme. */
+/** A modal dialog. It renders into its nearest themed ancestor inside <body> (or <body> itself, which follows the
+ *  theme on <html>), so a transformed or filtered parent cannot trap it, and it keeps that ancestor's theme. */
 export function Modal({ open, onClose, title, description, size = "md", children, footer }:
   { open: boolean; onClose: () => void; title: string; description?: ReactNode; size?: "sm" | "md" | "lg"; children: ReactNode; footer?: ReactNode }) {
   const anchor = useRef<HTMLSpanElement>(null);
@@ -47,7 +47,7 @@ export function Modal({ open, onClose, title, description, size = "md", children
   const [host, setHost] = useState<Element | null>(null);
   const titleId = useId();
   const descId = useId();
-  useLayoutEffect(() => { setHost(anchor.current?.closest("[data-theme]") ?? document.body); }, []);
+  useLayoutEffect(() => { setHost(anchor.current?.closest("body [data-theme]") ?? document.body); }, []);
   useDialog(open && !!host, onClose, panel);  // waits for the host, so a dialog mounted open still gets initial focus
   const w = size === "sm" ? "max-w-md" : size === "lg" ? "max-w-3xl" : "max-w-xl";
   return <>

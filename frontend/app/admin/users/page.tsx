@@ -7,6 +7,7 @@ import { fmtDate } from "@/lib/format";
 import SCREEN_ACCESS from "@/lib/screen-access.json";
 import { permissionText, ROLE_CODES, roleAbout, roleLabel, workContext } from "@/lib/roles";
 import { Badge, Card, Drawer, ErrorBox, Field, KV, Modal, Notice, PageHeader, SearchInput, Select, Table, useAction, useToast } from "@/components/ui";
+import { PlatformUsers } from "@/components/PlatformUsers";
 
 /* Team & Access (WF-IAM-01 Identity & Access Directory, WF-IAM-02 Effective Access; ZA-IAM-001 §08, §23).
    Everyone sees their own access and sessions. The directory and the role registry appear only for the roles the
@@ -25,6 +26,8 @@ const PRINCIPAL_TYPES = [{ value: "", label: "All principal types" }, ...["HUMAN
 
 export default function UsersAndRoles() {
   const { me } = useAuth();
+  // The Zoiko Super Admin has its own Users & Roles (components/PlatformUsers.tsx); everyone else keeps this view.
+  if (me && personaOf(me) === "platform") return <PlatformUsers />;
   const tenant = personaOf(me) === "tenant";
   return (
     <>

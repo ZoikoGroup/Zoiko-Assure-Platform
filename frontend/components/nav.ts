@@ -19,10 +19,17 @@ export type NavItem = { href: string; label: string; icon: LucideIcon; for?: Per
 const ACCESS: Record<string, { reads: string[]; perms: string[] }> = SCREEN_ACCESS.screens;
 const ALL: Persona[] = ["tenant", "content", "platform"];
 const CONTENT: Persona[] = ["tenant", "content"];
+const PLATFORM: Persona[] = ["platform"];
 export type NavGroup = { group: string; items: NavItem[] };
 
 const NAV_ITEMS: NavGroup[] = [
   { group: "Overview", items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard, for: ALL }] },
+  // The Super Admin's Action Queue and organisation registry (both read GET /platform/organisations); "/" is the
+  // Platform Command Center.
+  { group: "Platform administration", items: [
+    { href: "/action-queue", label: "Action Queue", icon: ClipboardCheck, for: PLATFORM },
+    { href: "/organisations", label: "Tenants & Entities", icon: Building2, for: PLATFORM },
+  ] },
   { group: "Regulatory Content", items: [
     { href: "/regulatory", label: "Regulatory Inbox", icon: Inbox, for: CONTENT },
     { href: "/sources", label: "Sources & Provisions", icon: Library, for: CONTENT },
@@ -136,7 +143,7 @@ const DETAIL_PARENT: [RegExp, string][] = [
   [/^\/ipe\/(?!runs$)[^/]+$/, "/ipe/runs"],
 ];
 
-/** Screens reached from the account menu and "Jump to" rather than the sidebar. */
+/** Screens reached from "Jump to" rather than the sidebar (the Design System also from the account menu). */
 const EXTRA = [
   { href: "/admin/dictionary", label: "Controlled Dictionary", group: "Administration & Trust" },
   { href: "/design-system", label: "Design System & UI Kit", group: "Design Governance" },
@@ -144,6 +151,7 @@ const EXTRA = [
   { href: "/design-system/flows", label: "High-Assurance Flows", group: "Design Governance" },
   { href: "/design-system/super-admin", label: "Super Admin Planes", group: "Design Governance" },
   { href: "/design-system/org-workspace", label: "Org Workspace", group: "Design Governance" },
+  { href: "/design-system/brand-kit", label: "Icons & Brand Kit", group: "Design Governance" },
 ];
 
 /** Screens with their own full-page workspace chrome, shown without the application sidebar and header. They still
@@ -151,7 +159,8 @@ const EXTRA = [
 export const isStandalone = (path: string) => path === "/design-system" || path.startsWith("/design-system/");
 
 /** A customer organisation's registry record is platform administration, not part of the Super Admin's own
- *  dashboard: its breadcrumb reads "Platform administration › Organisations › <name>" (the list lives on "/"). */
+ *  dashboard: its breadcrumb reads "Platform administration › Tenants & Entities › <name>" (the list lives on
+ *  "/organisations"). */
 const PLATFORM_DETAIL = /^\/organisations\/[^/]+$/;
 
 export type RouteMeta = { group: string; item: { href: string; label: string }; isDetail: boolean };
@@ -160,7 +169,7 @@ export type RouteMeta = { group: string; item: { href: string; label: string }; 
 export function routeMeta(path: string): RouteMeta | null {
   const extra = EXTRA.find((e) => e.href === path);
   if (extra) return { group: extra.group, item: extra, isDetail: false };
-  if (PLATFORM_DETAIL.test(path)) return { group: "Platform administration", item: { href: "/", label: "Organisations" }, isDetail: true };
+  if (PLATFORM_DETAIL.test(path)) return { group: "Platform administration", item: { href: "/organisations", label: "Tenants & Entities" }, isDetail: true };
   const parent = DETAIL_PARENT.find(([re]) => re.test(path))?.[1];
   const item = parent
     ? ITEMS.find((i) => i.href === parent)

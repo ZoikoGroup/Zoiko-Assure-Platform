@@ -4,10 +4,11 @@ import Link from "next/link";
 import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
-import { ArrowLeft, Building2, Component, Download, Eye, FileText, Image as ImageIcon, LayoutTemplate, Moon, Search, Sun } from "lucide-react";
+import { ArrowLeft, Building2, Component, Download, Eye, FileText, Image as ImageIcon, LayoutTemplate, Search } from "lucide-react";
 import { COLOR_GROUPS, RADII, SHADOWS, SPACING, STATUSES, TYPE_ROLES, statusVars } from "@/lib/design-tokens";
 import { ToastProvider } from "./ds";
 import { Logo } from "./Shell";
+import { ThemeToggle, useTheme } from "./ThemeToggle";
 
 /* The Design Governance workspace: the Unified Design System's own shell. It is built only from the foundation tokens
    (app/design-tokens.css), so it doubles as their reference implementation. It renders without the application's
@@ -19,8 +20,8 @@ const GovernanceCtx = createContext<{ theme: DsTheme; query: string }>({ theme: 
 export const useGovernance = () => useContext(GovernanceCtx);
 
 type Section = { id: string; label: string; icon: LucideIcon; href?: string };
-/* Every section exists except Icons & Brand Kit, which is planned and not a link yet. */
-const SECTIONS: { group: string; items: Section[] }[] = [
+/* The six Design Governance sections, all live. Exported so the Icons & Brand Kit can show this navigation's icons. */
+export const SECTIONS: { group: string; items: Section[] }[] = [
   { group: "Design governance", items: [
     { id: "foundations", label: "Foundations", icon: LayoutTemplate, href: "/design-system" },
     { id: "components", label: "Components", icon: Component, href: "/design-system/components" },
@@ -30,22 +31,19 @@ const SECTIONS: { group: string; items: Section[] }[] = [
     { id: "super-admin", label: "Super Admin Planes", icon: FileText, href: "/design-system/super-admin" },
     { id: "org", label: "Org Workspace", icon: Building2, href: "/design-system/org-workspace" },
   ] },
-  { group: "Assets", items: [{ id: "brand", label: "Icons & Brand Kit", icon: ImageIcon }] },
+  { group: "Assets", items: [{ id: "brand", label: "Icons & Brand Kit", icon: ImageIcon, href: "/design-system/brand-kit" }] },
 ];
 
-const THEME_KEY = "za-ds-theme";
 const CONTROL = "h-10 rounded-control border border-line bg-surface-control/80 text-fg-secondary transition-colors hover:border-line-strong hover:text-fg";
 
 export function GovernanceShell({ active, searchLabel = "Search tokens", children }: { active: string; searchLabel?: string; children: ReactNode }) {
-  const [theme, setTheme] = useState<DsTheme>("dark");
+  // The application theme (data-theme on <html>), shared with every other screen; light until hydration reads it.
+  const theme: DsTheme = useTheme().theme ?? "light";
   const [query, setQuery] = useState("");
   const [mac, setMac] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    try { const t = localStorage.getItem(THEME_KEY); if (t === "light" || t === "dark") setTheme(t); } catch {}
-    setMac(/Mac|iPhone|iPad/.test(navigator.userAgent));
-  }, []);
+  useEffect(() => { setMac(/Mac|iPhone|iPad/.test(navigator.userAgent)); }, []);
   // "/" (when not typing) or ⌘K / Ctrl+K moves focus to the token search.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -60,12 +58,9 @@ export function GovernanceShell({ active, searchLabel = "Search tokens", childre
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
-  const other: DsTheme = theme === "dark" ? "light" : "dark";
-  const toggle = () => { setTheme(other); try { localStorage.setItem(THEME_KEY, other); } catch {} };
-
   return (
     <GovernanceCtx.Provider value={{ theme, query }}>
-      <div data-theme={theme} className="min-h-screen bg-backdrop text-fg">
+      <div className="min-h-screen bg-backdrop text-fg">
         <a href="#main" className="sr-only z-50 rounded-control bg-accent px-3 py-2 text-on-accent focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
         <aside aria-label="Design governance"
           className="fixed inset-y-4 left-4 z-30 hidden w-sidebar flex-col overflow-hidden rounded-panel border border-sidebar-line bg-surface-sidebar/85 shadow-panel backdrop-blur-md lg:flex">
@@ -93,10 +88,7 @@ export function GovernanceShell({ active, searchLabel = "Search tokens", childre
                     className={`${CONTROL} w-full pl-9 pr-12 type-secondary text-fg placeholder:text-fg-muted focus:border-accent focus:outline-none sm:w-64`} />
                   {!query && <kbd aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 rounded-chip border border-line px-1.5 type-code text-fg-muted">{mac ? "⌘K" : "Ctrl K"}</kbd>}
                 </div>
-                <button type="button" onClick={toggle} aria-label={`Switch to ${other} theme`} title={`Switch to ${other} theme`}
-                  className={`${CONTROL} inline-flex w-10 shrink-0 items-center justify-center`}>
-                  {theme === "dark" ? <Sun size={17} aria-hidden /> : <Moon size={17} aria-hidden />}
-                </button>
+                <ThemeToggle className={`${CONTROL} inline-flex w-10 shrink-0 items-center justify-center`} iconSize={17} />
                 <span aria-hidden className="hidden h-6 w-px bg-line sm:block" />
                 <button type="button" onClick={exportTokens} aria-label="Export Library" title="Download every foundation token, in both themes, as JSON"
                   className={`${CONTROL} inline-flex shrink-0 items-center gap-2 px-3 type-secondary font-semibold text-fg sm:px-4`}>
@@ -119,17 +111,17 @@ function Sidebar({ active }: { active: string }) {
   return (
     <>
       <div className="p-sidebar-inset pb-2">
-        <Link href="/" aria-label="Zoiko Assure home" className="inline-flex rounded-card bg-white px-4 py-3 shadow-card">
-          <Logo width={124} />
+        {/* White in both themes: the navy wordmark needs it. */}
+        <Link href="/" aria-label="Zoiko Assure home" className="inline-flex rounded-card bg-[#fff] px-4 py-3 shadow-card">
+          <Logo width={124} onDark={false} />
         </Link>
       </div>
       <nav className="scroll-thin flex-1 overflow-y-auto px-4 pb-4">
         {SECTIONS.map((g) => <SectionGroup key={g.group} group={g.group} items={g.items} active={active} />)}
-        <p className="mt-5 px-3 type-caption text-sidebar-muted">Icons &amp; Brand Kit is a planned design-system task; the other sections are live.</p>
       </nav>
       <div className="border-t border-sidebar-line px-sidebar-inset py-4">
         <div className="flex items-center gap-3">
-          <span aria-hidden className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white type-caption font-bold text-midnight-950">DS</span>
+          <span aria-hidden className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#fff] type-caption font-bold text-midnight-950">DS</span>
           <div className="min-w-0">
             <div className="type-secondary font-medium text-sidebar-strong">System v1.0</div>
             <div className="type-code text-sidebar-muted">ZA-DS-FIG-003</div>

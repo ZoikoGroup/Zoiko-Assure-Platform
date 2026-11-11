@@ -655,7 +655,7 @@ export function Modal({ open, onClose, title, children, size = "md" }: { open: b
   if (!open) return null;
   const w = size === "sm" ? "max-w-md" : size === "lg" ? "max-w-4xl" : "max-w-2xl";
   return (
-    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4 pt-[10vh]" onMouseDown={onClose}>
+    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4 pt-[10vh] dark:bg-scrim" onMouseDown={onClose}>
       <div ref={panel} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
         className={`w-full ${w} rounded-lg border border-slate-200 bg-white shadow-xl focus:outline-none`} onMouseDown={(e) => e.stopPropagation()}>
         <header className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
@@ -675,7 +675,7 @@ export function Drawer({ open, onClose, title, children, side = "right", width =
   useDialog(open, onClose, panel);
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/30" onMouseDown={onClose}>
+    <div className="fixed inset-0 z-50 bg-slate-900/30 dark:bg-scrim" onMouseDown={onClose}>
       <div ref={panel} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onMouseDown={(e) => e.stopPropagation()}
         className={`absolute inset-y-0 ${side === "left" ? "left-0 border-r" : "right-0 border-l"} flex w-full ${width} flex-col border-slate-200 bg-white shadow-xl focus:outline-none`}>
         <header className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3">

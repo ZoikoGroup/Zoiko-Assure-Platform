@@ -306,7 +306,8 @@ How sign-in behaves:
 - Passwords are scrypt-hashed.
 - Five failed attempts lock an account for 15 minutes. A failed sign-in doesn't reveal whether the account exists.
 - **Sign out** revokes the session on the server.
-- **Change password** is in the user menu. It signs out your other sessions.
+- **Changing a password** (`POST /api/auth/password`) needs the current password and signs out your other sessions. The account menu doesn't offer it.
+- An account issued a temporary password (a new organisation administrator, for example) must set a new password before any page opens.
 - Agents and service identities cannot sign in interactively.
 
 ### PostgreSQL in Docker (alternative)

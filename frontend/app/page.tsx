@@ -8,7 +8,7 @@ import { useApi } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { fmtDate } from "@/lib/format";
 import { useCan } from "@/lib/roles";
-import { SuperAdminDashboard } from "@/components/PlatformAdmin";
+import { PlatformCommandCenter } from "@/components/PlatformCommandCenter";
 import SCREEN_ACCESS from "@/lib/screen-access.json";
 import { Badge, EmptyState, ErrorBox, LoadingSkeleton, Notice, PageHeader, usePageTitle } from "@/components/ui";
 
@@ -31,8 +31,9 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 export default function Dashboard() {
   const { me } = useAuth();
   const persona = personaOf(me);
-  // Three home screens: the platform Super Admin's, content staff's workspace, and the Organization Command Center.
-  if (me && persona === "platform") return <SuperAdminDashboard />;
+  // Three home screens: the platform Super Admin's Platform Command Center (its organisation registry is Tenants &
+  // Entities, /organisations), content staff's workspace, and the Organization Command Center.
+  if (me && persona === "platform") return <PlatformCommandCenter />;
   if (me && persona !== "tenant") return <ContentOpsHome name={me.display_name} />;
   return <CommandCenter />;
 }
