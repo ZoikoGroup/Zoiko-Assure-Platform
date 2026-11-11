@@ -10,7 +10,7 @@ os.environ["ZA_DATA_DIR"] = _tmp
 os.environ["ZA_DEV_IDENTITY_HEADER"] = "1"  # tests simulate agents/services via the dev header
 os.environ["ZA_ENVIRONMENT"] = "test"       # the only environments where that header is allowed (app/security.py)
 os.environ["ZA_SKIP_DOTENV"] = "1"          # never touch the real database configured in backend/.env
-os.environ.pop("REDIS_URL", None)           # nor a real Redis: tests that need one set their own (test_redis_client.py)
+os.environ.pop("REDIS_URL", None)           # nor a real Redis: tests that need one set their own (test_redis_cache.py)
 os.environ["ZA_DEMO_MODE"] = "1"            # tests run on the synthetic Customer Zero fixture
 os.environ["ZA_DEMO_PASSWORD"] = secrets.token_urlsafe(18)  # per-session test password; none is built into the app
 # Default: throwaway SQLite. To run against PostgreSQL + RLS, point these at a DISPOSABLE test database:

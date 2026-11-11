@@ -20,6 +20,7 @@ import pytest
 from conftest import H
 
 SECRET = "s3cr3t-Pa55word"
+USER = "za-test-user"  # a non-default user name: it must never reach a log, an error or /api/health either
 
 
 class MemoryRedis:
@@ -104,24 +105,33 @@ def no_redis():
     ("redis://default:" + SECRET + "@redis.example", "no port"),
     ("redis://default:" + SECRET + "@redis.example:notaport", "not a valid URL"),
     ("redis://default:" + SECRET + "@redis.example:6379/abc", "database must be a number"),
+    # No "//": urlsplit reads the user name as the scheme and the password as the path; neither may be repeated.
+    (USER + ":" + SECRET + "@redis.example:6379", "redis:// or rediss://"),
+    (USER + ":" + SECRET + "@redis.example:6379/0", "redis:// or rediss://"),
+    ("redis:" + USER + ":" + SECRET + "@redis.example:6379", "no host"),
 ])
 def test_malformed_configuration_is_refused_without_leaking_the_credential(monkeypatch, caplog, url, problem):
     from app import redis_client
     monkeypatch.setenv("REDIS_URL", url)
+    monkeypatch.delenv("REDIS_REQUIRED", raising=False)
     with pytest.raises(redis_client.RedisConfigError) as e:
         redis_client.load_settings()
-    assert problem in str(e.value) and SECRET not in str(e.value)
+    assert problem in str(e.value) and SECRET not in str(e.value) and USER not in str(e.value)
     mgr = redis_client.RedisManager()
     with caplog.at_level(logging.DEBUG):
         assert mgr.start() == redis_client.MISCONFIGURED
-    assert mgr.client is None and SECRET not in caplog.text
+    assert mgr.client is None and SECRET not in caplog.text and USER not in caplog.text
     status = mgr.status()
     assert status["state"] == "misconfigured" and SECRET not in json.dumps(status) and "redis.example" not in json.dumps(status)
 
 
-def test_a_missing_url_disables_redis_and_connects_to_nothing(monkeypatch):
+@pytest.mark.parametrize("value", [None, "", "   "])  # unset, empty, whitespace only
+def test_a_missing_url_disables_redis_and_connects_to_nothing(monkeypatch, value):
     from app import redis_client
-    monkeypatch.delenv("REDIS_URL", raising=False)
+    if value is None:
+        monkeypatch.delenv("REDIS_URL", raising=False)
+    else:
+        monkeypatch.setenv("REDIS_URL", value)
     mgr = redis_client.RedisManager()
     assert redis_client.load_settings() is None
     assert mgr.start() == redis_client.DISABLED and mgr.client is None  # never a default localhost connection
@@ -162,14 +172,114 @@ def test_tls_follows_the_url_or_the_explicit_flag(monkeypatch, url, tls_flag, tl
     assert "CHANGE_ME" not in s.safe_url and s.safe_url.startswith(url.split("://")[0] + "://***@redis.example:6379")
 
 
-@pytest.mark.parametrize("name, value", [("REDIS_TLS", "maybe"), ("REDIS_SOCKET_TIMEOUT_SECONDS", "0"),
-                                         ("REDIS_CONNECT_TIMEOUT_SECONDS", "abc"), ("REDIS_MAX_CONNECTIONS", "0")])
+@pytest.mark.parametrize("name, value", [
+    ("REDIS_TLS", "maybe"), ("REDIS_REQUIRED", "maybe"),
+    ("REDIS_SOCKET_TIMEOUT_SECONDS", "0"), ("REDIS_SOCKET_TIMEOUT_SECONDS", "61"),
+    ("REDIS_CONNECT_TIMEOUT_SECONDS", "abc"), ("REDIS_CONNECT_TIMEOUT_SECONDS", "-1"),
+    ("REDIS_MAX_CONNECTIONS", "0"), ("REDIS_MAX_CONNECTIONS", "1001"), ("REDIS_MAX_CONNECTIONS", "2.5"),
+    ("REDIS_HEALTH_CHECK_INTERVAL", "-1"), ("REDIS_HEALTH_CHECK_INTERVAL", "3601"),
+    ("REDIS_HEALTH_CHECK_INTERVAL", "often"), ("REDIS_HEALTH_CHECK_INTERVAL", "1.5"),
+])
 def test_invalid_tuning_values_are_refused(monkeypatch, name, value):
     from app import redis_client
     monkeypatch.setenv("REDIS_URL", "redis://default:CHANGE_ME@redis.example:6379")
+    if name != "REDIS_REQUIRED":
+        monkeypatch.delenv("REDIS_REQUIRED", raising=False)
     monkeypatch.setenv(name, value)
-    with pytest.raises(redis_client.RedisConfigError):
+    with pytest.raises(redis_client.RedisConfigError) as e:
         redis_client.load_settings()
+    assert name in str(e.value)  # the operator is told which setting to fix
+    mgr = redis_client.RedisManager()
+    assert mgr.start() == redis_client.MISCONFIGURED and mgr.client is None  # a configuration error, not an outage
+
+
+def test_valid_tuning_values_reach_the_shared_pool(monkeypatch):
+    """Every REDIS_* tuning value is applied to the pool redis-py builds (the defaults are asserted further down)."""
+    import redis
+    from app import redis_client
+    monkeypatch.setattr(redis.Redis, "ping", lambda self, **kw: True)  # no server needed: pool and client are real
+    monkeypatch.setenv("REDIS_URL", "redis://default:CHANGE_ME@redis.example:6379/2")
+    monkeypatch.delenv("REDIS_TLS", raising=False)
+    for name, value in (("REDIS_CONNECT_TIMEOUT_SECONDS", "3.5"), ("REDIS_SOCKET_TIMEOUT_SECONDS", "4"),
+                        ("REDIS_HEALTH_CHECK_INTERVAL", "0"), ("REDIS_MAX_CONNECTIONS", "7")):
+        monkeypatch.setenv(name, value)
+    mgr = redis_client.RedisManager()
+    try:
+        assert mgr.start() == redis_client.HEALTHY
+        pool = mgr._pool
+        kw = pool.connection_kwargs
+        assert (kw["socket_connect_timeout"], kw["socket_timeout"], kw["health_check_interval"]) == (3.5, 4.0, 0)
+        assert pool.max_connections == 7 and kw["db"] == 2
+    finally:
+        mgr.close()
+
+
+@pytest.mark.parametrize("query, problem", [
+    ("ssl_cert_reqs=none", "TLS options"), ("ssl_cert_reqs=optional", "TLS options"),
+    ("ssl_check_hostname=false", "TLS options"), ("ssl_ca_certs=ca.pem", "TLS options"),
+    ("socket_timeout=1&ssl_cert_reqs=none", "TLS options"),
+    ("no_such_option=1", "not supported"), ("socket_timeout=1", "not supported"), ("db=3", "not supported"),
+])
+def test_url_query_options_are_refused_before_any_connection(monkeypatch, caplog, query, problem):
+    """redis-py lets REDIS_URL query options override the keyword arguments the manager passes, so ssl_cert_reqs=none
+    or ssl_check_hostname=false would silently switch verification off, and an unknown option would only fail at the
+    first connection, looking like an outage. Any query option is a configuration error, found before connecting."""
+    import redis
+    from app import redis_client
+    pings = []
+    monkeypatch.setattr(redis.Redis, "ping", lambda self, **kw: pings.append(self) or True)
+    monkeypatch.setenv("REDIS_URL", f"rediss://{USER}:{SECRET}@redis.example:6380/0?{query}")
+    monkeypatch.delenv("REDIS_REQUIRED", raising=False)
+    with pytest.raises(redis_client.RedisConfigError) as e:
+        redis_client.load_settings()
+    assert problem in str(e.value)
+    mgr = redis_client.RedisManager()
+    with caplog.at_level(logging.DEBUG):
+        assert mgr.start() == redis_client.MISCONFIGURED
+    status = mgr.status()
+    assert mgr.client is None and pings == [] and status["state"] == "misconfigured" and "tls" not in status
+    for text in (str(e.value), caplog.text, json.dumps(status)):
+        assert SECRET not in text and USER not in text
+    monkeypatch.setenv("REDIS_REQUIRED", "true")  # required: the API refuses to start, still without the credential
+    with pytest.raises(redis_client.RedisConfigError) as e:
+        redis_client.RedisManager().start()
+    assert SECRET not in str(e.value) and USER not in str(e.value)
+
+
+def test_an_unrecognised_query_key_is_never_repeated(monkeypatch):
+    """A key outside redis-py's option names (text pasted into the wrong part of the URL) is not echoed."""
+    from app import redis_client
+    monkeypatch.setenv("REDIS_URL", f"rediss://default:CHANGE_ME@redis.example:6380/0?{SECRET}")
+    with pytest.raises(redis_client.RedisConfigError) as e:
+        redis_client.load_settings()
+    assert SECRET not in str(e.value) and "unrecognised option" in str(e.value)
+
+
+@pytest.mark.parametrize("url, tls_flag", [
+    ("rediss://default:CHANGE_ME@redis.example:6380/0", None),
+    ("redis://default:CHANGE_ME@redis.example:6379/0", "true"),  # REDIS_TLS=true on a redis:// URL
+])
+def test_tls_connections_verify_the_certificate_and_the_host_name(monkeypatch, url, tls_flag):
+    """Read from the connection redis-py would open (constructed, never connected): the certificate chain and the host
+    name are both verified, whatever the installed redis-py's own defaults are."""
+    import ssl
+    import redis
+    from app import redis_client
+    monkeypatch.setattr(redis.Redis, "ping", lambda self, **kw: True)
+    monkeypatch.setenv("REDIS_URL", url)
+    if tls_flag is None:
+        monkeypatch.delenv("REDIS_TLS", raising=False)
+    else:
+        monkeypatch.setenv("REDIS_TLS", tls_flag)
+    mgr = redis_client.RedisManager()
+    try:
+        assert mgr.start() == redis_client.HEALTHY and mgr.status()["tls"] is True
+        pool = mgr._pool
+        conn = pool.connection_class(**pool.connection_kwargs)
+        assert isinstance(conn, redis.SSLConnection)
+        assert conn.cert_reqs == ssl.CERT_REQUIRED and conn.check_hostname is True
+    finally:
+        mgr.close()
 
 
 # ------------------------------------------------------------------------------------------------ connection lifecycle
@@ -180,15 +290,17 @@ def test_start_builds_one_shared_pool_verifies_it_and_close_releases_it(monkeypa
     made = []
 
     class Pool:
-        def __init__(self):
-            self.disconnected = 0
+        connection_class = redis.SSLConnection  # what from_url picks for rediss://
+
+        def __init__(self, kw):
+            self.disconnected, self.connection_kwargs = 0, kw  # the effective settings the manager checks
 
         def disconnect(self, *a, **k):
             self.disconnected += 1
 
     def from_url(url, **kw):
         made.append((url, kw))
-        return Pool()
+        return Pool(kw)
     monkeypatch.setattr(redis.ConnectionPool, "from_url", staticmethod(from_url))
     monkeypatch.setattr(redis, "Redis", MemoryRedis)  # the client built on that pool
     monkeypatch.setenv("REDIS_URL", f"redis://default:{SECRET}@redis.example:6379/0")
@@ -198,7 +310,8 @@ def test_start_builds_one_shared_pool_verifies_it_and_close_releases_it(monkeypa
     [(url, kw)] = made
     assert url.startswith("rediss://")  # TLS, as `redis-cli --tls`
     assert kw["socket_connect_timeout"] == 2.0 and kw["socket_timeout"] == 2.0 and kw["retry_on_timeout"] is True
-    assert kw["ssl_cert_reqs"] == "required" and kw["max_connections"] == 20
+    assert kw["ssl_cert_reqs"] == "required" and kw["ssl_check_hostname"] is True and kw["max_connections"] == 20
+    assert kw["health_check_interval"] == 30
     client = mgr.client
     assert client.set("probe", "1") and mgr.client is client  # one shared client, not one per request
     pool = mgr._pool
@@ -224,6 +337,69 @@ def test_an_unreachable_server_is_reported_and_does_not_stop_the_api(monkeypatch
         redis_client.RedisManager().start()
     assert SECRET not in str(e.value)
     mgr.close()
+
+
+@pytest.mark.parametrize("error", ["AuthenticationError", "TimeoutError", "ConnectionError"])
+def test_a_failed_start_up_ping_is_named_by_its_class_without_the_credential(monkeypatch, caplog, error):
+    """Wrong credentials, a timeout or a refused connection at start-up, through a real pool: the API still starts
+    (REDIS_REQUIRED unset), the outage is reported by exception class only, and neither the password nor the user name
+    reaches the log, an error or /api/health, even when the server's own message quotes them."""
+    import redis
+    from app import redis_client
+    exc = getattr(redis.exceptions, error)
+
+    def fail(self, **kw):
+        raise exc(f"WRONGPASS {USER}:{SECRET} invalid username-password pair or user is disabled.")
+    monkeypatch.setattr(redis.Redis, "ping", fail)
+    monkeypatch.setenv("REDIS_URL", f"rediss://{USER}:{SECRET}@redis.example:6380/0")
+    monkeypatch.delenv("REDIS_REQUIRED", raising=False)
+    mgr = redis_client.RedisManager()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            assert mgr.start() == redis_client.UNAVAILABLE
+        status = mgr.status()
+        assert status == {"state": "unavailable", "required": False, "tls": True, "reason": error}
+        for text in (caplog.text, json.dumps(status)):
+            assert SECRET not in text and USER not in text
+    finally:
+        mgr.close()
+    monkeypatch.setenv("REDIS_REQUIRED", "true")
+    with pytest.raises(RuntimeError) as e:
+        redis_client.RedisManager().start()
+    assert SECRET not in str(e.value) and USER not in str(e.value)
+
+
+@pytest.mark.parametrize("tamper", ["certificate check off", "host-name check off", "plain connection"])
+def test_a_pool_whose_effective_tls_settings_do_not_verify_is_refused(monkeypatch, caplog, tamper):
+    """Defence in depth: were a redis-py release ever to drop or override the verification arguments, the manager reads
+    the pool's effective settings and reports misconfigured, never a healthy TLS connection, without connecting."""
+    import redis
+    from app import redis_client
+    real_from_url = redis.ConnectionPool.from_url
+
+    def from_url(url, **kw):
+        pool = real_from_url(url, **kw)
+        if tamper == "certificate check off":
+            pool.connection_kwargs["ssl_cert_reqs"] = "none"
+        elif tamper == "host-name check off":
+            pool.connection_kwargs["ssl_check_hostname"] = False
+        else:
+            pool.connection_class = redis.Connection
+        return pool
+    pings = []
+    monkeypatch.setattr(redis.ConnectionPool, "from_url", staticmethod(from_url))
+    monkeypatch.setattr(redis.Redis, "ping", lambda self, **kw: pings.append(self) or True)
+    monkeypatch.setenv("REDIS_URL", f"rediss://{USER}:{SECRET}@redis.example:6380/0")
+    monkeypatch.delenv("REDIS_REQUIRED", raising=False)
+    mgr = redis_client.RedisManager()
+    with caplog.at_level(logging.DEBUG):
+        assert mgr.start() == redis_client.MISCONFIGURED
+    assert mgr.client is None and pings == [] and mgr.status()["state"] == "misconfigured"
+    assert SECRET not in caplog.text and USER not in caplog.text
+    monkeypatch.setenv("REDIS_REQUIRED", "true")
+    with pytest.raises(RuntimeError) as e:
+        redis_client.RedisManager().start()
+    assert SECRET not in str(e.value) and USER not in str(e.value)
 
 
 # ------------------------------------------------------------------------------------------------ cache operations
@@ -390,5 +566,37 @@ def test_health_distinguishes_application_postgresql_and_redis(client, monkeypat
         r = client.get("/api/health")
         assert r.status_code == 503 and r.json()["status"] == "unavailable"
         assert "test.invalid" not in r.text
+    finally:
+        redis_client.manager.close()
+
+
+# ------------------------------------------------------------------------------------------------ API lifespan
+@pytest.mark.parametrize("up", [True, False], ids=["redis-up", "redis-down"])
+def test_the_api_lifespan_starts_and_closes_the_shared_pool(client, monkeypatch, up):
+    """app/main.py: start-up builds the pool and PINGs it once when REDIS_URL is set, and still starts during an outage
+    (REDIS_REQUIRED unset; reported as degraded); shutdown closes the pool. No credential reaches /api/health."""
+    import redis
+    from fastapi.testclient import TestClient
+    from app import redis_client
+    from app.main import app
+    pings = []
+
+    def ping(self, **kw):
+        pings.append(self)
+        if not up:
+            raise redis.exceptions.ConnectionError("connection refused")
+        return True
+    monkeypatch.setattr(redis.Redis, "ping", ping)
+    monkeypatch.setenv("REDIS_URL", f"rediss://{USER}:{SECRET}@redis.example:6380/0")
+    monkeypatch.delenv("REDIS_REQUIRED", raising=False)
+    redis_client.manager.close()
+    try:
+        with TestClient(app) as c:
+            assert len(pings) == 1 and redis_client.manager.client is not None  # one PING at start-up, one shared client
+            r = c.get("/api/health")
+            assert r.status_code == 200 and r.json()["status"] == ("ok" if up else "degraded")
+            assert r.json()["components"]["redis"]["state"] == ("healthy" if up else "unavailable")
+            assert SECRET not in r.text and USER not in r.text
+        assert redis_client.manager.client is None and redis_client.manager.state == redis_client.DISABLED  # closed
     finally:
         redis_client.manager.close()
