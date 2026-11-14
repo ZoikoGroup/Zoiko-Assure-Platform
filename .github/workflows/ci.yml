@@ -378,6 +378,41 @@ jobs:
           --require test_rule_limit_validation_parity=30
           --require test_requirement_supersession_content=5
           --require test_snapshot_engine_version=2
+          --require test_source_mapping_grounding=11
+          --require test_regulatory_obligation_traceability=13
+          --require test_control_assurance_provenance=17
+          --require test_dossier_governance_history=5
+          --require test_obligation_issue_concurrency=7
+          --require test_occurrence_governance=7
+          --require test_constituent_control_issues=6
+          --require test_catalog_versioning_integrity=5
+          --require test_rule_effective_selection=7
+          --require test_rule_publication_atomicity=7
+          --require test_api_persistence_boundaries=9
+          --require test_fact_input_integrity=7
+          --require test_evaluation_replay_guards=3
+          --require test_evaluation_key_compliance=10
+          --require test_evaluation_atomicity=3
+          --require test_shadow_publication_integrity=15
+          --require test_rule_runtime_shadow_coverage=10
+          --require test_rule_golden_vector_integrity=38
+          --require test_decimal_fact_integrity=40
+          --require test_inline_set_literal_validation=46
+          --require test_rule_runtime_invariant_validation=29
+          --require test_evaluator_build_replay_governance=8
+          --require test_decision_table_semantic_duplicates=16
+          --require test_raw_ast_decision_table_duplicates=26
+          --require test_decimal_canonicalization_guard=33
+          --require test_date_timestamp_input_integrity=17
+          --require test_effective_date_utc=31
+          --require test_effective_date_utc_consistency=29
+          --require test_legal_date_input_compatibility=56
+          --require test_temporal_failure_paths=10
+          --require test_obligation_transition_integrity=10
+          --require test_attestation_api_contract=7
+          --require test_idempotency_replay_integrity=10
+          --require test_regulatory_obligation_chain=6
+          --require test_rule_supersession_adoption=6
           --redact-env ZA_TEST_DATABASE_URL
           --redact-env ZA_TEST_DATABASE_ADMIN_URL
           --summary-json "$RUNNER_TEMP/reports/backend-postgres-summary.json"

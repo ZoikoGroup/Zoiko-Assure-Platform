@@ -47,6 +47,18 @@ def _table(rows, conds=1, tid="dt"):
             "children": [_row(f"{tid}r{i}", conds) for i in range(rows)]}
 
 
+def _distinct_rows_table(rows, tid="dt"):
+    """The same table shape with rows that differ (row i: f.e = "V<i>"), so the row limit is measured on a table that is
+    otherwise valid: rows of one identical condition are duplicate rows (RUL_DECISION_DUPLICATE_ROW)."""
+    return {"node_type": "ANY", "node_id": tid, "decision_table": True, "source_mappings": [f"sm_{tid}"],
+            "children": [{"node_type": "ALL", "node_id": f"row_{tid}r{i}", "row_id": f"{tid}r{i}",
+                          "source_mappings": [f"sm_{tid}r{i}"], "children": [
+                              {"node_type": "PREDICATE", "node_id": f"{tid}r{i}_c", "operator": "EQ", "args": [
+                                  {"node_type": "FACT_REF", "node_id": f"{tid}r{i}_f", "fact": "f.e"},
+                                  {"node_type": "CONST", "node_id": f"{tid}r{i}_v", "type": "ENUM", "value": f"V{i}"}]}]}
+                         for i in range(rows)]}
+
+
 def _nested(node):
     """``node`` two levels down inside an ordinary expression."""
     return {"node_type": "ALL", "node_id": "root", "source_mappings": ["sm_root"], "children": [
@@ -86,7 +98,7 @@ def _mappings(k):
 
 
 BUILD = {"max_depth": _depth, "max_nodes": _nodes, "max_inline_set": _inline, "max_source_mappings_per_node": _mappings,
-         "max_table_rows": lambda k: _table(k), "max_conditions_per_row": lambda k: _table(1, k)}
+         "max_table_rows": lambda k: _distinct_rows_table(k), "max_conditions_per_row": lambda k: _table(1, k)}
 
 
 def _only(monkeypatch, limit):

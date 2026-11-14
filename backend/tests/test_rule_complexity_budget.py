@@ -206,6 +206,10 @@ def test_golden_vectors_report_the_limit_as_an_error_never_an_outcome():
 
 
 # ================================================================================================ API and database
+ENTITY_TYPES = ["CREDIT_INSTITUTION", "PAYMENT_INSTITUTION", "E_MONEY_INSTITUTION", "INVESTMENT_FIRM", "ICT_THIRD_PARTY",
+                "NONE"]  # the seeded entity.financial_entity_type domain
+
+
 def _ast(tag: str, *, nest: int = 0, extra: int = 0, root_mappings: int = 1, inline: int = 0) -> dict:
     def pred(nid, fact, typ, value, op="EQ"):
         return {"node_type": "PREDICATE", "node_id": f"{tag}_{nid}", "operator": op, "source_mappings": [f"sm_{tag}_{nid}"],
@@ -217,9 +221,8 @@ def _ast(tag: str, *, nest: int = 0, extra: int = 0, root_mappings: int = 1, inl
                                                                                    "BOOLEAN", True), inner]}
     kids = [pred("a", "entity.established_in_eu", "BOOLEAN", True), inner]
     kids += [pred(f"x{i}", "entity.established_in_eu", "BOOLEAN", True) for i in range(extra)]
-    if inline:
-        kids.append(pred("in", "entity.financial_entity_type", "SET<ENUM>",
-                         ["CREDIT_INSTITUTION"] + [f"FILLER_{i}" for i in range(inline - 1)], op="IN"))
+    if inline:  # members of the fact's ENUM domain (RUL §04; an inline set's members are validated against it)
+        kids.append(pred("in", "entity.financial_entity_type", "SET<ENUM>", ENTITY_TYPES[:inline], op="IN"))
     return {"node_type": "ALL", "node_id": f"{tag}_root", "children": kids,
             "source_mappings": [f"sm_{tag}_root"] + [f"sm_{tag}_root{i}" for i in range(1, root_mappings)]}
 
@@ -500,7 +503,9 @@ def test_rules_within_the_limits_behave_as_before(client, world):
     odef = _definition()
     _publish(client, odef, nest=2, extra=1, root_mappings=2, inline=3)
     sid = _subject(client, "normal")
-    a, b = _evaluate(client, sid, odef), _evaluate(client, sid, odef)
+    a = _evaluate(client, sid, odef)
+    # Identical under ZA-APP-001 §06 (the same exact effective_at and record cutoff): collapses to one evaluation.
+    b = _evaluate(client, sid, odef, effective_at=a.json()["effective_at"], record_cutoff_seq=a.json()["record_cutoff_seq"])
     assert a.status_code == b.status_code == 200 and a.json()["outcome"] == "APPLIES"
     assert a.json()["evaluation_id"] == b.json()["evaluation_id"]
 
@@ -526,7 +531,7 @@ def pg(world):
     return True
 
 
-def _engine_evaluate(sid, odef_id, start: threading.Barrier):
+def _engine_evaluate(sid, odef_id, start: threading.Barrier, at=None, cutoff=None):
     from app.db import SessionLocal, set_principal
     from app.engines import applicability as appl
     from app.models import ObligationDefinition, Subject
@@ -534,8 +539,8 @@ def _engine_evaluate(sid, odef_id, start: threading.Barrier):
         set_principal(db, TEN, CCO)
         start.wait(30)
         ev = appl.evaluate(db, tenant_id=TEN, subject=db.get(Subject, sid), odef=db.get(ObligationDefinition, odef_id),
-                           effective_at=datetime.now(timezone.utc), record_cutoff_seq=None, trigger="EXPLICIT_REQUEST",
-                           actor_id=CCO)
+                           effective_at=at or datetime.now(timezone.utc), record_cutoff_seq=cutoff,
+                           trigger="EXPLICIT_REQUEST", actor_id=CCO)
         db.commit()
         return ev.evaluation_id
 
@@ -553,10 +558,17 @@ def test_concurrent_evaluations_refuse_the_over_limit_rule_and_collapse_the_othe
     assert _measure(rv_big)["max_nodes"] > rules.LIMITS["max_nodes"]
     start = threading.Barrier(6)
     out: dict = {}
+    # One shared instant and record cutoff: the three "small" requests are then identical under ZA-APP-001 §06 and
+    # collapse to one evaluation (APP-REQ-016).
+    from app.db import AdminSession
+    from app.platform import current_watermark
+    with AdminSession() as db:
+        cutoff = current_watermark(db)["record_seq"]
+    at = datetime.now(timezone.utc)
 
     def run(name, odef):
         try:
-            out[name] = ("ok", _engine_evaluate(sid, odef, start))
+            out[name] = ("ok", _engine_evaluate(sid, odef, start, at, cutoff))
         except HTTPException as e:
             out[name] = (e.status_code, e.detail)
         except Exception as e:  # noqa: BLE001 - reported by the assertions

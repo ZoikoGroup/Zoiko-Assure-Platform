@@ -37,6 +37,11 @@ def _current_obl(db, tenant, lineage) -> ObligationInstance:
     return o
 
 
+def _missing(id_field: str, value: str | None, *fields: str) -> dict:
+    """A referenced record that cannot be found: its ID, the display fields as null and ``missing: true``."""
+    return {id_field: value, **dict.fromkeys(fields), "missing": True}
+
+
 def _lineage_entity(db, tenant, lineage) -> str | None:
     o = _find_obl(db, tenant, lineage) if lineage else None
     return o.entity_id if o else None
@@ -66,12 +71,21 @@ def obligations(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
                                                              ObligationInstance.record_to_seq.is_(None))).scalars():
         d = to_dict(o)
         od = ctx.db.get(ObligationDefinition, o.obligation_definition_id)
-        d["definition"] = {"key": od.key, "title": od.title, "schedule_kind": od.schedule_kind}
-        d["subject"] = to_dict(ctx.db.get(Subject, o.subject_id))
-        snap = ctx.db.execute(select(AssuranceSnapshot).where(AssuranceSnapshot.obligation_lineage_id == o.lineage_id)
-                              .order_by(AssuranceSnapshot.created_at.desc())).scalars().first()
+        subject = ctx.db.get(Subject, o.subject_id)
+        # Referenced by ID only (no foreign key from tenant records to the catalogue): a definition or subject that
+        # cannot be found is reported as missing, never a failure of the whole register.
+        d["definition"] = ({"key": od.key, "title": od.title, "schedule_kind": od.schedule_kind} if od else
+                           _missing("obligation_definition_id", o.obligation_definition_id, "key", "title", "schedule_kind"))
+        d["subject"] = to_dict(subject) if subject else _missing("subject_id", o.subject_id, "display_name")
+        # Scoped to the caller's organisation in the query itself, as every other read here, not only by row-level
+        # security (which the SQLite runtime does not have).
+        snap = ctx.db.execute(select(AssuranceSnapshot).where(AssuranceSnapshot.tenant_id == ctx.tenant,
+                                                              AssuranceSnapshot.obligation_lineage_id == o.lineage_id)
+                              .order_by(AssuranceSnapshot.created_at.desc(), AssuranceSnapshot.snapshot_id.desc())
+                              ).scalars().first()
         d["latest_snapshot"] = {k: v for k, v in to_dict(snap).items() if k not in ("segments", "dependency_manifest")} if snap else None
-        d["open_exceptions"] = ctx.db.query(ExceptionRecord).filter(ExceptionRecord.target_id == o.lineage_id,
+        d["open_exceptions"] = ctx.db.query(ExceptionRecord).filter(ExceptionRecord.tenant_id == ctx.tenant,
+                                                                     ExceptionRecord.target_id == o.lineage_id,
                                                                      ExceptionRecord.state == "APPROVED").count()
         out.append(d)
     return out
@@ -98,6 +112,9 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
     od = ctx.db.get(ObligationDefinition, o.obligation_definition_id)
     det = ctx.db.get(ApplicabilityDetermination, o.determination_revision_id)
     att = ctx.db.get(AdoptionAttestation, o.attestation_id)
+    # Only this organisation's records are shown; another's is treated as not found (DOM-INV-11), as on PostgreSQL.
+    det = det if det is not None and det.tenant_id == ctx.tenant else None
+    att = att if att is not None and att.tenant_id == ctx.tenant else None
     exprs = satisfaction.versions(ctx.db, ctx.tenant, lineage)
     if as_of_record_seq is not None:
         exprs = [e for e in exprs if e.record_seq <= as_of_record_seq]
@@ -107,7 +124,7 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
     subject = ctx.db.get(Subject, o.subject_id)
     controls = []
     now = datetime.now(timezone.utc)
-    for k in sorted(keys):
+    for k in sorted(keys) if subject else []:  # without its subject no implementation can be resolved
         ci = asr._resolve_impl(ctx.db, ctx.tenant, k, subject, now - timedelta(days=1), now,
                                as_of_record_seq if as_of_record_seq is not None else 10**15)
         cd = ctx.db.execute(select(ControlDefinition).where(ControlDefinition.key == k)).scalars().first()
@@ -125,39 +142,57 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
     if as_of_record_seq is not None:
         snap_q = snap_q.where(AssuranceSnapshot.record_cutoff_seq <= as_of_record_seq)
     by_id = {e.expression_version_id: e for e in satisfaction.versions(ctx.db, ctx.tenant, lineage)}
+    snap_rows = ctx.db.execute(snap_q.order_by(AssuranceSnapshot.created_at.desc(),
+                                               AssuranceSnapshot.snapshot_id.desc())).scalars().all()
+    unplaced = 0
+    if as_of_record_seq is not None:
+        # A snapshot computed later for an earlier cutoff (AS_KNOWN_THEN) was not known at that cutoff: a historical read
+        # lists only snapshots recorded by it (TIM-REQ-005/006). Their record sequence is the one their creation took
+        # (the assurance.snapshot_created event written in the same transaction; the row has no column for it).
+        recorded = _snapshot_record_seqs(ctx.db, ctx.tenant, [s.snapshot_id for s in snap_rows])
+        unplaced = sum(1 for s in snap_rows if s.snapshot_id not in recorded)
+        snap_rows = [s for s in snap_rows if recorded.get(s.snapshot_id, as_of_record_seq + 1) <= as_of_record_seq]
     snapshots = [{**{k: v for k, v in to_dict(s).items() if k != "dependency_manifest"},
-                  "expression_pins": _expression_pins(s, by_id)}
-                 for s in ctx.db.execute(snap_q.order_by(AssuranceSnapshot.created_at.desc())).scalars()]
+                  "expression_pins": _expression_pins(s, by_id)} for s in snap_rows]
 
-    # Records that carry only the sequence at which they were created: a historical read lists those known by the
-    # cutoff, but their state fields are the current ones (no state history is recorded for them yet).
+    # Exceptions, compensations and occurrences: a historical read lists those recorded by the cutoff, with their state
+    # fields as their append-only event history recorded them by then (decision_history.governance_records_at); the
+    # in-place projections are never shown as historical state. The current perspective lists the rows as they are.
     def known(q, model):
         return q.where(model.record_seq <= as_of_record_seq) if as_of_record_seq is not None else q
     exceptions = ctx.db.execute(known(select(ExceptionRecord).where(ExceptionRecord.tenant_id == ctx.tenant,
                                                                     ExceptionRecord.target_id == lineage),
-                                      ExceptionRecord)).scalars()
+                                      ExceptionRecord)).scalars().all()
     compensations = ctx.db.execute(known(select(Compensation).where(Compensation.tenant_id == ctx.tenant,
                                                                     Compensation.obligation_lineage_id == lineage),
-                                         Compensation)).scalars()
+                                         Compensation)).scalars().all()
     occurrences = ctx.db.execute(known(select(ObligationOccurrence).where(
         ObligationOccurrence.tenant_id == ctx.tenant, ObligationOccurrence.obligation_lineage_id == lineage),
-        ObligationOccurrence).order_by(ObligationOccurrence.due_at)).scalars()
-    provenance = _provenance(ctx, det, as_of_record_seq)
+        ObligationOccurrence).order_by(ObligationOccurrence.due_at)).scalars().all()
+    then = decision_history.governance_records_at(
+        ctx.db, ctx.tenant, exceptions=exceptions, compensations=compensations, occurrences=occurrences,
+        as_of=as_of_record_seq) if as_of_record_seq is not None else None
+
+    def at_cutoff(kind: str, key: str, row) -> dict:
+        return {**to_dict(row), **then[kind][getattr(row, key)]} if then is not None else to_dict(row)
+    provenance = _provenance(ctx, det, as_of_record_seq, o=o)
     history = decision_history.obligation_decision_history(ctx.db, ctx.tenant, lineage, as_of_record_seq)
+    issues, unplaced_issues = _issues_as_of(ctx, lineage, as_of_record_seq)
     return {
-        "obligation": as_known(o), "definition": to_dict(od), "subject": to_dict(subject),
+        "obligation": as_known(o),
+        "definition": to_dict(od) if od else _missing("obligation_definition_id", o.obligation_definition_id, "key", "title"),
+        "subject": to_dict(subject) if subject else _missing("subject_id", o.subject_id, "display_name"),
         # In the definition's link order, never the physical row order an UPDATE can change (catalog.definition_provisions).
-        "provisions": [to_dict(p) for p in catalog.definition_provisions(ctx.db, od)],
+        "provisions": [to_dict(p) for p in catalog.definition_provisions(ctx.db, od)] if od else [],
         "determination": as_known(det) if det else None, "attestation": to_dict(att) if att else None,
         "revisions": revisions,
         "expression_versions": [{**to_dict(e), "control_mappings": satisfaction.view(ctx.db, e)["control_mappings"]}
                                 for e in exprs], "controls": controls,
         "snapshots": snapshots,
-        "exceptions": [to_dict(x) for x in exceptions],
-        "compensations": [to_dict(c) for c in compensations],
-        "occurrences": [to_dict(x) for x in occurrences],
-        "issues": [to_dict(i) for i in ctx.db.execute(select(Issue).where(Issue.tenant_id == ctx.tenant,
-                                                                         Issue.dedupe_key.like(f"%{lineage}%"))).scalars()],
+        "exceptions": [at_cutoff("exceptions", "exception_id", x) for x in exceptions],
+        "compensations": [at_cutoff("compensations", "compensation_id", c) for c in compensations],
+        "occurrences": [at_cutoff("occurrences", "occurrence_id", x) for x in occurrences],
+        "issues": issues,
         "regulatory_provenance": provenance,
         "decision_history": history,
         "as_of_record_seq": as_of_record_seq,
@@ -167,10 +202,63 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
                              "perspective": "AS_OF_RECORD_SEQ" if as_of_record_seq is not None else "CURRENT"},
         "controls_valid_time": [now - timedelta(days=1), now],
         "historical_limitations": [
-            "Exceptions, compensations and occurrences are listed if recorded by the cutoff; their state fields are "
-            "current, because no state history is recorded for them.",
-            "Issues are not record-sequenced and are shown as they are now."] if as_of_record_seq is not None else [],
+            "Exceptions, compensations and occurrences are listed if recorded by the cutoff, with state, approver, "
+            "fulfilment, evidence and dispute reconstructed from their recorded events at the cutoff; where that "
+            "history is missing, incomplete (a migration-0008 baseline that cannot be placed at the cutoff) or "
+            "inconsistent, those fields are null and historical_state.problem says why.",
+            "Issues are listed if recorded by the cutoff, with state and owner reconstructed from their recorded "
+            "events at the cutoff; an issue whose history does not prove itself shows state null and its "
+            "historical_state.problem.",
+            *([f"{unplaced} assurance snapshot(s) have no recorded creation sequence and are not listed: whether they "
+               "were known at the cutoff cannot be shown."] if unplaced else []),
+            *([f"{unplaced_issues} issue(s) have no recorded history that places them at or before the cutoff and are "
+               "not listed: whether they existed then, and in which state, cannot be shown."] if unplaced_issues else [])]
+        if as_of_record_seq is not None else [],
     }
+
+
+def _issues_as_of(ctx: Ctx, lineage: str, as_of: int | None) -> tuple[list[dict], int]:
+    """The obligation's issues, current or as known at ``as_of`` (governance.issue_states_at). A historical read lists
+    only issues recorded by the cutoff, with the state and owner recorded by then; later remediation, verification or
+    closure events are not shown (TIM-REQ-006/015). Returns (issues, number not placeable at the cutoff)."""
+    rows = ctx.db.execute(select(Issue).where(Issue.tenant_id == ctx.tenant, Issue.dedupe_key.like(f"%{lineage}%"))
+                          .order_by(Issue.created_at, Issue.issue_id)).scalars().all()
+    # STA §17 constituent control issues of each obligation-level issue (governance.constituent_control_issues: derived
+    # read-only from the issue's source snapshot; nothing is stored).
+    seqs = _snapshot_record_seqs(ctx.db, ctx.tenant, sorted({i.source_ref_id for i in rows
+                                                             if i.source_ref_type == "AssuranceSnapshot"}))
+
+    def with_trace(i: Issue, d: dict) -> dict:
+        trace = governance.constituent_control_issues(ctx.db, ctx.tenant, i, snapshot_seq=seqs.get(i.source_ref_id),
+                                                      as_of=as_of)
+        return {**d, "constituent_control_issues": trace} if trace is not None else d
+    if as_of is None:
+        return [with_trace(i, to_dict(i)) for i in rows], 0
+    hist = governance.issue_states_at(ctx.db, ctx.tenant, rows, as_of)
+    out, unplaced = [], 0
+    for i in rows:
+        h = hist[i.issue_id]
+        if h["known"] is None:
+            unplaced += 1
+        if not h["known"]:
+            continue
+        out.append(with_trace(i, {**to_dict(i), "state": h["state"], "owner_actor_id": h["owner_actor_id"],
+                                  "historical_state": {k: h[k] for k in ("source", "problem", "event_ids", "created_seq")}}))
+    return out, unplaced
+
+
+def _snapshot_record_seqs(db, tenant: str, snapshot_ids: list[str]) -> dict[str, int]:
+    """The record sequence at which each snapshot was persisted: that of its assurance.snapshot_created event, which
+    asr.compute_snapshot writes in the snapshot's own transaction (DAT-REQ-014). A snapshot without one is left out."""
+    from ..models import OutboxEvent
+    if not snapshot_ids:
+        return {}
+    out: dict[str, int] = {}
+    for sid, seq in db.execute(select(OutboxEvent.aggregate_id, OutboxEvent.record_seq).where(
+            OutboxEvent.tenant_id == tenant, OutboxEvent.aggregate_type == "AssuranceSnapshot",
+            OutboxEvent.event_type == "assurance.snapshot_created", OutboxEvent.aggregate_id.in_(snapshot_ids))):
+        out[sid] = min(seq, out.get(sid, seq))
+    return out
 
 
 def _as_known(row: dict, as_of: int | None) -> dict:
@@ -245,12 +333,28 @@ def create_expression_version(lineage: str, body: ExpressionVersionIn,
     return satisfaction.view(ctx.db, e)
 
 
-def _provenance(ctx: Ctx, det, as_of_record_seq: int | None = None) -> dict | None:
+def _provenance(ctx: Ctx, det, as_of_record_seq: int | None = None, *, o: ObligationInstance | None = None) -> dict:
     """Obligation -> adopted determination -> its evaluation -> the exact RuleVersion -> requirement versions,
-    provisions and source snapshots (DOM §1 canonical chain; DOM §16 end-to-end trace)."""
+    provisions and source snapshots (DOM §1 canonical chain; DOM §16 end-to-end trace).
+
+    A link that cannot be followed is reported (INCOMPLETE, with the ID that could not be resolved), never shown as an
+    absent provenance: another organisation's determination or evaluation is treated as not found (DOM-INV-11; row-level
+    security hides it on PostgreSQL). The checks that the decision records agree with each other and with the obligation
+    are decision_history's; this section adds that the evaluation ran a rule of the obligation's own definition."""
+    p = catalog._problem
+    head = [] if o is None or ctx.db.get(ObligationDefinition, o.obligation_definition_id) else [
+        p("OBLIGATION_DEFINITION_MISSING", "INCOMPLETE", obligation_definition_id=o.obligation_definition_id)]
+    if det is not None and det.tenant_id != ctx.tenant:
+        det = None
     ev = ctx.db.get(ApplicabilityEvaluation, det.evaluation_id) if det else None
-    if ev is None or ev.tenant_id != ctx.tenant:
-        return None
+    if ev is not None and ev.tenant_id != ctx.tenant:
+        ev = None
+    if ev is None:
+        det_ref = det.revision_id if det else (o.determination_revision_id if o else None)
+        missing = (p("DETERMINATION_MISSING", "INCOMPLETE", determination_revision_id=det_ref)
+                   if det is None else p("EVALUATION_MISSING", "INCOMPLETE", evaluation_id=det.evaluation_id))
+        return {"binding_basis": "INCOMPLETE", "missing": True, "rule_version_id": None,
+                "determination_revision_id": det_ref, "integrity": catalog.integrity_verdict([*head, missing])}
     rule = ctx.db.get(RuleVersion, ev.rule_version_id)
     evaluation = {"evaluation_id": ev.evaluation_id, "outcome": ev.outcome, "effective_at": ev.effective_at,
                   "record_cutoff_seq": ev.record_cutoff_seq, "input_bundle_hash": ev.input_bundle_hash,
@@ -260,10 +364,9 @@ def _provenance(ctx: Ctx, det, as_of_record_seq: int | None = None) -> dict | No
         det.outcome, det.subject_id, det.obligation_definition_id) else [
         catalog._problem("EVALUATION_MISMATCH", "MISMATCH", evaluation_id=ev.evaluation_id,
                          determination_revision_id=det.revision_id)]
+    chain = [*head, *chain, *catalog.evaluation_rule_problems(ev, rule)]
     if rule is not None:
-        out = catalog.trace_rule_version(ctx.db, rule, as_of_record_seq)
-        if chain:
-            out["integrity"] = catalog.integrity_verdict(out["integrity"]["problems"] + chain)
+        out = catalog.with_problems(catalog.trace_rule_version(ctx.db, rule, as_of_record_seq), chain)
     else:
         out = {"binding_basis": "INCOMPLETE", "rule_version_id": ev.rule_version_id, "missing": True,
                "integrity": catalog.integrity_verdict(
@@ -278,12 +381,25 @@ class PeriodIn(BaseModel):
     period_from: datetime
     period_to: datetime
     record_cutoff_seq: int | None = None
-    perspective: str = "RECONSTRUCTED_NOW"
+    # ZA-TIM-001 §01: "User-facing perspectives are explicit: CURRENT, AS_KNOWN_THEN, RECONSTRUCTED_NOW or
+    # CUSTOM_BITEMPORAL" (persisted on the immutable snapshot, assurance_snapshot.perspective varchar(32)).
+    perspective: Literal["CURRENT", "AS_KNOWN_THEN", "RECONSTRUCTED_NOW", "CUSTOM_BITEMPORAL"] = "RECONSTRUCTED_NOW"
+
+
+def _require_known_cutoff(db, cutoff: int | None) -> None:
+    """TIM-REQ-019: no answer for a record cutoff newer than the data watermark, so a snapshot never pins knowledge that
+    does not exist yet (records written later would otherwise fall inside its cutoff and it could not be reproduced).
+    The same refusal as every historical read and as applicability evaluation (422 RECORD_SEQ_IN_FUTURE)."""
+    now_seq = current_watermark(db)["record_seq"]
+    if cutoff is not None and cutoff > now_seq:
+        raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                  "message": f"record_cutoff_seq is beyond the current record sequence {now_seq}"})
 
 
 @router.post("/obligations/{lineage}/snapshots")
 def create_snapshot(lineage: str, body: PeriodIn, ctx: Ctx = Depends(authorize("request_evaluation", "package"))):
     # A persisted snapshot is an assurance record and can open issues; read-only roles may only preview.
+    _require_known_cutoff(ctx.db, body.record_cutoff_seq)
     persp = body.perspective if body.record_cutoff_seq is None else "AS_KNOWN_THEN"
     r = asr.compute_snapshot(ctx.db, tenant_id=ctx.tenant, obligation_lineage_id=lineage, period_from=body.period_from,
                              period_to=body.period_to, record_cutoff_seq=body.record_cutoff_seq, perspective=persp,
@@ -294,6 +410,7 @@ def create_snapshot(lineage: str, body: PeriodIn, ctx: Ctx = Depends(authorize("
 
 @router.post("/obligations/{lineage}/preview")
 def preview(lineage: str, body: PeriodIn, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBLIGATION))):  # computes and rolls back
+    _require_known_cutoff(ctx.db, body.record_cutoff_seq)
     r = asr.compute_snapshot(ctx.db, tenant_id=ctx.tenant, obligation_lineage_id=lineage, period_from=body.period_from,
                              period_to=body.period_to, record_cutoff_seq=body.record_cutoff_seq,
                              perspective=body.perspective, actor_id=ctx.actor.actor_id, persist=False)
@@ -414,19 +531,27 @@ def control_detail(ci_id: str, days: int = 30, ctx: Ctx = Depends(authorize(*DOS
         ce = asr.evaluate_control(ctx.db, ci, now - timedelta(days=days), now, 10**15, persist=False)
     except asr.AssuranceConfigurationError as e:  # an error object, never a control state (STA §16)
         ce = {"state": None, "configuration_error": e.detail}
-    pols =ctx.db.execute(select(ControlTestPolicy).where(ControlTestPolicy.control_implementation_id == ci_id)).scalars().all()
+    # Every read is scoped to the caller's organisation in the query itself, not only by row-level security (which the
+    # SQLite runtime does not have): a row of another organisation that names this control, policy or test definition
+    # is never listed as part of it.
+    pols = ctx.db.execute(select(ControlTestPolicy).where(ControlTestPolicy.tenant_id == ctx.tenant,
+                                                          ControlTestPolicy.control_implementation_id == ci_id)
+                          .order_by(ControlTestPolicy.version, ControlTestPolicy.policy_version_id)).scalars().all()
     tests = []
     for p in pols:
-        for td in ctx.db.execute(select(TestDefinition).where(TestDefinition.policy_version_id == p.policy_version_id)).scalars():
+        for td in ctx.db.execute(select(TestDefinition).where(TestDefinition.tenant_id == ctx.tenant,
+                                                              TestDefinition.policy_version_id == p.policy_version_id)).scalars():
             t = to_dict(td)
-            t["runs"] = [to_dict(r) for r in ctx.db.execute(select(TestRun).where(TestRun.test_definition_id == td.test_definition_id)
-                                                            .order_by(TestRun.occurred_at.desc())).scalars()]
+            t["runs"] = [to_dict(r) for r in ctx.db.execute(select(TestRun).where(TestRun.tenant_id == ctx.tenant,
+                                                                                  TestRun.test_definition_id == td.test_definition_id)
+                                                            .order_by(TestRun.occurred_at.desc(), TestRun.test_run_id)).scalars()]
             tests.append(t)
     return {"implementation": to_dict(ci), "definition": to_dict(ctx.db.get(ControlDefinition, ci.control_definition_id)),
             "subject": to_dict(ctx.db.get(Subject, ci.subject_id)), "policies": [to_dict(p) for p in pols], "tests": tests,
             "evaluation_preview": ce, "window_days": days,
             "evaluations": [to_dict(e) for e in ctx.db.execute(select(ControlEvaluation).where(
-                ControlEvaluation.control_implementation_id == ci_id).order_by(ControlEvaluation.created_at.desc()).limit(20)).scalars()]}
+                ControlEvaluation.tenant_id == ctx.tenant, ControlEvaluation.control_implementation_id == ci_id)
+                .order_by(ControlEvaluation.created_at.desc(), ControlEvaluation.evaluation_id.desc()).limit(20)).scalars()]}
 
 
 class WindowIn(BaseModel):
@@ -449,9 +574,11 @@ def evaluate_control(ci_id: str, body: WindowIn,
 
 class TestDefIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    name: str
-    source_class: str = "CONNECTOR"
-    cadence_days: int = 30
+    # API-REQ-033: the column limits of assurance_test_definition_version (name varchar(200), source_class varchar(48),
+    # cadence_days a 32-bit integer), so an out-of-range value is a 422 before anything is written.
+    name: str = Field(max_length=200)
+    source_class: str = Field(default="CONNECTOR", max_length=48)
+    cadence_days: int = Field(default=30, ge=-(2 ** 31), le=2 ** 31 - 1)
     required: bool = True
     primary: bool = False
     degrades_on_fail: bool = False
@@ -742,19 +869,26 @@ def close_issue(issue_id: str, body: IssueCloseIn, ctx: Ctx = Depends(authorize(
 
 
 @router.get("/issues/{issue_id}/events")
-def issue_events(issue_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
+def issue_events(issue_id: str, as_of_record_seq: int | None = Query(default=None, ge=0),
+                 ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
+    """The issue's append-only event history. With ``as_of_record_seq`` only the events recorded by that cutoff, so
+    remediation, verification and closure recorded later are not shown (TIM-REQ-006); a cutoff beyond the current
+    record sequence is refused rather than answered from newer knowledge."""
     ctx.scoped(ctx.db.get(Issue, issue_id), "issue")
+    q = select(IssueEvent).where(IssueEvent.tenant_id == ctx.tenant, IssueEvent.issue_id == issue_id)
+    if as_of_record_seq is not None:
+        now_seq = current_watermark(ctx.db)["record_seq"]
+        if as_of_record_seq > now_seq:
+            raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                      "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
+        q = q.where(IssueEvent.record_seq <= as_of_record_seq)
     return [governance.event_view(e) for e in ctx.db.execute(
-        select(IssueEvent).where(
-            IssueEvent.tenant_id == ctx.tenant,
-            IssueEvent.issue_id == issue_id,
-        ).order_by(IssueEvent.record_seq.asc())
-    ).scalars()]
+        q.order_by(IssueEvent.record_seq.asc(), IssueEvent.event_id)).scalars()]
 
 
 class RiskIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    scope_ref: str
+    scope_ref: str = Field(max_length=200)  # API-REQ-033: governance_risk_acceptance_revision.scope_ref varchar(200)
     residual_risk_statement: str
     valid_from: datetime
     valid_to: datetime | None = None

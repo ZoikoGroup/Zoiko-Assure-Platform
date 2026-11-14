@@ -201,7 +201,8 @@ def _current_expression(db: Session, tenant_id: str, lineage_id: str) -> Satisfa
     return db.execute(select(SatisfactionExpressionVersion).where(
         SatisfactionExpressionVersion.tenant_id == tenant_id,
         SatisfactionExpressionVersion.obligation_lineage_id == lineage_id)
-        .order_by(SatisfactionExpressionVersion.version.desc())).scalars().first()
+        .order_by(SatisfactionExpressionVersion.version.desc(),
+                  SatisfactionExpressionVersion.expression_version_id)).scalars().first()
 
 
 def _wrappable(node: dict, key: str) -> bool:
@@ -249,8 +250,16 @@ def compensation_problems(db: Session, *, tenant_id: str, obligation_lineage_id:
     if valid_to is not None and ensure_utc(valid_to) <= ensure_utc(valid_from):
         out.append((422, "COMPENSATION_PERIOD_EMPTY", "valid_to must be later than valid_from (half-open, non-empty)"))
     cur = _current_expression(db, tenant_id, obligation_lineage_id)
+    from .satisfaction import hash_intact
     if cur is None:
         out.append((409, "NO_EXPRESSION_TO_COMPENSATE", "the obligation has no SatisfactionExpressionVersion"))
+    elif not hash_intact(cur):
+        # Approval copies the current AST into version N+1 under a freshly computed hash; an AST altered in place after
+        # release would be re-released as if it had been reviewed (STA-REQ-019/021; STA §19 "Released/adopted version
+        # immutable"). The evaluator refuses such a version (SATISFACTION_EXPRESSION_HASH_MISMATCH); so does this.
+        out.append((409, "SATISFACTION_EXPRESSION_HASH_MISMATCH",
+                    f"the obligation's current SatisfactionExpressionVersion (version {cur.version}) no longer matches "
+                    "its recorded hash"))
     elif not _wrappable(cur.ast, primary_control_key):
         out.append((409, "PRIMARY_CONTROL_NOT_IN_EXPRESSION",
                     f"{primary_control_key} is not a compensable CONTROL leaf of the obligation's current expression "
@@ -409,6 +418,21 @@ UNVERIFIED_CLOSURE_ISSUE_TYPES = frozenset({"INTEGRITY_INCIDENT", "DETERMINATION
 TERMINAL_ISSUE_STATES = frozenset({"CLOSED", "CANCELLED"})
 
 
+def lock_issue_raising(db: Session, tenant_id: str) -> None:
+    """The organisation's issue-raising lock: held by everything that decides whether an active issue covers a new
+    condition, and by everything that can end an issue.
+
+    Holders: raise_control_issue (control-level, per new FAILING / REQUIRES_REVIEW ControlEvaluation),
+    assurance.compute_snapshot for a persisted snapshot that raises an obligation-level issue (_issue_hooks), and
+    close_issue / transition_issue to CLOSED or CANCELLED. STA §17 "Create/link issue unless an existing open issue
+    already covers ...": without the lock a closure or cancellation committing concurrently could leave the new
+    condition linked to an issue that is no longer active, covered by no active issue at all. Always taken first,
+    before any issue row lock and before the record-sequence row (one global lock order). The key name predates
+    obligation-level use and is kept so that every holder shares one lock."""
+    from .locks import xact_lock
+    xact_lock(db, "control-issue", tenant_id)
+
+
 def _lock_issue(db: Session, tenant_id: str, issue_id: str) -> Issue:
     """Row-lock the issue for this transaction and read its committed state, so concurrent transitions, assignments
     and closures of one issue serialise and none is lost (a waiting request sees the other's result)."""
@@ -430,6 +454,8 @@ def transition_issue(
     owner_actor_id: str | None = None,
     _verified_closure: bool = False,
 ) -> tuple[Issue, IssueEvent]:
+    if to_state in TERMINAL_ISSUE_STATES:
+        lock_issue_raising(db, tenant_id)
     i = _lock_issue(db, tenant_id, issue_id)
     if to_state not in ISSUE_FLOW.get(i.state, set()):
         raise HTTPException(409, f"Invalid transition {i.state} -> {to_state}")
@@ -597,6 +623,19 @@ def control_closure_problems(db: Session, issue: Issue, evaluation_id: str) -> l
     return out
 
 
+def control_issue_identity(ci, evaluation) -> tuple[str | None, str | None]:
+    """(issue type, dedupe key) of the control-level condition an evaluation records, or (None, None) when its state
+    raises no control issue. The identity raise_control_issue deduplicates on: issue type + control implementation +
+    subject + the evaluation's own reason codes as the root cause."""
+    import hashlib
+    kind = CONTROL_ISSUE_TYPES.get(evaluation.state)
+    if kind is None:
+        return None, None
+    causes = sorted(set(evaluation.reason_codes or []))
+    cause_id = hashlib.sha256("|".join(causes).encode()).hexdigest()[:16]
+    return kind, f"{kind}:{ci.control_implementation_id}:{ci.subject_id}:{cause_id}"
+
+
 def raise_control_issue(db: Session, *, ci, evaluation) -> Issue | None:
     """Create or link the issue for a newly stored ControlEvaluation (STA §17):
 
@@ -618,12 +657,10 @@ def raise_control_issue(db: Session, *, ci, evaluation) -> Issue | None:
 
     from ..models import Actor, ControlDefinition
     from .locks import xact_lock
-    kind = CONTROL_ISSUE_TYPES.get(evaluation.state)
+    kind, key = control_issue_identity(ci, evaluation)
     if kind is None:
         return None
     causes = sorted(set(evaluation.reason_codes or []))
-    cause_id = hashlib.sha256("|".join(causes).encode()).hexdigest()[:16]
-    key = f"{kind}:{ci.control_implementation_id}:{ci.subject_id}:{cause_id}"
     # One lock per organisation, taken before any record-sequence write, so every path acquires the same locks in the
     # same order (several control issues raised by one snapshot cannot deadlock with another snapshot).
     xact_lock(db, "control-issue", ci.tenant_id)
@@ -668,6 +705,7 @@ def close_issue(db: Session, *, tenant_id: str, actor: Any, issue_id: str, verif
     (control_closure_problems). Closure changes the issue only: no control, obligation, snapshot, test or evidence
     record is written (STA-REQ-023). The verifying result is recorded in the event, the audit record and the catalogued
     ``issue.closed`` outbox event."""
+    lock_issue_raising(db, tenant_id)
     i = _lock_issue(db, tenant_id, issue_id)
     if i.issue_type in SNAPSHOT_VERIFIED_ISSUE_TYPES:
         kind, ref = "AssuranceSnapshot", verification_snapshot_id
@@ -693,6 +731,139 @@ def close_issue(db: Session, *, tenant_id: str, actor: Any, issue_id: str, verif
     emit(db, event_type="issue.closed", aggregate_type="Issue", aggregate_id=issue_id, tenant_id=tenant_id,
          record_seq=ev.record_seq, payload={"issue_id": issue_id, "issue_type": i.issue_type, key: ref})
     return i, ev
+
+
+ISSUE_TRANSITIONS = frozenset((f, t) for f, ts in ISSUE_FLOW.items() for t in ts)
+
+
+def issue_states_at(db: Session, tenant_id: str, issues, cutoff: int) -> dict[str, dict]:
+    """Each issue's workflow state and owner as known at record sequence ``cutoff``, from assurance_issue_event only
+    (append-only, migration 0008), never from the assurance_issue projection, which is updated in place.
+
+    TIM-REQ-006/015 (a historical answer uses the record cutoff, no "latest" joins), STA-REQ-001 (issue state is its own
+    dimension), ZA-GLS-001 §07 workflow. Returns {issue_id: {"known", "state", "owner_actor_id", "source", "problem",
+    "event_ids", "created_seq"}}:
+      * ``known``: whether the issue had been recorded by the cutoff. True when its CREATED event, or any event other
+        than the migration baseline, is at or before the cutoff; False when its first such event is after it; None when
+        that cannot be shown (no events, or only the migration-0008 BASELINE, which 0008 stamped record_seq 0 with the
+        state at migration time, so it places neither the issue's creation nor its state at any cutoff).
+      * ``state`` / ``owner_actor_id``: from the last event recorded by the cutoff, or None with ``problem``:
+        ISSUE_HISTORY_MISSING (known is None), ISSUE_HISTORY_INCOMPLETE (only the baseline is known at the cutoff), or
+        ISSUE_HISTORY_INCONSISTENT (ambiguous order, a first event that is not CREATED/BASELINE, a broken from_state
+        chain, a transition the workflow does not allow, or a projection that disagrees with a fully known history).
+    Nothing is written; the current projection is never substituted for a missing history."""
+    ids = [i.issue_id for i in issues]
+    events = db.execute(select(IssueEvent).where(IssueEvent.tenant_id == tenant_id, IssueEvent.issue_id.in_(ids or ["-"]))
+                        .order_by(IssueEvent.record_seq, IssueEvent.event_id)).scalars().all()
+    out: dict[str, dict] = {}
+    for i in issues:
+        own = [e for e in events if e.issue_id == i.issue_id]
+        recorded = [e for e in own if e.event_type != MIGRATION_BASELINE_EVENT]
+        known = [e for e in own if e.record_seq <= cutoff]
+        res = {"known": None, "state": None, "owner_actor_id": None, "source": None, "problem": None,
+               "event_ids": [e.event_id for e in known],
+               "created_seq": next((e.record_seq for e in own if e.event_type == "CREATED"), None)}
+        out[i.issue_id] = res
+        if not own:
+            res["problem"] = "ISSUE_HISTORY_MISSING"
+            continue
+        if recorded and recorded[0].record_seq <= cutoff:
+            res["known"] = True
+        elif own[0].event_type != MIGRATION_BASELINE_EVENT:
+            res["known"] = False  # its history starts after the cutoff: not yet recorded then
+            continue
+        else:  # only the migration baseline is at or before the cutoff: neither existence nor state is placed there
+            res["problem"] = "ISSUE_HISTORY_INCOMPLETE"
+            continue
+        seqs = [e.record_seq for e in own]
+        ok = len(seqs) == len(set(seqs)) and own[0].from_state is None and \
+            own[0].event_type in ("CREATED", MIGRATION_BASELINE_EVENT) and \
+            all(e.event_type not in ("CREATED", MIGRATION_BASELINE_EVENT) for e in own[1:])
+        for prev, e in zip(own, own[1:]):
+            if e.event_type == "ASSIGNED":
+                ok = ok and e.from_state == e.to_state == prev.to_state
+            else:
+                ok = ok and e.from_state == prev.to_state and (e.from_state, e.to_state) in ISSUE_TRANSITIONS \
+                    and e.event_type == e.to_state
+        if ok and own[-1].to_state != i.state:
+            ok = False  # the full history is recorded, yet the projection says otherwise
+        if not ok:
+            res["problem"] = "ISSUE_HISTORY_INCONSISTENT"
+            continue
+        res["state"], res["owner_actor_id"], res["source"] = known[-1].to_state, known[-1].owner_actor_id, "EVENT_HISTORY"
+    return out
+
+
+def constituent_control_issues(db: Session, tenant_id: str, issue: Issue, *, snapshot_seq: int | None,
+                               as_of: int | None = None) -> dict | None:
+    """The control-level issues behind an obligation-level issue (STA §17 "Obligation FAILING: ... link constituent
+    control issues"), derived read-only from records that already exist; nothing is stored or changed.
+
+    No relationship table or link event exists (DAT §11 assurance.issue: "source evaluation refs"), so the relationship
+    is reconstructed from immutable references, by the rules the writers already apply:
+      1. the obligation issue's source AssuranceSnapshot (raised by assurance._issue_hooks);
+      2. each FAILING / REQUIRES_REVIEW leaf of its segments names the exact ControlEvaluation it used;
+      3. that evaluation's condition identity (control_issue_identity: the key raise_control_issue deduplicates on);
+      4. the one control issue with that identity that was recorded and active (not CLOSED / CANCELLED) at
+         ``snapshot_seq``, the record sequence at which the snapshot was created (issue_states_at). raise_control_issue
+         ran in the snapshot's own transaction, before that sequence, so this is the issue it created or linked.
+    Every input predates the obligation issue, so the relationship is the same at every later cutoff; with ``as_of``
+    only each control issue's state is the one recorded by then. Closing or cancelling either issue changes neither the
+    relationship nor the other issue. Only this organisation's records are read; a link that cannot be established is
+    reported in ``problems`` (catalog._problem classes), never guessed.
+
+    Returns None for an issue that is not raised from an obligation snapshot."""
+    from ..models import AssuranceSnapshot, ControlEvaluation, ControlImplementation
+    from .catalog import _problem
+    if issue.issue_type not in SNAPSHOT_VERIFIED_ISSUE_TYPES:
+        return None
+    out = {"basis": "DERIVED", "snapshot_id": None, "snapshot_record_seq": snapshot_seq, "control_issues": [],
+           "problems": []}
+    snap = db.get(AssuranceSnapshot, issue.source_ref_id) if issue.source_ref_type == "AssuranceSnapshot" else None
+    if snap is None or snap.tenant_id != tenant_id:
+        out["problems"].append(_problem("SOURCE_SNAPSHOT_NOT_FOUND", "INCOMPLETE", snapshot_id=issue.source_ref_id))
+        return out
+    out["snapshot_id"] = snap.snapshot_id
+    leaves: dict[str, dict] = {}
+    for seg in snap.segments or []:
+        for leaf in seg.get("leaf_evaluations") or []:
+            if leaf.get("control_state") in CONTROL_ISSUE_TYPES and leaf.get("control_evaluation_id"):
+                leaves.setdefault(leaf["control_evaluation_id"], leaf)
+    if leaves and snapshot_seq is None:
+        out["problems"].append(_problem("SNAPSHOT_RECORD_SEQ_UNKNOWN", "INCOMPLETE", snapshot_id=snap.snapshot_id))
+        return out
+    for evaluation_id, leaf in leaves.items():
+        ce = db.get(ControlEvaluation, evaluation_id)
+        ci = db.get(ControlImplementation, ce.control_implementation_id) if ce is not None else None
+        if ce is None or ce.tenant_id != tenant_id or ci is None or ci.tenant_id != tenant_id:
+            out["problems"].append(_problem("CONTROL_EVALUATION_NOT_FOUND", "INCOMPLETE", control_evaluation_id=evaluation_id))
+            continue
+        if ce.state != leaf["control_state"] or ci.control_implementation_id != leaf.get("control_implementation_id"):
+            out["problems"].append(_problem("CONTROL_EVALUATION_MISMATCH", "MISMATCH", control_evaluation_id=evaluation_id))
+            continue
+        if ci.entity_id != snap.entity_id:
+            out["problems"].append(_problem("CONTROL_SCOPE_MISMATCH", "MISMATCH", control_evaluation_id=evaluation_id,
+                                            control_implementation_id=ci.control_implementation_id))
+            continue
+        kind, key = control_issue_identity(ci, ce)
+        candidates = db.execute(select(Issue).where(Issue.tenant_id == tenant_id, Issue.dedupe_key == key)
+                                .order_by(Issue.created_at, Issue.issue_id)).scalars().all()
+        then = issue_states_at(db, tenant_id, candidates, snapshot_seq)
+        active = [c for c in candidates if then[c.issue_id]["known"] and then[c.issue_id]["state"] is not None
+                  and then[c.issue_id]["state"] not in TERMINAL_ISSUE_STATES]
+        if len(active) != 1:
+            out["problems"].append(_problem("CONTROL_ISSUE_AMBIGUOUS" if active else "CONTROL_ISSUE_NOT_FOUND",
+                                            "MISMATCH" if active else "INCOMPLETE", control_evaluation_id=evaluation_id))
+            continue
+        linked = active[0]
+        entry = {"control_implementation_id": ci.control_implementation_id, "control_evaluation_id": evaluation_id,
+                 "control_state": ce.state, "control_issue_id": linked.issue_id, "issue_type": kind,
+                 "state": linked.state, "history_problem": None}
+        if as_of is not None:
+            h = issue_states_at(db, tenant_id, [linked], as_of)[linked.issue_id]
+            entry["state"], entry["history_problem"] = h["state"], h["problem"]
+        out["control_issues"].append(entry)
+    return out
 
 
 # ==============================================================================
@@ -882,6 +1053,22 @@ def resolve_evidence_conflict(
 # ==============================================================================
 # 6. Obligation Occurrences (assurance_obligation_occurrence_event)
 # ==============================================================================
+# Waiver, extension and a governed dispute workflow (STA §13 "WAIVER / EXTENSION: Governed valid-time object ...;
+# never an ad hoc due-date edit"; "disputed waiver" -> REQUIRES_REVIEW) are not implemented: no table, lifecycle,
+# approval authority or event contract for them exists in ZA-DAT-001, ZA-GLS-001, ZA-IAM-001 or ZA-EVT-001, and the
+# WRK §07 deadline-policy inputs (rule/calendar versions) do not exist. Scheduling and fulfilment are the only occurrence
+# mutations; due dates are never edited.
+
+def _current_obligation(db: Session, tenant_id: str, lineage_id: str):
+    """The current revision of one of this organisation's obligations (404 otherwise, for another organisation's too)."""
+    from ..models import ObligationInstance
+    obl = db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant_id,
+                                                      ObligationInstance.lineage_id == lineage_id,
+                                                      ObligationInstance.record_to_seq.is_(None))).scalars().first()
+    if obl is None:
+        raise HTTPException(404, "obligation not found")
+    return obl
+
 
 def schedule_occurrence(
     db: Session,
@@ -891,6 +1078,23 @@ def schedule_occurrence(
     window_from: datetime,
     due_at: datetime,
 ) -> tuple[ObligationOccurrence, ObligationOccurrenceEvent]:
+    """Record one required occurrence (STA §13 REQUIRED_WINDOW) of an obligation of this organisation.
+
+    Refused before anything is written:
+      * 422 OCCURRENCE_WINDOW_EMPTY: the required window [window_from, due_at) is empty (TIM-REQ-002: canonical
+        half-open, non-empty ranges);
+      * 404: no obligation with this lineage in this organisation;
+      * 409 OBLIGATION_CLOSED: the obligation's current revision is CLOSED and the occurrence would fall due at or after
+        the end of its validity (DOM §6.3 CLOSED: "Duty ended and no future occurrence remains"). An occurrence that
+        fell due while the duty applied can still be recorded."""
+    if ensure_utc(due_at) <= ensure_utc(window_from):
+        raise HTTPException(422, {"error": "OCCURRENCE_WINDOW_EMPTY",
+                                  "message": "due_at must be later than window_from (a non-empty required window)"})
+    obl = _current_obligation(db, tenant_id, obligation_lineage_id)
+    if obl.lifecycle == "CLOSED" and obl.valid_to is not None and ensure_utc(due_at) >= ensure_utc(obl.valid_to):
+        raise HTTPException(409, {"error": "OBLIGATION_CLOSED",
+                                  "message": "The obligation is closed; no occurrence can fall due after "
+                                             f"{ensure_utc(obl.valid_to).isoformat()}."})
     seq = next_record_seq(db)
     o = ObligationOccurrence(
         tenant_id=tenant_id,
@@ -941,10 +1145,25 @@ def fulfil_occurrence(
         raise HTTPException(404, "Occurrence not found")
     if o.fulfilled_at:
         raise HTTPException(409, "Occurrence already fulfilled; history is immutable")
+    # A fulfilment is a completion event with its proof (STA §13 FULFILLMENT_EVENT "completion event with evidence";
+    # ZA-EVT-001 obligation.occurrence_completed "recorded with evidence refs"; DAT §07 "fulfillment refs"), and that
+    # proof belongs to the obligation's legal entity: cross-entity proof needs a governed shared-evidence reference
+    # (TEN-REQ-008, TEN §14), as for test results (test_results._validate). Checked before anything is written.
+    if not evidence_ids:
+        raise HTTPException(422, {"error": "FULFILMENT_EVIDENCE_REQUIRED",
+                                  "message": "A fulfilment needs at least one evidence reference (ZA-STA-001 §13)."})
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise HTTPException(422, {"error": "DUPLICATE_EVIDENCE", "message": "an evidence reference is listed more than once"})
+    entity_id = _current_obligation(db, tenant_id, o.obligation_lineage_id).entity_id
     for e in evidence_ids:
         ev_art = db.get(EvidenceArtifact, e)
         if not ev_art or ev_art.tenant_id != tenant_id:
             raise HTTPException(404, f"Evidence {e} not found")
+        if ev_art.entity_id != entity_id:
+            raise HTTPException(422, {"error": "EVIDENCE_SCOPE_MISMATCH", "evidence_id": e,
+                                      "message": "Evidence of another legal entity cannot fulfil this obligation: "
+                                                 "cross-entity proof needs a governed shared-evidence reference "
+                                                 "(ZA-TEN-001 §14)."})
     seq = next_record_seq(db)
     is_late = ensure_utc(fulfilled_at) > ensure_utc(o.due_at)
     o.fulfilled_at = fulfilled_at

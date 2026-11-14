@@ -14,8 +14,11 @@ from sqlalchemy.orm import Session
 
 from ..models import FactAssertion, FactConflict, FactDefinition, Subject, new_id
 from ..platform import emit, ensure_utc, next_record_seq
+from . import rules
 
 FAR_FUTURE = None  # open upper bound represented as NULL (no sentinel dates, TIM-REQ-002)
+# applicability_fact_assertion_revision.value_text (varchar): the longest TIMESTAMP value a fact write can store as given.
+_VALUE_TEXT_MAX = FactAssertion.__table__.c.value_text.type.length
 
 
 def _lt(a: datetime | None, b: datetime | None) -> bool:
@@ -42,14 +45,37 @@ def typed_columns(fd: FactDefinition, value) -> dict:
                 raise ValueError
             cols["value_boolean"] = value
         elif t == "INTEGER":
-            if isinstance(value, bool) or not isinstance(value, int):
+            # value_integer is a signed 64-bit column (BIGINT): a value outside it is refused here, before anything is
+            # written, instead of failing at persistence differently on PostgreSQL and SQLite (API-REQ-033).
+            if isinstance(value, bool) or not isinstance(value, int) or not -(2 ** 63) <= value < 2 ** 63:
                 raise ValueError
             cols["value_integer"] = value
         elif t == "DECIMAL":
-            cols["value_decimal"] = str(Decimal(str(value)))
+            # RUL §05 "Exact decimal arithmetic": NaN, sNaN and +/-Infinity are refused (Decimal accepts them, and an
+            # ordering comparison with NaN raises in the evaluator), and so is a value value_decimal (numeric(38,10))
+            # cannot hold exactly: PostgreSQL rounded a longer fraction silently and failed on a longer integer part
+            # only at persistence, after the record sequence was taken (API-REQ-033, as for INTEGER above).
+            d = Decimal(str(value))
+            if isinstance(value, bool) or not rules.decimal_value_ok(d):
+                raise ValueError
+            cols["value_decimal"] = str(d)
         elif t == "DATE":
             from datetime import date
-            cols["value_date"] = date.fromisoformat(str(value))
+            # A DATE is an ISO date string, as golden-vector inputs require (rules._fact_value_ok). str(value) also turned a
+            # JSON number such as 20270101 into a date: an implicit coercion this function's contract excludes.
+            if not isinstance(value, str):
+                raise ValueError
+            cols["value_date"] = date.fromisoformat(value)
+        elif t == "TIMESTAMP":
+            # ZA-RUL-001 §03 "Offset-aware canonical instant". TIMESTAMP used to fall through to the text branch below and
+            # accept any string, which the evaluator then could not compare (malformed text, or a local time without an
+            # offset against an instant). Storage is unchanged: the value as given, in value_text. That column holds
+            # _VALUE_TEXT_MAX characters, so a longer instant (hundreds of fractional digits, all beyond the microsecond
+            # the evaluator reads) is refused here, before the record sequence is taken, instead of failing at persistence
+            # on PostgreSQL with a 500 (SQLite stored it), as an INTEGER or DECIMAL its column cannot hold is (API-REQ-033).
+            if not isinstance(value, str) or rules.timestamp_value(value) is None or len(value) > _VALUE_TEXT_MAX:
+                raise ValueError
+            cols["value_text"] = value
         elif t.startswith("SET<"):
             if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
                 raise ValueError
@@ -167,8 +193,12 @@ def fact_subject_for(db: Session, subject: Subject, fd: FactDefinition) -> Subje
     if fd.subject_type == subject.subject_type:
         return subject
     if fd.subject_type == "LEGAL_ENTITY" and subject.entity_id:
-        return db.execute(select(Subject).where(Subject.entity_id == subject.entity_id,
-                                                Subject.subject_type == "LEGAL_ENTITY")).scalars().first()
+        # The subject's own organisation only (DOM-INV-11): the query is scoped itself, not only by row-level security
+        # (which SQLite does not have), and ordered, so the holder is the same on every read (APP §04 determinism).
+        return db.execute(select(Subject).where(Subject.tenant_id == subject.tenant_id,
+                                                Subject.entity_id == subject.entity_id,
+                                                Subject.subject_type == "LEGAL_ENTITY")
+                          .order_by(Subject.subject_id)).scalars().first()
     return None
 
 
