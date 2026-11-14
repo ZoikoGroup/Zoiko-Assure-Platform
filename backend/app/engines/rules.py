@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from .. import codes  # constants only (no I/O): the one evaluator build identifier, read at call time
 
 TRUE, FALSE, UNKNOWN, NOT_EVALUATED = "TRUE", "FALSE", "UNKNOWN", "NOT_EVALUATED"
 OUTCOME = {TRUE: "APPLIES", FALSE: "DOES_NOT_APPLY", UNKNOWN: "UNCERTAIN"}
@@ -34,6 +36,27 @@ def unsupported_versions(rule_schema_version, operator_set_version) -> dict | No
                                  ("operator_set_version", operator_set_version, SUPPORTED_OPERATOR_SET_VERSIONS))
            if v not in ok}
     return bad or None
+# ZA-DAT-001 typed fact value column value_decimal: numeric(38,10) (migration 0001), i.e. at most 28 integer and 10
+# fractional digits. RUL §05: DECIMAL is "Exact decimal arithmetic"; NaN, sNaN and +/-Infinity are not decimal values.
+DECIMAL_PRECISION, DECIMAL_SCALE = 38, 10
+
+
+def decimal_value_ok(d: Decimal) -> bool:
+    """A finite decimal the value_decimal column holds exactly: no rounding of the fraction (PostgreSQL rounds beyond
+    the scale silently) and no integer part the column cannot hold. Trailing zeros carry no digits. Pure: no context
+    arithmetic, so no rounding happens while checking."""
+    if not isinstance(d, Decimal) or not d.is_finite():
+        return False
+    if d.is_zero():
+        return True
+    _, digits, exp = d.as_tuple()
+    digits = list(digits)
+    while exp < 0 and digits[-1] == 0:
+        digits.pop()
+        exp += 1
+    return exp >= -DECIMAL_SCALE and len(digits) + exp <= DECIMAL_PRECISION - DECIMAL_SCALE
+
+
 LIMITS = {"max_depth": 32, "max_nodes": 500, "max_inline_set": 100, "max_table_rows": 250,
           "max_conditions_per_row": 40, "max_source_mappings_per_node": 20}
 
@@ -173,7 +196,9 @@ def _limit_issue(limit: str, msg: str, node_id=None) -> dict:
 
 # ------------------------------------------------------------------ types
 def is_set(t: str | None) -> bool:
-    return bool(t) and t.startswith("SET<")
+    # A type that is not a string (a malformed `type` field) is no type at all: never a set, and never raised on, so
+    # validation reports it as a schema error and the runtime limit guard can still measure the AST.
+    return isinstance(t, str) and t.startswith("SET<")
 
 
 def elem(t: str) -> str:
@@ -185,7 +210,52 @@ def fact_type(fdef: dict) -> str:
 
 
 def _base(t: str) -> str:
-    return "ENUM" if t and t.startswith("ENUM") else t
+    return "ENUM" if isinstance(t, str) and t.startswith("ENUM") else t
+
+
+def legal_date(v: Any) -> date:
+    """The legal calendar date an effective_at denotes, for rule selection and for rules that compare the effective date
+    (CONTEXT_REF effective_at). Owner decision (TIM owner and RUL owner), "Option U", for the explicit conversion rule
+    ZA-TIM-001 §02 requires for mixed-profile comparison: an offset-aware instant is converted to UTC and its UTC calendar
+    date is used, so "2027-01-01T23:30:00-05:00" and "2027-01-02T04:30:00Z" are both 2027-01-02. The one conversion every
+    path uses (golden vectors, sandbox, live evaluation and replay, shadow, publication impact, catalogue selection).
+    A date is itself; a date-time without an offset keeps its written date (unchanged: it is not an instant, and live
+    evaluation already reads such values as UTC). Nothing else is converted; invalid text is a RUL_TYPE_MISMATCH."""
+    if isinstance(v, datetime):
+        d = v
+    elif isinstance(v, date):
+        return v
+    else:
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            raise RuleError("RUL_TYPE_MISMATCH", f"{v!r} is not an ISO DATE value and cannot be compared.") from None
+    if d.utcoffset() is not None:
+        try:
+            d = d.astimezone(timezone.utc)
+        except OverflowError:
+            # Its UTC conversion leaves the calendar (year 1 east of UTC, year 9999 west of it): it has no UTC date, so
+            # it cannot be read either. Refused as unreadable input is, not an unhandled OverflowError (a 500).
+            raise RuleError("RUL_TYPE_MISMATCH", f"{v!r} has no UTC calendar date (outside years 1-9999).") from None
+    return d.date()
+
+
+def timestamp_value(v: Any) -> datetime | None:
+    """The instant a TIMESTAMP value denotes, or None when it is not one. ZA-RUL-001 §03: TIMESTAMP is an "Offset-aware
+    canonical instant" and date/time literals use "ISO 8601 canonical form; no ambiguous local date/time strings". A
+    string without a UTC offset (or a date alone) is a local date/time, not an instant: comparing it with an instant is
+    undefined (Python raises, or calls them unequal), and reading it as UTC would be the implicit timezone conversion
+    §05 prohibits. Used alike by literal validation, golden-vector and fixture inputs, fact writes and the evaluator."""
+    if isinstance(v, datetime):
+        d = v
+    elif isinstance(v, str):
+        try:
+            d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return d if d.utcoffset() is not None else None
 
 
 # ------------------------------------------------------------------ decision tables
@@ -220,6 +290,12 @@ def compile_decision_table(table: dict) -> tuple[dict | None, list[dict]]:
         issues.append(_issue("RUL_PROHIBITED_CONSTRUCT", "FIRST_MATCH is prohibited for binding rules (RUL-REQ-012)."))
     elif mode not in ("ANY_MATCH", "SINGLE_MATCH_VALIDATED"):
         issues.append(_issue("RUL_SCHEMA_INVALID", f"Unknown table_mode {mode!r}."))
+    # Cells are addressed by column_id, so two columns sharing one id cannot both be compiled: the later one replaced
+    # the earlier and its condition vanished from the AST (RUL-INV-10: no semantic loss between authoring view and AST).
+    column_ids = [c["column_id"] for c in table.get("columns", [])]
+    for cid in dict.fromkeys(i for i in column_ids if column_ids.count(i) > 1):
+        issues.append(_issue("RUL_SCHEMA_INVALID", f"Column id {cid} is declared more than once; each input column "
+                                                   "needs its own column_id."))
     cols = {c["column_id"]: c for c in table.get("columns", [])}
     rows = table.get("rows", [])
     if len(rows) > LIMITS["max_table_rows"]:
@@ -230,6 +306,12 @@ def compile_decision_table(table: dict) -> tuple[dict | None, list[dict]]:
         rid = row.get("row_id")
         preds = []
         cells = row.get("cells", {})
+        # §11 stage 1 "unknown ... field rejected"; §07 conditions are input columns. A cell naming no declared column was
+        # never compiled, so the condition a reviewer read in the table was absent from the executable AST.
+        for k in cells:
+            if k not in cols:
+                issues.append(_issue("RUL_SCHEMA_INVALID", f"Row {rid} has a cell for undeclared column {k!r}; every "
+                                                           "condition must be a declared input column.", f"row_{rid}"))
         for cid, col in cols.items():
             if cid not in cells or cells[cid] in (None, ""):
                 issues.append(_issue("RUL_DECISION_CELL_BLANK", f"Row {rid} column {cid} is blank; use explicit ANY.", f"row_{rid}"))
@@ -248,7 +330,10 @@ def compile_decision_table(table: dict) -> tuple[dict | None, list[dict]]:
             issues.append(_limit_issue("max_conditions_per_row", f"Row {rid} has too many conditions.", f"row_{rid}"))
         if not preds:
             issues.append(_issue("RUL_DECISION_DUPLICATE_ROW", f"Row {rid} is all ANY (unconditional match).", f"row_{rid}"))
-        sig = json.dumps(cells, sort_keys=True)
+        # §18 "Semantically duplicate row": cells compared as the evaluator compares them (_cell_key), so "1.0" / "1.00"
+        # or one instant written with two offsets are one condition, not two rows that happen to be spelled differently.
+        sig = tuple(sorted(((k, _cell_key(cols[k].get("value_type", "ENUM") if k in cols else None, v))
+                            for k, v in cells.items()), key=lambda kv: kv[0]))
         if sig in seen_sigs:
             issues.append(_issue("RUL_DECISION_DUPLICATE_ROW", f"Row {rid} duplicates row {seen_sigs[sig]}.", f"row_{rid}"))
         seen_sigs[sig] = rid
@@ -264,7 +349,8 @@ def compile_decision_table(table: dict) -> tuple[dict | None, list[dict]]:
                 exclusive = False
                 for cid, col in cols.items():
                     a, b = rows[i].get("cells", {}).get(cid), rows[j].get("cells", {}).get(cid)
-                    if col.get("operator", "EQ") == "EQ" and a not in (None, "ANY") and b not in (None, "ANY") and a != b:
+                    if col.get("operator", "EQ") == "EQ" and a not in (None, "ANY") and b not in (None, "ANY") \
+                            and _distinct_values(col.get("value_type", "ENUM"), a, b):
                         exclusive = True
                 if not exclusive:
                     issues.append(_issue("RUL_DECISION_OVERLAP", f"Rows {rows[i]['row_id']} and {rows[j]['row_id']} are not provably exclusive.",
@@ -275,6 +361,125 @@ def compile_decision_table(table: dict) -> tuple[dict | None, list[dict]]:
         root["single_match"] = True
     root["decision_table"] = True
     return root, issues
+
+
+def _cell_key(value_type: Any, v: Any) -> tuple:
+    """What one decision-table cell compares as, for duplicate-row detection. A valid literal of the column type
+    (_literal_ok, every member of a SET<T>) is its value as the evaluator compares it (_coerce): DECIMAL by exact value
+    (RUL §03 "Exact decimal arithmetic"), DATE by calendar date, TIMESTAMP by instant ("Offset-aware canonical instant"),
+    SET<T> by membership; text types as written (no case or Unicode normalization is defined, §03). Anything else (ANY,
+    a SetRef, an invalid literal, a cell of no declared column) is compared as written: never merged with a valid value,
+    and validation reports the invalid literal itself."""
+    if isinstance(value_type, str) and v != "ANY" and not isinstance(v, dict):
+        try:
+            if is_set(value_type):
+                et = elem(value_type) if value_type.endswith(">") else ""
+                valid = _base(et) in SCALARS and isinstance(v, list) and all(_literal_ok(et, m) for m in v)
+            else:
+                valid = _base(value_type) in SCALARS and _literal_ok(value_type, v)
+            if valid:
+                return ("value", _coerce(value_type, v))
+        except (RuleError, ValueError, TypeError):
+            pass
+    return ("as_written", json.dumps(v, sort_keys=True))
+
+
+def _as_text(x: Any) -> str:
+    return json.dumps(x, sort_keys=True, default=str)
+
+
+def _condition_key(n: Any) -> tuple:
+    """What one node of an AST decision-table row compares as, for duplicate-row detection (team-lead decision TL-3).
+    Exact structure, in source order: the same node types, operators, facts, set references and context keys, and
+    literals compared as decision-table cells are (_cell_key: a valid literal by the evaluator's typed value, anything
+    else as written). No reordering of conditions, no operator equivalence (DATE_ON_OR_AFTER is not GTE), no flattening
+    of nested logic; node IDs, source mappings and other annotations are not conditions. A node that cannot be read is
+    never equal to anything."""
+    if not isinstance(n, dict):
+        return ("UNCOMPARABLE", id(n))
+    nt = n.get("node_type")
+    if nt == "PREDICATE":
+        args = n.get("args")
+        return ("PREDICATE", _as_text(n.get("operator")),
+                tuple(_condition_key(a) for a in args) if isinstance(args, list) else ("UNCOMPARABLE", id(n)))
+    if nt == "FACT_REF":
+        return ("FACT_REF", _as_text(n.get("fact")))
+    if nt == "CONST":
+        return ("CONST", _as_text(n.get("type")), _cell_key(n.get("type"), n.get("value")))
+    if nt == "SET_REF":
+        return ("SET_REF", _as_text(n.get("set_version_id")))
+    if nt == "CONTEXT_REF":
+        return ("CONTEXT_REF", _as_text(n.get("key")))
+    if nt in ("ALL", "ANY"):
+        ch = n.get("children")
+        return (nt, n.get("single_match") is True, n.get("decision_table") is True,
+                tuple(_condition_key(c) for c in ch) if isinstance(ch, list) else ("UNCOMPARABLE", id(n)))
+    if nt == "NOT":
+        return ("NOT", _condition_key(n.get("child")))
+    return ("UNCOMPARABLE", id(n))
+
+
+def _ast_table_issues(n: dict, nid, nt: str, table_rows: set) -> list[dict]:
+    """Decision-table structure written directly as AST (authoring_mode AST, or a compiled table's AST re-authored).
+
+    TL-1 (team-lead decision; the compiler's output shape, compile_decision_table): a decision table is an ANY node with
+    `decision_table: true`, and its rows are its children, each an ALL node with a string row_id. TL-2: other uses of that
+    metadata are refused as RUL_SCHEMA_INVALID, not ignored: the flag on another node type or with a non-boolean value, a
+    table child that is not a row, a row_id outside a table or not a non-empty string, a row_id repeated in one table
+    (§07 "Stable row_id"; RUL-REQ-025). Rows of one table that are the same conditions (TL-3, _condition_key) are
+    RUL_DECISION_DUPLICATE_ROW, reported exactly as the decision-table compiler reports them, so a compiled table is not
+    reported twice. `table_rows` collects the row nodes of tables already visited (the walk visits a table before its
+    rows)."""
+    out = []
+    flag = n.get("decision_table")
+    if flag not in (None, False) and (flag is not True or nt != "ANY"):
+        out.append(_issue("RUL_SCHEMA_INVALID", f"decision_table must be a boolean and marks only an ANY node (the table "
+                                                f"root); found {flag!r} on {nt}.", nid))
+    if "row_id" in n:
+        rid = n["row_id"]
+        if not (isinstance(rid, str) and rid.strip()):
+            out.append(_issue("RUL_SCHEMA_INVALID", f"row_id must be a non-empty string, not {rid!r}.", nid))
+        elif id(n) not in table_rows:
+            out.append(_issue("RUL_SCHEMA_INVALID", f"Row {rid} is not a row of a decision table: a row_id marks an ALL "
+                                                    "child of an ANY node with decision_table true.", nid))
+    children = n.get("children")
+    if flag is not True or nt != "ANY" or not isinstance(children, list):
+        return out
+    ids: set = set()
+    seen: dict = {}
+    for c in children:
+        if not (isinstance(c, dict) and c.get("node_type") == "ALL" and "row_id" in c):
+            out.append(_issue("RUL_SCHEMA_INVALID", f"Decision table {nid}: every child must be a row (an ALL node with a "
+                                                    "row_id).", nid))
+            continue
+        table_rows.add(id(c))
+        rid = c["row_id"]
+        if not (isinstance(rid, str) and rid.strip()):
+            continue  # reported on the row itself
+        row_nid = c.get("node_id") if isinstance(c.get("node_id"), str) else None
+        if rid in ids:
+            out.append(_issue("RUL_SCHEMA_INVALID", f"Decision table {nid} has row_id {rid} more than once.", row_nid))
+            continue
+        ids.add(rid)
+        ch = c.get("children")
+        key = tuple(_condition_key(x) for x in ch) if isinstance(ch, list) else ("UNCOMPARABLE", id(c))
+        if key in seen:
+            out.append(_issue("RUL_DECISION_DUPLICATE_ROW", f"Row {rid} duplicates row {seen[key]}.", row_nid))
+        else:
+            seen[key] = rid
+    return out
+
+
+def _distinct_values(value_type: Any, a: Any, b: Any) -> bool:
+    """Whether two EQ cell constants of one column can never both equal a fact value (RUL-REQ-013 exclusivity proof).
+    They are compared as the evaluator compares them (_coerce): "1.0" and "1.00" are one DECIMAL, and two spellings of
+    one instant are one TIMESTAMP, so different text is not proof that two rows cannot both match ("More than one TRUE:
+    RUNTIME_RULE_INVARIANT_BREACH ... Publication should have prevented it", RUL §07). A cell that is not a valid
+    literal of the column type proves nothing (validation reports the literal itself)."""
+    try:
+        return _coerce(value_type, a) != _coerce(value_type, b)
+    except (RuleError, ValueError, TypeError):
+        return False
 
 
 # ------------------------------------------------------------------ validation / type checking
@@ -298,6 +503,7 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
     counter = {"nodes": 0}
     required_facts: set[str] = set()
     set_refs: set[str] = set()
+    table_rows: set[int] = set()  # row nodes of decision tables already visited (_ast_table_issues)
 
     def walk(n: Any, depth: int, mapped: bool) -> str | None:
         if not isinstance(n, dict):
@@ -307,6 +513,9 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
         nid = n.get("node_id")
         if not nid:
             issues.append(_issue("RUL_SCHEMA_INVALID", "Every node requires node_id."))
+        elif not isinstance(nid, str):  # §11 stage 1: a schema error, reported, never raised (it is not hashable)
+            issues.append(_issue("RUL_SCHEMA_INVALID", f"node_id must be a string, not {nid!r}."))
+            nid = None
         elif nid in ids:
             issues.append(_issue("RUL_SCHEMA_INVALID", f"Duplicate node_id {nid}.", nid))
         else:
@@ -318,10 +527,18 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
             issues.append(_limit_issue("max_depth", "AST depth limit exceeded.", nid))
             return None
         nt = n.get("node_type")
-        if nt not in NODE_TYPES:
+        if not isinstance(nt, str) or nt not in NODE_TYPES:
             issues.append(_issue("RUL_UNKNOWN_NODE", f"Unknown node_type {nt!r}.", nid))
             return None
+        # single_match is the compiled form of a SINGLE_MATCH_VALIDATED table (RUL §07): a boolean on the ANY node over
+        # the rows. No other node has single-match semantics; on ALL the evaluator applied them anyway and contradicted
+        # the §06 ALL truth table (ALL(TRUE, FALSE) evaluated TRUE), and a non-boolean value ("false") read as true.
+        if n.get("single_match") not in (None, False) and (n["single_match"] is not True or nt != "ANY"):
+            issues.append(_issue("RUL_SCHEMA_INVALID", f"single_match must be a boolean and is defined only on an ANY "
+                                                       f"node (SINGLE_MATCH_VALIDATED rows); found {n['single_match']!r} "
+                                                       f"on {nt}.", nid))
         issues.extend(_table_limit_issues(n, nid))
+        issues.extend(_ast_table_issues(n, nid, nt, table_rows))
         sm = _mapping_refs(n, nid, issues)
         if len(sm) > LIMITS["max_source_mappings_per_node"]:
             issues.append(_limit_issue("max_source_mappings_per_node", "Too many source mappings on node.", nid))
@@ -352,7 +569,7 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
             return "TRUTH3"
         if nt == "PREDICATE":
             op = n.get("operator")
-            if op not in SIGNATURES:
+            if not isinstance(op, str) or op not in SIGNATURES:
                 issues.append(_issue("RUL_UNKNOWN_OPERATOR", f"Operator {op!r} not in OperatorSetVersion 1.0.", nid))
                 return "TRUTH3"
             if not here_mapped:
@@ -382,7 +599,7 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
             return "TRUTH3"
         if nt == "FACT_REF":
             key = n.get("fact")
-            fd = fact_defs.get(key)
+            fd = fact_defs.get(key) if isinstance(key, str) else None
             if not fd:
                 issues.append(_issue("RUL_FACT_REF_INVALID", f"Unknown or unreleased FactDefinition {key!r}.", nid))
                 return None
@@ -393,23 +610,49 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
         if nt == "CONST":
             t = n.get("type")
             v = n.get("value")
+            if not isinstance(t, str):
+                issues.append(_issue("RUL_SCHEMA_INVALID", f"Literal type must be a type name, not {t!r}.", nid))
+                return None
             if v is None:
                 issues.append(_issue("RUL_SCHEMA_INVALID", "Null literal prohibited.", nid))
                 return None
             if is_set(t):
+                # RUL §04 "SET<T>: Elements same type T": the element type is a scalar literal type, and every member
+                # is a literal of it, checked exactly as a scalar literal (_literal_ok: no coercion, canonical decimal
+                # strings, ISO dates); a null member is a null literal ("Null: Not permitted as a literal"). The
+                # specification has no rule for an empty set or a repeated member: both keep their set meaning.
+                et = elem(t) if t.endswith(">") else ""
+                if _base(et) not in SCALARS:
+                    issues.append(_issue("RUL_TYPE_MISMATCH", f"Unknown literal type {t!r}.", nid))
                 if not isinstance(v, list):
                     issues.append(_issue("RUL_TYPE_MISMATCH", "Inline set must be a list.", nid))
                 elif len(v) > LIMITS["max_inline_set"]:
                     issues.append(_limit_issue("max_inline_set", "Inline set too large; use SetVersion.", nid))
+                elif _base(et) in SCALARS:
+                    for i, m in enumerate(v):
+                        if m is None:
+                            issues.append(_issue("RUL_SCHEMA_INVALID", f"Inline set member {i} is null; null literal "
+                                                 "prohibited.", nid))
+                        elif not _literal_ok(et, m):
+                            issues.append(_issue("RUL_TYPE_MISMATCH", f"Inline set member {i} {m!r} is not a "
+                                                 f"canonical {et}.", nid))
                 return t
             if _base(t) not in SCALARS:
                 issues.append(_issue("RUL_TYPE_MISMATCH", f"Unknown literal type {t!r}.", nid))
                 return None
             if not _literal_ok(t, v):
                 issues.append(_issue("RUL_TYPE_MISMATCH", f"Literal {v!r} is not a canonical {t}.", nid))
+            elif _base(t) == "DECIMAL":
+                canonical = decimal_canonicalization_loss(t, v)
+                if canonical is not None:
+                    issues.append({**_issue("RUL_DECIMAL_CANONICALIZATION_LOSS",
+                                            f"DECIMAL literal {v!r} would be released as {canonical!r}: canonicalization "
+                                            "changes its exact value, so the rule cannot be published as authored.", nid),
+                                   "authored_value": v, "canonical_value": canonical})
             return t
         if nt == "SET_REF":
-            sv = set_versions.get(n.get("set_version_id"))
+            svid = n.get("set_version_id")
+            sv = set_versions.get(svid) if isinstance(svid, str) else None
             if not sv:
                 issues.append(_issue("RUL_SET_REF_INVALID", f"Unknown SetVersion {n.get('set_version_id')!r}.", nid))
                 return None
@@ -421,7 +664,14 @@ def validate(ast: dict, fact_defs: dict[str, dict], set_versions: dict[str, dict
             return "DATE"
         return None
 
-    walk(ast, 1, False)
+    root = walk(ast, 1, False)
+    if root not in (None, "TRUTH3"):
+        # §04: the rule is a truth expression (ALL/ANY/NOT/PREDICATE -> TRUTH3); a FactRef, Constant, SetRef or
+        # ContextRef is a value. RUL-INV-04: every valid typed input must yield TRUE/FALSE/UNKNOWN, but the evaluator
+        # cannot take a value as the rule (RUL_UNKNOWN_NODE on every input), so it is a static type error here (§11 stage 3).
+        issues.append(_issue("RUL_TYPE_MISMATCH", f"The rule root must be a truth expression (ALL, ANY, NOT or "
+                                                  f"PREDICATE), not a {root} value.",
+                             ast["node_id"] if isinstance(ast.get("node_id"), str) else None))
     if counter["nodes"] > LIMITS["max_nodes"]:
         issues.append(_limit_issue("max_nodes", "Executable node limit exceeded."))
     # RUL-REQ-029 parity: validation must refuse everything the runtime guard (resource_limit_violations) would refuse,
@@ -445,14 +695,13 @@ def _literal_ok(t: str, v: Any) -> bool:
             return isinstance(v, bool)
         if b == "INTEGER":
             return isinstance(v, int) and not isinstance(v, bool)
-        if b == "DECIMAL":
-            return isinstance(v, str) and "e" not in v.lower() and Decimal(v) is not None
+        if b == "DECIMAL":  # RUL §05 "Canonical decimal string": NaN / Infinity are not decimals
+            return isinstance(v, str) and "e" not in v.lower() and Decimal(v).is_finite()
         if b == "DATE":
             date.fromisoformat(v)
             return True
-        if b == "TIMESTAMP":
-            datetime.fromisoformat(v.replace("Z", "+00:00"))
-            return True
+        if b == "TIMESTAMP":  # RUL §03: an offset-aware instant, never a local date/time (timestamp_value)
+            return isinstance(v, str) and timestamp_value(v) is not None
         return isinstance(v, str)
     except (ValueError, InvalidOperation, TypeError, AttributeError):
         return False
@@ -476,12 +725,26 @@ def _typecheck(op, types, args, fact_defs, nid, issues):
     elif op in ("IN", "NOT_IN"):
         if not is_set(types[1]) or is_set(a) or not _compatible(a, elem(types[1])):
             issues.append(_issue("RUL_TYPE_MISMATCH", f"{op} needs T against SET<T>; got {a} / {types[1]}.", nid))
+        _set_domain_check(args, fact_defs, nid, issues)
     elif op in ("INTERSECTS", "CONTAINS_ALL"):
         if not (is_set(a) and is_set(types[1]) and _compatible(elem(a), elem(types[1]))):
             issues.append(_issue("RUL_TYPE_MISMATCH", f"{op} needs SET<T> x SET<T>; got {types}.", nid))
+        _set_domain_check(args, fact_defs, nid, issues)
     elif op == "SET_SIZE_GTE":
         if not is_set(a) or types[1] != "INTEGER":
             issues.append(_issue("RUL_TYPE_MISMATCH", "SET_SIZE_GTE needs SET<T> x INTEGER.", nid))
+
+
+def _set_domain_check(args, fact_defs, nid, issues):
+    """ENUM<T> "Values must come from versioned domain T" (RUL §04), for an inline set compared with a fact, as EQ checks
+    a scalar literal (_enum_domain_check): every member must belong to the fact's domain."""
+    f = next((x for x in args if x.get("node_type") == "FACT_REF"), None)
+    c = next((x for x in args if x.get("node_type") == "CONST" and isinstance(x.get("value"), list)), None)
+    dom = fact_defs.get(f.get("fact"), {}).get("enum_domain") if f else None
+    if c and dom:
+        for m in c["value"]:
+            if isinstance(m, str) and m not in dom:
+                issues.append(_issue("RUL_TYPE_MISMATCH", f"Value {m!r} not in domain of {f['fact']}.", nid))
 
 
 def _enum_domain_check(args, fact_defs, nid, issues):
@@ -496,6 +759,19 @@ def _enum_domain_check(args, fact_defs, nid, issues):
 # ------------------------------------------------------------------ canonicalization & hashing
 def canonical_bytes(obj: Any) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def decimal_canonicalization_loss(literal_type: str, value: Any) -> str | None:
+    """The canonical form canonicalize() gives a valid DECIMAL literal when that form has a different exact value, else
+    None. Owner decision (RUL owner and Head of Assurance), "DECIMAL precision-loss guard": a literal canonicalization
+    would change is refused at validation (RUL_DECIMAL_CANONICALIZATION_LOSS) instead of being released changed; e.g.
+    "1234567890123456789012345678.1234567890" becomes "1234567890123456789012345678" (Decimal.normalize() rounds to 28
+    significant digits). The canonicalizer itself decides the canonical form (one CONST node through canonicalize, which
+    is not changed), and the two values are compared with exact Decimal equality, never binary floating point. A value
+    whose canonical form only changes spelling ("50000000.00" -> "5E+7") keeps its value and is not refused: exponent-form
+    output is outside this decision."""
+    canonical = canonicalize({"node_type": "CONST", "type": literal_type, "value": value})["value"]
+    return None if Decimal(canonical) == Decimal(value) else canonical
 
 
 def canonicalize(ast: dict) -> dict:
@@ -526,22 +802,50 @@ def set_hash(element_type: str, members: list) -> str:
 
 
 # ------------------------------------------------------------------ pure evaluator
+def _decimal(v: Any) -> Decimal:
+    """A DECIMAL operand. A value that is not a finite decimal (NaN, sNaN, +/-Infinity, e.g. a fact stored before fact
+    writes refused them) is never compared: Decimal ordering with NaN raises, and equality with it is silently FALSE.
+    The evaluation is refused with the type error instead (APP §12: an error, never an applicability outcome)."""
+    try:
+        d = Decimal(str(v))
+    except (InvalidOperation, ValueError, TypeError):
+        d = None
+    if d is None or not d.is_finite():
+        raise RuleError("RUL_TYPE_MISMATCH", f"{v!r} is not a finite DECIMAL value and cannot be compared.")
+    return d
+
+
 def _coerce(t: str, v: Any):
     b = _base(t)
     if is_set(t):
         return frozenset(_coerce(elem(t), x) for x in v)
     if b == "DECIMAL":
-        return Decimal(str(v))
+        return _decimal(v)
     if b == "DATE":
-        return v if isinstance(v, date) else date.fromisoformat(str(v)[:10])
+        # Option U (legal_date): an instant is read as its UTC calendar date, never as the first ten characters as
+        # written; a malformed value (e.g. a SET<DATE> fact member never checked as a date) is refused, as NaN is.
+        return legal_date(v)
     if b == "TIMESTAMP":
-        return v if isinstance(v, datetime) else datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        # A value without a UTC offset (stored before fact writes checked TIMESTAMP values, or malformed text) is never
+        # compared: against an instant Python raised TypeError (ordering) or answered FALSE (EQ / IN), an outcome
+        # from an undefined comparison. Refused as a type error instead (APP §12: an error, never an outcome).
+        d = timestamp_value(v)
+        if d is None:
+            raise RuleError("RUL_TYPE_MISMATCH", f"{v!r} is not an offset-aware TIMESTAMP instant and cannot be compared.")
+        return d
     return v
 
 
 class _Eval:
     def __init__(self, facts: dict, fact_types: dict, sets: dict, context: dict):
         self.facts, self.fact_types, self.sets, self.context = facts, fact_types, sets, context
+
+    @staticmethod
+    def _typed(t: str, v: Any, n: dict):
+        try:
+            return _coerce(t, v)
+        except RuleError as e:
+            raise RuleError(e.code, e.message, n.get("node_id")) from None
 
     def value(self, n: dict) -> tuple[bool, Any, dict]:
         """Returns (known, value, trace-node)."""
@@ -555,10 +859,10 @@ class _Eval:
                 tr.update(result=UNKNOWN, reason_code=f.get("reason", "MISSING_REQUIRED_FACT"))
                 return False, None, tr
             tr.update(result="KNOWN", fact_revision_id=f.get("revision_id"), display_value=f.get("display", f["value"]))
-            return True, _coerce(self.fact_types[key], f["value"]), tr
+            return True, self._typed(self.fact_types[key], f["value"], n), tr
         if nt == "CONST":
             tr["display_value"] = n["value"]
-            return True, _coerce(n["type"], n["value"]), tr
+            return True, self._typed(n["type"], n["value"], n), tr
         if nt == "SET_REF":
             s = self.sets.get(n["set_version_id"])
             tr["set_version_id"] = n["set_version_id"]
@@ -567,9 +871,12 @@ class _Eval:
                 return False, None, tr
             return True, frozenset(_coerce(s["element_type"], m) for m in s["members"]), tr
         if nt == "CONTEXT_REF":
-            v = self.context["effective_at"]
-            tr["display_value"] = str(v)
-            return True, _coerce("DATE", v), tr
+            # The legal date compared (Option U, legal_date), shown as compared: the sandbox and golden vectors pass
+            # effective_at as written and live evaluation and replay pass its legal date, so the trace of one instant
+            # is the same on every path (and unchanged for live evaluation, whose context is already that date).
+            d = _coerce("DATE", self.context["effective_at"])
+            tr["display_value"] = d.isoformat()
+            return True, d, tr
         raise RuleError("RUL_UNKNOWN_NODE", nt, n.get("node_id"))
 
     def truth(self, n: dict) -> tuple[str, dict]:
@@ -581,6 +888,9 @@ class _Eval:
             children, results = [], []
             decisive = FALSE if nt == "ALL" else TRUE
             single = n.get("single_match")
+            if single and nt != "ANY":  # no single-match semantics outside ANY (validate: RUL_SCHEMA_INVALID)
+                raise RuleError("RUL_SCHEMA_INVALID", "single_match is defined only on an ANY node; an ALL node is "
+                                                      "never evaluated with single-match semantics.", n["node_id"])
             stop = False
             for c in n["children"]:
                 if stop:
@@ -595,6 +905,13 @@ class _Eval:
                 trues = results.count(TRUE)
                 if trues > 1:
                     raise RuleError("RUNTIME_RULE_INVARIANT_BREACH", "SINGLE_MATCH table matched more than one row.", n["node_id"])
+                if trues == 1 and UNKNOWN in results:
+                    # RUL §07 "TRUE + UNKNOWN rows: TRUE only if exclusivity proof guarantees UNKNOWN rows cannot also
+                    # legally match; otherwise ... runtime returns invariant breach." Under the compiler's proof (every
+                    # pair of rows differs on an EQ column, compared by value) a matching row makes every other row
+                    # FALSE, so this state means no proof covers the node: an error, never a TRUE outcome.
+                    raise RuleError("RUNTIME_RULE_INVARIANT_BREACH", "SINGLE_MATCH matched one row while another row is "
+                                    "UNKNOWN; exclusivity is not proven, so the match cannot be relied on.", n["node_id"])
                 res = TRUE if trues == 1 else (UNKNOWN if UNKNOWN in results else FALSE)
             elif decisive in results:
                 res = decisive
@@ -697,11 +1014,121 @@ def evaluate(ast: dict, facts: dict, fact_types: dict, sets: dict, context: dict
             "missing_facts": sorted(mat), "non_material_unknowns": sorted(nonmat - mat)}
 
 
+def _fact_value_ok(fd: dict, value: Any) -> bool:
+    """A typed fact input as FactDefinition accepts it (facts.typed_columns: no implicit coercion), and one the
+    evaluator can execute: a DECIMAL finite and held exactly by value_decimal (decimal_value_ok), a DATE / TIMESTAMP
+    an ISO string."""
+    t, dom = fd.get("data_type") or "", fd.get("enum_domain")
+    try:
+        if t == "BOOLEAN":
+            return isinstance(value, bool)
+        if t == "INTEGER":
+            return isinstance(value, int) and not isinstance(value, bool) and -(2 ** 63) <= value < 2 ** 63
+        if t == "DECIMAL":
+            return not isinstance(value, bool) and decimal_value_ok(Decimal(str(value)))
+        if t == "DATE":
+            return isinstance(value, str) and date.fromisoformat(value) is not None
+        if t == "TIMESTAMP":  # an offset-aware instant, as fact writes and the evaluator require (timestamp_value)
+            return isinstance(value, str) and timestamp_value(value) is not None
+        if is_set(t):
+            return isinstance(value, list) and all(isinstance(x, str) for x in value) and \
+                not (dom and any(x not in dom for x in value))
+        return isinstance(value, str) and not (dom and value not in dom)  # ENUM, STRING, COUNTRY, JURISDICTION
+    except (ValueError, InvalidOperation, TypeError):
+        return False
+
+
+def vector_input_problems(vec: Any, fact_defs: dict) -> list[dict]:
+    """Structural and type problems of one golden vector or sandbox fixture, found before it is evaluated (ZA-RUL-001
+    §13: "facts: Typed inputs or deliberate UNKNOWN reason"; expected_outcome APPLIES / DOES_NOT_APPLY / UNCERTAIN;
+    trace_assertions keyed by node ID; an explicit effective_at). Each problem carries its §18 code: RUL_SCHEMA_INVALID
+    for a malformed field, RUL_FACT_REF_INVALID for a fact key with no FactDefinition, RUL_TYPE_MISMATCH for a value
+    the FactDefinition does not accept. A vector with any problem is never evaluated and never passes."""
+    def p(code, field, msg, **kw):
+        return {"code": code, "severity": "ERROR", "field": field, "message": msg, **kw}
+    if not isinstance(vec, dict):
+        return [p("RUL_SCHEMA_INVALID", None, "A golden vector must be an object.")]
+    out = []
+    if vec.get("expected_outcome") not in OUTCOME.values():
+        out.append(p("RUL_SCHEMA_INVALID", "expected_outcome",
+                     f"expected_outcome must be one of {sorted(OUTCOME.values())}, not {vec.get('expected_outcome')!r}."))
+    if vec.get("vector_class") is not None and not isinstance(vec.get("vector_class"), str):
+        out.append(p("RUL_SCHEMA_INVALID", "vector_class", "vector_class must be a string."))
+    ta = vec.get("trace_assertions")
+    if ta is not None and not (isinstance(ta, dict) and all(isinstance(k, str) for k in ta)):
+        out.append(p("RUL_SCHEMA_INVALID", "trace_assertions", "trace_assertions must map node IDs to expected states."))
+    if "effective_at" in vec:
+        ea = vec["effective_at"]
+        if not _effective_at_ok(ea):
+            out.append(p("RUL_SCHEMA_INVALID", "effective_at", f"effective_at {ea!r} is not an ISO date."))
+    return out + fact_input_problems(vec.get("facts"), fact_defs)
+
+
+def _effective_at_ok(ea: Any) -> bool:
+    """A golden-vector or sandbox effective_at (RUL §13 "Explicit time perspective"): the whole string is an ISO 8601 date
+    or date-time. Only the date part used to be checked, so trailing text ("2027-01-01garbage") was accepted and silently
+    ignored. Which values are accepted is unchanged; the legal date the evaluator reads from one is legal_date's (Option
+    U: the UTC calendar date of an instant with an offset, the written date of a date or of a date-time without one).
+    An instant with no UTC calendar date (legal_date refuses it) is refused here too: accepted, it failed evaluation with
+    an unhandled error instead of being reported as a malformed input."""
+    if not isinstance(ea, str):
+        return False
+    try:
+        date.fromisoformat(ea[:10])
+    except ValueError:
+        return False
+    try:
+        date.fromisoformat(ea)
+        return True
+    except ValueError:
+        pass
+    try:
+        datetime.fromisoformat(ea.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    try:
+        legal_date(ea)
+    except RuleError:
+        return False
+    return True
+
+
+def fact_input_problems(facts: Any, fact_defs: dict) -> list[dict]:
+    """The `facts` of a golden vector or sandbox fixture: an object of FactDefinition key -> typed value, or
+    {"unknown": "<reason>"} for a deliberate UNKNOWN (see vector_input_problems)."""
+    def p(code, fact, msg):
+        return {"code": code, "severity": "ERROR", "field": "facts", "fact": fact, "message": msg}
+    if facts is None:
+        return []
+    if not isinstance(facts, dict):
+        return [p("RUL_SCHEMA_INVALID", None, "facts must be an object of fact key to typed value.")]
+    out = []
+    for key, val in facts.items():
+        fd = fact_defs.get(key)
+        if fd is None:
+            out.append(p("RUL_FACT_REF_INVALID", key, f"Unknown FactDefinition {key!r}."))
+        elif isinstance(val, dict) and "unknown" in val:
+            if not isinstance(val["unknown"], str) or not val["unknown"].strip():
+                out.append(p("RUL_SCHEMA_INVALID", key, f"The UNKNOWN reason for {key} must be a non-empty string."))
+        elif not _fact_value_ok(fd, val):
+            out.append(p("RUL_TYPE_MISMATCH", key, f"Value {val!r} is not a valid {fd.get('data_type')} for fact {key}"
+                         + (f" (domain {fd.get('enum_domain')})." if fd.get("enum_domain") else ".")))
+    return out
+
+
 def run_golden_vectors(ast: dict, vectors: list[dict], fact_defs: dict, sets: dict) -> dict:
-    """Execute reviewed golden vectors against exact AST (RUL-REQ-017)."""
+    """Execute reviewed golden vectors against exact AST (RUL-REQ-017). A vector whose input is malformed
+    (vector_input_problems) is a failed result carrying its first §18 code and every problem, never evaluated."""
     ftypes = {k: v["data_type"] for k, v in fact_defs.items()}
     results = []
+    if not isinstance(vectors, list):
+        vectors = [vectors]
     for vec in vectors:
+        problems = vector_input_problems(vec, fact_defs)
+        if problems:
+            results.append({"vector_id": vec.get("vector_id") if isinstance(vec, dict) else None, "passed": False,
+                            "error": problems[0]["code"], "message": problems[0]["message"], "issues": problems})
+            continue
         facts = {}
         for k, val in (vec.get("facts") or {}).items():
             if isinstance(val, dict) and "unknown" in val:
@@ -722,11 +1149,14 @@ def run_golden_vectors(ast: dict, vectors: list[dict], fact_defs: dict, sets: di
         except RuleError as e:
             results.append({"vector_id": vec.get("vector_id"), "passed": False, "error": e.code, "message": e.message})
     passed = sum(1 for r in results if r["passed"])
-    classes = {v.get("vector_class") for v in vectors}
+    classes = {v.get("vector_class") for v in vectors if isinstance(v, dict) and isinstance(v.get("vector_class"), str)}
     missing = sorted({"POSITIVE", "NEGATIVE", "UNKNOWN"} - classes)
+    # The build these vectors just ran on (RUL §11 stage 9 "on exact evaluator build"; §17 /test "Results linked to draft
+    # revision/evaluator build"). A copy of the identifier here would keep naming the old build after a build change, so a
+    # changed evaluator's results would be attributed to the build that preceded it.
     return {"total": len(results), "passed": passed, "failed": len(results) - passed,
             "all_passed": bool(results) and passed == len(results), "results": results,
-            "missing_mandatory_classes": missing, "evaluator_build": "za-applicability-evaluator:1.0.0"}
+            "missing_mandatory_classes": missing, "evaluator_build": codes.EVALUATOR_BUILD}
 
 
 def _find(trace: dict, node_id: str) -> dict | None:

@@ -64,24 +64,38 @@ def _decision(db, tenant_id: str, det: ApplicabilityDetermination | None, att: A
     """One adoption decision (determination + attestation + evaluation) and the problems that stop it proving itself."""
     p = catalog._problem
     problems: list[dict] = []
-    ev = db.get(ApplicabilityEvaluation, det.evaluation_id) if det else None
-    if det is None:
-        problems.append(p("DETERMINATION_MISSING", "INCOMPLETE", role=role))
+    # Another organisation's record is never summarised or described here, only reported (DOM-INV-11). On PostgreSQL
+    # row-level security already hides it (it reads as missing); the same answer is given on every backend.
+    if det is not None and det.tenant_id != tenant_id:
+        problems.append(p("DETERMINATION_MISMATCH", "MISMATCH", role=role, determination_revision_id=det.revision_id))
+        det, foreign_det = None, True
     else:
-        if det.tenant_id != tenant_id:
-            problems.append(p("DETERMINATION_MISMATCH", "MISMATCH", role=role, determination_revision_id=det.revision_id))
+        foreign_det = False
+    if att is not None and att.tenant_id != tenant_id:
+        att = None
+    ev = db.get(ApplicabilityEvaluation, det.evaluation_id) if det else None
+    if ev is not None and ev.tenant_id != tenant_id:
+        ev = None
+    if det is None:
+        if not foreign_det:
+            problems.append(p("DETERMINATION_MISSING", "INCOMPLETE", role=role))
+    else:
         if det.state != "ADOPTED":
             problems.append(p("DETERMINATION_NOT_ADOPTED", "MISMATCH", role=role, state=det.state,
                               determination_revision_id=det.revision_id))
         if det.outcome not in expect_outcome:
             problems.append(p("OUTCOME_DOES_NOT_SUPPORT_DECISION", "MISMATCH", role=role, outcome=det.outcome,
                               determination_revision_id=det.revision_id))
-        if ev is None or ev.tenant_id != tenant_id:
+        if ev is None:
             problems.append(p("EVALUATION_MISSING", "INCOMPLETE", role=role, evaluation_id=det.evaluation_id))
-        elif (ev.outcome, ev.subject_id, ev.obligation_definition_id) != (det.outcome, det.subject_id,
-                                                                          det.obligation_definition_id):
-            problems.append(p("EVALUATION_MISMATCH", "MISMATCH", role=role, evaluation_id=ev.evaluation_id))
-    if att is None or att.tenant_id != tenant_id:
+        else:
+            if (ev.outcome, ev.subject_id, ev.obligation_definition_id) != (det.outcome, det.subject_id,
+                                                                            det.obligation_definition_id):
+                problems.append(p("EVALUATION_MISMATCH", "MISMATCH", role=role, evaluation_id=ev.evaluation_id))
+            # The evaluation must have run a rule of the definition it evaluated (catalog.evaluation_rule_problems).
+            problems += [{**x, "role": role}
+                         for x in catalog.evaluation_rule_problems(ev, db.get(RuleVersion, ev.rule_version_id))]
+    if att is None:
         problems.append(p("ATTESTATION_MISSING", "INCOMPLETE", role=role))
     else:
         if att.decision != "ATTESTED":
@@ -116,6 +130,56 @@ def _closing(db, tenant_id: str, rev: ObligationInstance, origin: ApplicabilityD
     return det, att
 
 
+def _baseline_unplaced(h: dict, initial: bool) -> bool:
+    """Whether a state taken from the migration-0008 BASELINE event cannot be placed at the cutoff. 0008 recorded each
+    record's state at migration time but stamped it with the record's own record_seq, so at a cutoff before the
+    migration a later state (an approval, a revocation, a fulfilment) would appear before it was recorded (STA §10
+    "historical 'what was known then' still shows it was not approved before its record time"). Only the initial state
+    is exact at every earlier cutoff, because these lifecycles only move forward."""
+    from .assurance import BASELINE_SOURCE
+    return h.get("source") == BASELINE_SOURCE and not initial
+
+
+def governance_records_at(db, tenant_id: str, *, exceptions, compensations, occurrences, as_of: int) -> dict:
+    """Exception, compensation and occurrence state as recorded by record sequence ``as_of``, for a historical dossier
+    (TIM-REQ-006/015; STA §09, §10, §13). Only event history recorded by the cutoff is used; where it is missing,
+    incomplete or inconsistent the state fields are None with a ``problem`` (…_HISTORY_MISSING / _INCOMPLETE /
+    _INCONSISTENT), never the current projection. Read-only.
+
+    Returns {"exceptions": {id: {"state", "approved_by", "historical_state"}}, "compensations": {id: {"status",
+    "approved_by", "historical_state"}}, "occurrences": {id: {"fulfilled_at", "evidence_ids", "disputed",
+    "historical_state"}}}; ``historical_state`` = {"source", "problem", "event_ids"}."""
+    from ..models import ExceptionEvent
+    from .assurance import compensation_states_at, exception_states_at, occurrence_states_at
+
+    def hist(h, problem=None):
+        return {"source": None if problem else h["source"], "problem": problem or h["problem"],
+                "event_ids": h["event_ids"]}
+    out: dict = {"exceptions": {}, "compensations": {}, "occurrences": {}}
+    exc = exception_states_at(db, tenant_id, exceptions, as_of)
+    approvals = {e.exception_id: e.actor_id for e in db.execute(select(ExceptionEvent).where(
+        ExceptionEvent.tenant_id == tenant_id,
+        ExceptionEvent.event_id.in_([i for h in exc.values() for i in h["event_ids"]] or ["-"]),
+        ExceptionEvent.event_type == "APPROVED").order_by(ExceptionEvent.record_seq)).scalars()}
+    for xid, h in exc.items():
+        problem = "EXCEPTION_HISTORY_INCOMPLETE" if _baseline_unplaced(h, h["state"] == "PENDING_APPROVAL") else None
+        ok = h["state"] is not None and problem is None
+        out["exceptions"][xid] = {"state": h["state"] if ok else None,
+                                  "approved_by": approvals.get(xid) if ok else None, "historical_state": hist(h, problem)}
+    for cid, h in compensation_states_at(db, tenant_id, compensations, as_of).items():
+        problem = "COMPENSATION_HISTORY_INCOMPLETE" if _baseline_unplaced(h, h["state"] == "PENDING_APPROVAL") else None
+        ok = h["state"] is not None and problem is None
+        out["compensations"][cid] = {"status": h["state"] if ok else None,
+                                     "approved_by": h["approved_by"] if ok else None, "historical_state": hist(h, problem)}
+    for oid, h in occurrence_states_at(db, tenant_id, occurrences, as_of).items():
+        problem = "OCCURRENCE_HISTORY_INCOMPLETE" if _baseline_unplaced(h, h["fulfilled_at"] is None) else None
+        ok = h["problem"] is None and problem is None
+        out["occurrences"][oid] = {"fulfilled_at": h["fulfilled_at"] if ok else None,
+                                   "evidence_ids": h["evidence_ids"] if ok else None,
+                                   "disputed": h["disputed"] if ok else None, "historical_state": hist(h, problem)}
+    return out
+
+
 def obligation_decision_history(db, tenant_id: str, lineage_id: str, as_of_record_seq: int | None = None) -> dict:
     """Every revision of one obligation recorded by `as_of_record_seq` (all if None), oldest first, each with the
     decision that created it and the evaluation that decision rests on, plus an integrity verdict for the whole chain."""
@@ -130,8 +194,8 @@ def obligation_decision_history(db, tenant_id: str, lineage_id: str, as_of_recor
         origin_att = db.get(AdoptionAttestation, rev.attestation_id)
         origin_view, origin_problems = _decision(db, tenant_id, origin, origin_att, {"APPLIES"}, "origin",
                                                  as_of_record_seq)
-        if origin is not None and (origin.subject_id, origin.obligation_definition_id) != (
-                rev.subject_id, rev.obligation_definition_id):
+        if origin is not None and origin.tenant_id == tenant_id and (origin.subject_id, origin.obligation_definition_id) != (
+                rev.subject_id, rev.obligation_definition_id):  # another organisation's: already reported by _decision
             origin_problems.append(catalog._problem("DETERMINATION_MISMATCH", "MISMATCH", role="origin",
                                                     determination_revision_id=origin.revision_id))
         # Visible to the historical perspective: a record_to_seq after the cutoff was not yet known then.

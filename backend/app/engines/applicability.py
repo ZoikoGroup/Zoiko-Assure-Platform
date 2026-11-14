@@ -19,7 +19,7 @@ from ..models import (AdoptionAttestation, ApplicabilityDetermination, Applicabi
                       FactDefinition, FactRequest, Issue, ObligationDefinition, ObligationInstance, RuleVersion,
                       SatisfactionExpressionVersion, SetVersion, Subject, new_id)
 from ..platform import audit, canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
-from . import rules
+from . import idempotency, rules
 from .facts import resolve_fact
 from .locks import xact_lock
 
@@ -274,10 +274,20 @@ def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationD
     effective_at = ensure_utc(effective_at)
     if persist:  # before the watermark is read and the RuleVersion resolved (see lock_rule_scope)
         lock_rule_scope(db, odef.obligation_definition_id)
+        # The decision scope too, before the watermark is read and the facts are resolved (APP §10). A fact write locks
+        # every scope it may re-evaluate before it takes the record sequence (fact_impact_plan), so this evaluation
+        # either completes first and is then re-evaluated by the fact write, or reads after the fact is committed. It
+        # never commits a result from knowledge older than a fact written meanwhile with nothing left to re-evaluate it
+        # (a subject's first evaluation used to take this lock only after resolving its facts). Lock order unchanged:
+        # rule scope -> decision scope -> record sequence.
+        lock_decision(db, tenant_id, subject.subject_id, odef.obligation_definition_id)
     if record_cutoff_seq is None:
         from ..platform import current_watermark
         record_cutoff_seq = current_watermark(db)["record_seq"]
-    rv = rule_version or resolve_rule(db, odef, effective_at.date(), record_cutoff_seq)
+    # The legal date of the instant (Option U, rules.legal_date): the UTC calendar date, for rule selection and for the
+    # rule's own effective date (CONTEXT_REF) alike, as every other path derives it.
+    legal_day = rules.legal_date(effective_at)
+    rv = rule_version or resolve_rule(db, odef, legal_day, record_cutoff_seq)
     verify_rule_integrity(db, rv)  # before input freeze (ZA-APP-001 §13); raises RuleIntegrityError
     require_supported_versions(rv)  # before input freeze; never an approximate interpretation (RUL-REQ-028)
     require_within_limits(rv)  # before input freeze; a budget breach is an infrastructure error (RUL-REQ-029)
@@ -307,24 +317,26 @@ def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationD
               "fact_inputs": sorted(fact_inputs, key=lambda x: x["fact_definition"]),
               "unknown_facts": sorted(unknowns, key=lambda x: x["fact_definition"]),
               "evaluator_build": codes.EVALUATOR_BUILD}
-    bundle_hash = digest(bundle)
-    eval_key = digest({k: bundle[k] for k in ("subject_ref", "obligation_definition_id", "rule_version_id",
-                                               "fact_inputs", "unknown_facts", "evaluator_build")}
-                      | {"effective_date": effective_at.date().isoformat()})
+    bundle_hash = digest(bundle)  # unchanged contract: the frozen bundle and its hash are not affected by the key below
+    eval_key = evaluation_key(bundle)
     try:
         out = rules.evaluate(rv.canonical_ast, facts, {k: v["data_type"] for k, v in fact_defs.items()},
-                             sets, {"effective_at": effective_at.date().isoformat()})
+                             sets, {"effective_at": legal_day.isoformat()})
     except rules.RuleResourceLimitError as e:  # the evaluator's own guard (RUL-REQ-029); same refusal as above
         raise resource_limit_refusal(rv.rule_version_id, e.violations) from None
     except rules.RuleError as e:  # invariant breach is an infrastructure/content error, never UNCERTAIN
-        raise HTTPException(500, {"error": e.code, "message": e.message, "node_id": e.node_id})
+        refusal = HTTPException(500, {"error": e.code, "message": e.message, "node_id": e.node_id})
+        # The hash of the inputs frozen before the refusal (not part of the response): a read-only replay compares it
+        # with the record, so a refusal by another evaluator build is told apart from altered historical inputs.
+        refusal.input_bundle_hash = bundle_hash
+        raise refusal from e
 
     if not persist:
         return {"outcome": out["outcome"], "trace": out["trace"], "missing_facts": out["missing_facts"],
                 "rule_version_id": rv.rule_version_id, "input_bundle_hash": bundle_hash}
 
-    # Before the duplicate check and the determination it derives (APP-REQ-016; see lock_decision).
-    lock_decision(db, tenant_id, subject.subject_id, odef.obligation_definition_id)
+    # The decision scope is already locked (above), before the duplicate check and the determination it derives
+    # (APP-REQ-016; see lock_decision).
     existing = db.execute(select(ApplicabilityEvaluation).where(
         ApplicabilityEvaluation.tenant_id == tenant_id,
         ApplicabilityEvaluation.evaluation_key == eval_key)).scalars().first()
@@ -348,6 +360,43 @@ def evaluate(db: Session, *, tenant_id: str, subject: Subject, odef: ObligationD
                   "trigger": trigger})
     _derive(db, ev, subject, odef, seq, actor_id)
     return ev
+
+
+# ZA-APP-001 §06 "Idempotency and concurrency": "evaluation_key = hash(subject, obligation_definition, rule_version,
+# effective_at, record_cutoff, exact fact revision set, evaluator_build). Concurrent identical jobs collapse to one
+# committed evaluation ... A new FactAssertion revision, RuleVersion or evaluator build changes the key and creates a new
+# immutable evaluation." Every component is a field of the frozen EvaluationInputBundle, so the key is computed from it:
+# the exact effective_at instant and the exact record cutoff included. The exact fact revision set is fact_inputs (each
+# assertion revision ID with its value hash and provenance) together with unknown_facts (no revision, and why).
+EVALUATION_KEY_FIELDS = ("subject_ref", "obligation_definition_id", "rule_version_id", "effective_at",
+                         "record_cutoff_seq", "fact_inputs", "unknown_facts", "evaluator_build")
+# The key evaluations stored before this change carry (kept as recorded, never rewritten): the effective DATE instead of
+# the instant, and no record cutoff. Used only to say which profile a stored key was made under.
+LEGACY_EVALUATION_KEY_FIELDS = ("subject_ref", "obligation_definition_id", "rule_version_id", "fact_inputs",
+                                "unknown_facts", "evaluator_build")
+
+
+def evaluation_key(bundle: dict) -> str:
+    """The APP-001 §06 deduplication key of an evaluation input bundle (in-memory or as stored: the stored bundle is the
+    canonical JSON of the in-memory one, so both give the same digest). Separate from input_bundle_hash."""
+    return digest({k: bundle[k] for k in EVALUATION_KEY_FIELDS})
+
+
+def evaluation_key_profile(ev: ApplicabilityEvaluation) -> str:
+    """Which key definition a stored evaluation's evaluation_key was made under, recomputed from its own frozen bundle
+    (read-only): APP_001_06 (the full §06 key), LEGACY_EFFECTIVE_DATE (made before the full key: effective date only, no
+    record cutoff; such a row is never matched by a new request, so it is never reinterpreted under the new key), or
+    UNRECOGNISED (the stored key matches neither: the row or its bundle was not written by this code)."""
+    b = ev.input_bundle if isinstance(ev.input_bundle, dict) else {}
+    try:
+        if evaluation_key(b) == ev.evaluation_key:
+            return "APP_001_06"
+        legacy = digest({k: b[k] for k in LEGACY_EVALUATION_KEY_FIELDS} | {"effective_date": str(b["effective_at"])[:10]})
+        if legacy == ev.evaluation_key:
+            return "LEGACY_EFFECTIVE_DATE"
+    except (KeyError, TypeError):
+        pass
+    return "UNRECOGNISED"
 
 
 def digest_safe(obj):
@@ -503,16 +552,58 @@ def _transition_refused(state: str, decision: str) -> HTTPException:
                    + hint.get((state, decision), "")})
 
 
+ATTEST_OPERATION = "POST /applicability/determinations/{lineage_id}/attest"
+
+
+def _attestation_result(db: Session, tenant_id: str, lineage_id: str, attestation_id: str | None) -> dict | None:
+    """What one attestation produced, for an idempotent replay (ZA-API-001 §08: "same attestation_id / same resulting
+    determination revision"): the attestation, the determination revision recorded with it, and the obligation revision
+    it activated (none for a rejection, a non-APPLIES adoption or a closure, as the original response)."""
+    att = db.get(AdoptionAttestation, attestation_id) if attestation_id else None
+    if att is None or att.tenant_id != tenant_id:
+        return None
+    rev = db.execute(select(ApplicabilityDetermination).where(
+        ApplicabilityDetermination.tenant_id == tenant_id, ApplicabilityDetermination.lineage_id == lineage_id,
+        ApplicabilityDetermination.record_from_seq == att.record_seq)).scalars().first()
+    if rev is None:
+        return None
+    obligation = db.execute(select(ObligationInstance).where(
+        ObligationInstance.tenant_id == tenant_id, ObligationInstance.attestation_id == att.attestation_id,
+        ObligationInstance.record_from_seq == att.record_seq)).scalars().first()
+    return {"determination": rev, "attestation": att, "obligation": obligation, "replayed": True}
+
+
+def as_committed(response: dict) -> dict:
+    """A replayed attestation's response as it was committed. The determination revision and the obligation revision the
+    attestation created were current when it committed (record_to_seq null); the only column of either that changes
+    afterwards is record_to_seq, set when a later revision supersedes it in record time (no code path updates any other,
+    and the attestation itself is immutable). The replay reports them as committed, never as they are now. Applied to the
+    serialised response only: the session rows are not touched."""
+    return {**response, **{part: {**response[part], "record_to_seq": None}
+                           for part in ("determination", "obligation") if response.get(part)}}
+
+
 def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, authority_basis: str,
            reason: str | None = None, expected_revision_id: str | None = None,
-           expected_evaluation_id: str | None = None) -> dict:
+           expected_evaluation_id: str | None = None, idempotency_key: str | None = None) -> dict:
     """Customer adoption / rejection (FR-APP-004, INV-01, DOM-INV-03/04) of the exact current determination revision.
 
     `expected_revision_id` / `expected_evaluation_id`: the revision the attestor reviewed and the evaluation it is based
     on. When given, a decision on anything else is refused (409) instead of being applied to a newer state: APP §12
-    "Adopt/reject exact determination revision"; APP §16 "stale/superseded revision cannot be silently attested"."""
+    "Adopt/reject exact determination revision"; APP §16 "stale/superseded revision cannot be silently attested".
+
+    `idempotency_key` (optional; engines/idempotency.py, ZA-API-001 §08): a retry of a committed attestation with the same
+    key and request returns that attestation's result and writes nothing; the key with another request is 409."""
     ctx.require_human("Determination adoption")
     ctx.require("attest")
+    request = {"determination_lineage_id": determination_lineage_id, "decision": decision,
+               "authority_basis": (authority_basis or "").strip(), "reason": (reason or "").strip() or None,
+               "revision_id": expected_revision_id, "evaluation_id": expected_evaluation_id}
+    done = idempotency.replay(db, tenant_id=ctx.tenant, operation=ATTEST_OPERATION, key=idempotency_key, request=request)
+    if done is not None:
+        result = _attestation_result(db, ctx.tenant, determination_lineage_id, done)
+        if result is not None:
+            return result
     if decision not in ATTESTABLE:
         raise HTTPException(422, "decision must be ADOPT or REJECT")
     authority_basis = (authority_basis or "").strip()
@@ -540,7 +631,11 @@ def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, au
     if not cur:
         raise HTTPException(404, "Determination not found")
     if cur.state not in ("PROPOSED", "IN_REVIEW") and not (cur.state == "ADOPTED" and cur.needs_review):
-        raise HTTPException(409, f"Determination in state {cur.state} cannot be attested")
+        # No attestation decision leaves this state (GLS §05: ADOPTED is decided until a differing newer evaluation flags
+        # it; REJECTED re-opens only through a new proposal). Refused with the transition code every other refusal of this
+        # endpoint carries, so a repeated or late request is identified by its code; status and message are unchanged.
+        raise HTTPException(409, {"error": "DETERMINATION_TRANSITION_NOT_PERMITTED", "from_state": cur.state,
+                                  "decision": decision, "message": f"Determination in state {cur.state} cannot be attested"})
     state = "ADOPTED_REVIEW" if cur.state == "ADOPTED" else cur.state
     if state not in ATTESTABLE[decision]:
         raise _transition_refused(state, decision)
@@ -606,6 +701,8 @@ def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, au
              aggregate_id=rev.lineage_id, tenant_id=ctx.tenant, actor=ctx.actor_ref(), record_seq=seq,
              payload={"determination_revision_id": rev.revision_id, "attestation_id": att.attestation_id,
                       "authority_basis": authority_basis, "outcome": ev.outcome, "evaluation_id": ev.evaluation_id})
+    idempotency.remember(db, tenant_id=ctx.tenant, operation=ATTEST_OPERATION, key=idempotency_key, request=request,
+                         result_ref=att.attestation_id)
     return {"determination": rev, "attestation": att, "obligation": obligation}
 
 
@@ -691,7 +788,12 @@ def _activate_obligation(db, det, att, subject, odef, seq, actor_id) -> Obligati
 def fact_impact_plan(db: Session, *, tenant_id: str, holder: Subject, fd: FactDefinition) -> list[tuple]:
     """The (subject, obligation definition) pairs a change of `fd` on `holder` re-evaluates (ZA-APP-001 §10, TIM §17
     impact index): the holder and, for a legal entity, its subordinate subjects, for every definition with a published
-    version that needs the fact and that the subject was evaluated against before. Read-only."""
+    version that needs the fact. Read-only.
+
+    Every such scope is planned (and locked by lock_fact_impact), not only those already evaluated: a subject's first
+    evaluation may be running while the fact is written, and holding its scope makes it either finish first, and be
+    re-evaluated, or start after the fact. reevaluate_for_fact re-evaluates only the scopes that have an evaluation by
+    then; a content or fact change never evaluates a subject for the first time."""
     subjects = [holder]
     if holder.subject_type == "LEGAL_ENTITY":
         subjects += db.execute(select(Subject).where(Subject.tenant_id == tenant_id,
@@ -705,13 +807,7 @@ def fact_impact_plan(db: Session, *, tenant_id: str, holder: Subject, fd: FactDe
             versions = db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == od.obligation_definition_id,
                                                             RuleVersion.status == "PUBLISHED")
                                   .order_by(RuleVersion.version.desc())).scalars().all()
-            if not any(fd.key in v.required_facts for v in versions):
-                continue
-            had = db.execute(select(ApplicabilityEvaluation.evaluation_id).where(
-                ApplicabilityEvaluation.tenant_id == tenant_id,
-                ApplicabilityEvaluation.subject_id == s.subject_id,
-                ApplicabilityEvaluation.obligation_definition_id == od.obligation_definition_id).limit(1)).first()
-            if had:
+            if any(fd.key in v.required_facts for v in versions):
                 plan.append((s, od))
     return plan
 
@@ -732,6 +828,13 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
         plan = fact_impact_plan(db, tenant_id=tenant_id, holder=holder, fd=fd)
         lock_fact_impact(db, tenant_id, plan)
     for s, od in plan:
+        # Only scopes evaluated before (read now, under the scope lock, so an evaluation that committed while this
+        # transaction waited for the lock is included). Unchanged rule: no subject is evaluated for the first time here.
+        had = db.execute(select(ApplicabilityEvaluation.evaluation_id).where(
+            ApplicabilityEvaluation.tenant_id == tenant_id, ApplicabilityEvaluation.subject_id == s.subject_id,
+            ApplicabilityEvaluation.obligation_definition_id == od.obligation_definition_id).limit(1)).first()
+        if not had:
+            continue
         try:
             ev = evaluate(db, tenant_id=tenant_id, subject=s, odef=od, effective_at=datetime.now(timezone.utc),
                           record_cutoff_seq=None, trigger="FACT_CHANGED", actor_id=actor_id)
@@ -777,22 +880,25 @@ def shadow_impact(db: Session, *, odef: ObligationDefinition, candidate_ast: dic
             facts[key] = {"known": True, "value": r["value"], "revision_id": r["revision_id"]} if r["known"] else \
                 {"known": False, "reason": r["reason"]}
         try:
-            cand = rules.evaluate(candidate_ast, facts, {k: v["data_type"] for k, v in fact_defs.items()}, sets,
-                                  {"effective_at": now.date().isoformat()})["outcome"]
+            out = rules.evaluate(candidate_ast, facts, {k: v["data_type"] for k, v in fact_defs.items()}, sets,
+                                 {"effective_at": rules.legal_date(now).isoformat()})
+            cand = out["outcome"]
         except rules.RuleError:
             errors += 1
             continue
-        cur_ev = db.execute(select(ApplicabilityEvaluation).where(
-            ApplicabilityEvaluation.subject_id == s.subject_id,
-            ApplicabilityEvaluation.obligation_definition_id == odef.obligation_definition_id).order_by(
-            ApplicabilityEvaluation.record_seq.desc())).scalars().first()
+        # APP §10 step 3 "Compare current released outcome vs candidate outcome": the latest-knowledge evaluation, as
+        # the publication impact and the determination use it. One requested later at an older record cutoff is history
+        # (TIM-REQ-006/007), not the current outcome.
+        cur_ev = latest_evaluation(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
         prior = cur_ev.outcome if cur_ev else "NONE"
         k = f"{prior}->{cand}"
         buckets[k] = buckets.get(k, 0) + 1
         if cand == "UNCERTAIN":
-            for f, v in facts.items():
-                if not v["known"]:
-                    new_required[f] = new_required.get(f, 0) + 1
+            # APP §10 step 4 "new required fact counts": the material missing facts, exactly the ones an evaluation of
+            # the candidate would raise fact requests for (APP §08, _fact_requests). An unknown fact the result does not
+            # depend on (e.g. under a branch already decided) is not required.
+            for f in out["missing_facts"]:
+                new_required[f] = new_required.get(f, 0) + 1
         det = current_determination(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
         if det and det.state == "ADOPTED" and det.outcome != cand:
             adopted_conflicts += 1

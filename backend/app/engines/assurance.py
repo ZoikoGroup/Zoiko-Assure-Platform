@@ -139,57 +139,161 @@ def _overlap(f, t, a, b) -> bool:
 
 
 # ------------------------------------------------------------------ control evaluation
-def _ipe_overall(db: Session, source_run_id: str | None, cutoff_seq: int) -> str | None:
+def _ipe_overall(db: Session, source_run_id: str | None, cutoff_seq: int, ci: ControlImplementation) -> str | None:
     """The run's bound IPE result (ipe.bound_evaluation), never the newest evaluation: a later re-evaluation, or one
     under a weaker policy, cannot turn a failed population proof into a verified one. A run recorded after the cutoff
-    was not known then, so it supports nothing (None counts as IPE_INCONCLUSIVE below)."""
+    was not known then, so it supports nothing (None counts as IPE_INCONCLUSIVE below). Nor does a run of another
+    organisation or legal entity: it is not population proof for this control (TEN-REQ-008, TEN §14; the same rule
+    test_results._validate applies at ingestion), and it is treated as not found on every backend, not only where
+    row-level security hides it."""
     if not source_run_id:
         return None
     run = db.get(SourceRun, source_run_id)
-    if run is None or run.record_seq > cutoff_seq:
+    if run is None or run.record_seq > cutoff_seq or run.tenant_id != ci.tenant_id or run.entity_id != ci.entity_id:
         return None
     ev = ipe.bound_evaluation(db, run)
     return ev.overall_result if ev else None
 
 
-def _evidence_admissible(db, run: TestRun, td: TestDefinition, policy: ControlTestPolicy, a, b, cutoff_seq):
-    """Returns (status, reasons, evidence_rows): status OK | CONFLICT | UNKNOWN."""
+# Evidence lifecycle ledger events that change an artifact's condition, and the outbox event the owning route writes in
+# the same transaction (routers/evidence.py supersede/invalidate, engines/evidence.py erase_payload; DAT-REQ-014). The
+# ledger orders events by ledger_seq only; their Assure record sequence is that of the outbox event.
+LIFECYCLE_OUTBOX_EVENTS = {"SUPERSEDED": "evidence.superseded", "INVALIDATED": "evidence.invalidated",
+                           "PAYLOAD_ERASED": "evidence.erased"}
+EVIDENCE_HISTORY_UNRESOLVED = "EVIDENCE_HISTORY_UNRESOLVED"
+
+
+class _EvidenceKnowledge:
+    """The evaluated organisation's evidence lifecycle and source-conflict state as known at one record cutoff.
+
+    TIM §11 "Correction join: Historical AS_KNOWN_THEN excludes revisions first recorded after K"; TIM-REQ-006/015;
+    STA-REQ-019 (new knowledge creates new evaluations; it never changes what an earlier cutoff derives). A historical
+    control evaluation therefore reads
+      * an artifact's lifecycle from the ledger events placed at or before the cutoff (record sequence of the outbox
+        event written with each one), and
+      * each evidence conflict's status from evidence_conflict_event recorded at or before the cutoff,
+    never today's projection. Where that history cannot be placed in record time (a lifecycle event without its outbox
+    event, a conflict with no recorded history, or one known at the cutoff only through the migration-0008 baseline,
+    which records the state at migration time, stamped record_seq 0), the gap is reported as
+    EVIDENCE_HISTORY_UNRESOLVED and the evidence cannot support the control: TIM §09 "Any unresolved temporal
+    ambiguity/conflict that prevents deterministic roll-up REQUIRES_REVIEW". Current state is never substituted.
+
+    A cutoff at or after the current record watermark (a current evaluation) keeps the projection reads used before."""
+
+    def __init__(self, db: Session, tenant_id: str, cutoff: int):
+        from ..platform import current_watermark
+        self.db, self.tenant_id, self.cutoff = db, tenant_id, cutoff
+        self.historical = cutoff < current_watermark(db)["record_seq"]
+        self._conflicts: tuple[set[str], set[str]] | None = None
+
+    def lifecycle(self, art: EvidenceArtifact) -> tuple[str | None, str | None]:
+        """(lifecycle at the cutoff, problem). The lifecycle is None when the problem is set."""
+        from ..models import EvidenceLedgerEvent, OutboxEvent
+        material = [t for t in self.db.execute(select(EvidenceLedgerEvent.event_type).where(
+            EvidenceLedgerEvent.tenant_id == art.tenant_id, EvidenceLedgerEvent.evidence_id == art.evidence_id)
+            .order_by(EvidenceLedgerEvent.ledger_seq)).scalars() if t in LIFECYCLE_OUTBOX_EVENTS]
+        if not material:
+            return evd._fold_lifecycle(()), None
+        placed: dict[str, list[int]] = {t: [] for t in LIFECYCLE_OUTBOX_EVENTS}
+        by_name = {v: k for k, v in LIFECYCLE_OUTBOX_EVENTS.items()}
+        for name, seq in self.db.execute(select(OutboxEvent.event_type, OutboxEvent.record_seq).where(
+                OutboxEvent.tenant_id == art.tenant_id, OutboxEvent.aggregate_type == "EvidenceArtifact",
+                OutboxEvent.aggregate_id == art.evidence_id, OutboxEvent.event_type.in_(list(by_name)))
+                .order_by(OutboxEvent.record_seq)):
+            placed[by_name[name]].append(seq)
+        seqs = []
+        if all(len(placed[t]) == material.count(t) for t in LIFECYCLE_OUTBOX_EVENTS):
+            seqs = [placed[t].pop(0) for t in material]
+        if len(seqs) == len(material) and all(x < y for x, y in zip(seqs, seqs[1:])):
+            return evd._fold_lifecycle([t for t, s in zip(material, seqs) if s <= self.cutoff]), None
+        if not self.historical:  # every recorded event is known at a current cutoff
+            return evd._fold_lifecycle(material), None
+        return None, EVIDENCE_HISTORY_UNRESOLVED
+
+    def conflicts(self) -> tuple[set[str], set[str]]:
+        """(member evidence IDs of conflicts OPEN at the cutoff, member IDs whose conflict state there is unknown)."""
+        if self._conflicts is not None:
+            return self._conflicts
+        rows = self.db.execute(select(EvidenceConflict).where(EvidenceConflict.tenant_id == self.tenant_id)
+                               .order_by(EvidenceConflict.created_at, EvidenceConflict.conflict_id)).scalars().all()
+        open_ids: set[str] = set()
+        unknown: set[str] = set()
+        if not self.historical:
+            for c in rows:
+                if c.status == "OPEN":
+                    open_ids |= set(c.member_evidence_ids or [])
+            self._conflicts = (open_ids, unknown)
+            return self._conflicts
+        from ..models import EvidenceConflictEvent
+        from .governance import MIGRATION_BASELINE_EVENT
+        events: dict[str, list] = {}
+        for e in self.db.execute(select(EvidenceConflictEvent).where(EvidenceConflictEvent.tenant_id == self.tenant_id)
+                                 .order_by(EvidenceConflictEvent.record_seq, EvidenceConflictEvent.event_id)).scalars():
+            events.setdefault(e.conflict_id, []).append(e)
+        for c in rows:
+            own = events.get(c.conflict_id, [])
+            known = [e for e in own if e.record_seq <= self.cutoff]
+            if not own:  # no recorded history: whether and how it existed at the cutoff is unknown
+                unknown |= set(c.member_evidence_ids or [])
+            elif not known:  # first recorded after the cutoff: not known then
+                continue
+            elif known[-1].event_type == MIGRATION_BASELINE_EVENT:
+                unknown |= set(known[-1].member_evidence_ids or [])
+            elif known[-1].status == "OPEN":
+                open_ids |= set(known[-1].member_evidence_ids or [])
+        self._conflicts = (open_ids, unknown)
+        return self._conflicts
+
+
+def _evidence_admissible(db, run: TestRun, td: TestDefinition, policy: ControlTestPolicy, a, b, cutoff_seq,
+                         ci: ControlImplementation, known: _EvidenceKnowledge):
+    """Returns (status, reasons, evidence_rows): status OK | CONFLICT | UNKNOWN. CONFLICT (control REQUIRES_REVIEW)
+    also covers evidence whose state at the cutoff cannot be established (_EvidenceKnowledge)."""
     reasons, rows = [], []
     if not run.evidence_ids:
         return UNK, ["MISSING_EVIDENCE"], rows
     arts = [db.get(EvidenceArtifact, e) for e in run.evidence_ids]
-    arts = [x for x in arts if x is not None and x.tenant_id == run.tenant_id and x.record_seq <= cutoff_seq]
+    # This organisation's and this legal entity's evidence only: proof is not reused across entities without a governed
+    # shared-evidence reference (TEN-REQ-008, TEN §14; test_results._validate refuses it at ingestion). A reference
+    # that is not, or was not yet at the cutoff, is treated as missing, as another organisation's always was.
+    arts = [x for x in arts if x is not None and x.tenant_id == run.tenant_id and x.entity_id == ci.entity_id
+            and x.record_seq <= cutoff_seq]
     if not arts:
         return UNK, ["MISSING_EVIDENCE"], rows
-    conflict = False
+    open_ids, unknown_ids = known.conflicts()
+    conflict = unresolved = False
     manual_only = True
     for art in arts:
-        lc = evd.lifecycle(db, art)
-        cond = "CURRENT"
+        lc, problem = known.lifecycle(art)
+        cond = None if problem else "CURRENT"
         if lc == "ERASED":
             cond = "ERASED"
         elif lc == "INVALIDATED":
             cond = "INVALID"
-        elif ensure_utc(art.valid_until) <= a:
+        elif cond and ensure_utc(art.valid_until) <= a:
             cond = "STALE"
-        open_conf = db.execute(select(EvidenceConflict).where(EvidenceConflict.tenant_id == art.tenant_id,
-                                                              EvidenceConflict.status == "OPEN")).scalars().all()
-        if any(art.evidence_id in c.member_evidence_ids for c in open_conf):
+        if art.evidence_id in open_ids:
             cond = "CONFLICTING"
             conflict = True
+        problem = problem or (EVIDENCE_HISTORY_UNRESOLVED if art.evidence_id in unknown_ids else None)
         if art.origin_class not in ("HUMAN_UPLOAD", "ATTESTATION"):
             manual_only = False
-        ipe = _ipe_overall(db, art.source_run_id or run.source_run_id, cutoff_seq) if td.ipe_required else None
-        rows.append({"evidence_id": art.evidence_id, "condition": cond, "origin_class": art.origin_class,
-                     "provenance_class": art.provenance_class, "ipe_result": ipe, "valid_until": art.valid_until})
+        ipe = _ipe_overall(db, art.source_run_id or run.source_run_id, cutoff_seq, ci) if td.ipe_required else None
+        row = {"evidence_id": art.evidence_id, "condition": cond, "origin_class": art.origin_class,
+               "provenance_class": art.provenance_class, "ipe_result": ipe, "valid_until": art.valid_until}
+        if problem:
+            row["history_problem"] = problem
+            reasons.append(problem)
+            unresolved = True
+        rows.append(row)
         if cond in ("STALE", "INVALID", "ERASED"):
             reasons.append({"STALE": "STALE_EVIDENCE", "INVALID": "INVALID_EVIDENCE", "ERASED": "MISSING_EVIDENCE"}[cond])
         if td.ipe_required and ipe != "IPE_VERIFIED":
             reasons.append("IPE_FAILED" if ipe == "IPE_FAILED" else "IPE_INCONCLUSIVE")
     if policy.automation_requirement == "REQUIRED" and manual_only:
         reasons.append("MANUAL_EVIDENCE_INSUFFICIENT")
-    if conflict:
-        return "CONFLICT", sorted(set(reasons + ["SOURCE_CONFLICT"])), rows
+    if conflict or unresolved:
+        return "CONFLICT", sorted(set(reasons + (["SOURCE_CONFLICT"] if conflict else []))), rows
     return ("UNKNOWN" if reasons else "OK"), sorted(set(reasons)), rows
 
 
@@ -217,6 +321,7 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
                                           control_implementation_id=ci.control_implementation_id,
                                           policy_version_id=policy.policy_version_id)
     test_rows = []
+    known = _EvidenceKnowledge(db, ci.tenant_id, cutoff_seq)
     deps = {"control_implementation": ci.control_implementation_id, "policy": policy.policy_version_id, "runs": [], "evidence": []}
     for td in tds:
         runs = db.execute(select(TestRun).where(TestRun.tenant_id == ci.tenant_id,
@@ -234,7 +339,7 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
             conflict = False
             for r in runs:
                 if r.result == "PASS":
-                    st, rs, rows = _evidence_admissible(db, r, td, policy, a, b, cutoff_seq)
+                    st, rs, rows = _evidence_admissible(db, r, td, policy, a, b, cutoff_seq, ci, known)
                     ev_rows += rows
                     deps["evidence"] += [x["evidence_id"] for x in rows]
                     if st == "OK":
@@ -273,10 +378,16 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
     dep_digest = digest({**deps, "window": [a, b], "cutoff": cutoff_seq, "v": codes.CONTROL_EVALUATOR_VERSION})
     out["dependency_digest"] = dep_digest
     if persist:
-        # Concurrent requests can store twins (nothing makes the digest unique); always reuse the earliest.
-        existing = db.execute(select(ControlEvaluation).where(ControlEvaluation.tenant_id == ci.tenant_id,
-                                                              ControlEvaluation.dependency_digest == dep_digest)
-                              .order_by(ControlEvaluation.created_at, ControlEvaluation.evaluation_id)).scalars().first()
+        # Concurrent requests can store twins (nothing makes the digest unique); always reuse the earliest. The digest
+        # names the inputs, not the result, so an evaluation is reused only if it records this result: one stored
+        # before historical reads excluded later evidence events, or altered since, must never lend its ID to a
+        # different state (STA §19 deduplication "identical ... input digest"; STA-REQ-019/020). A new immutable
+        # evaluation is stored instead and the earlier one is left as it is.
+        existing = next((e for e in db.execute(
+            select(ControlEvaluation).where(ControlEvaluation.tenant_id == ci.tenant_id,
+                                            ControlEvaluation.dependency_digest == dep_digest)
+            .order_by(ControlEvaluation.created_at, ControlEvaluation.evaluation_id)).scalars()
+            if _records_result(e, ci, policy, state, reasons, rule, a, b, cutoff_seq)), None)
         if existing:
             out["evaluation_id"] = existing.evaluation_id
         else:
@@ -294,6 +405,15 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
             from . import governance
             governance.raise_control_issue(db, ci=ci, evaluation=ce)
     return out
+
+
+def _records_result(e: ControlEvaluation, ci, policy, state, reasons, rule, a, b, cutoff) -> bool:
+    """Whether a stored evaluation is the one just derived: same control implementation, policy version, window, record
+    cutoff and evaluator, and the same state, reason codes and precedence rule."""
+    return (e.control_implementation_id == ci.control_implementation_id and e.policy_version_id == policy.policy_version_id
+            and ensure_utc(e.window_from) == a and ensure_utc(e.window_to) == b and e.record_cutoff_seq == cutoff
+            and e.evaluator_version == codes.CONTROL_EVALUATOR_VERSION and e.state == state
+            and list(e.reason_codes or []) == list(reasons) and e.precedence_rule == rule)
 
 
 def _jsonable(o):
@@ -575,16 +695,21 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
     impl_ids, keys_all = set(), set()
     for e in exprs:
         keys_all |= _control_keys(e.ast)
+    # Boundary candidates are the dependencies known at the cutoff only (TIM §11 "Correction join: Historical
+    # AS_KNOWN_THEN excludes revisions first recorded after K"; TIM-REQ-015). An implementation, policy or evidence
+    # record first recorded later must not re-segment an earlier perspective (STA-REQ-019).
     for key in keys_all:
         cd = db.execute(select(ControlDefinition).where(ControlDefinition.key == key)).scalars().first()
         if not cd:
             continue
         for ci in db.execute(select(ControlImplementation).where(ControlImplementation.tenant_id == tenant_id,
-                                                                 ControlImplementation.control_definition_id == cd.control_definition_id)).scalars():
+                                                                 ControlImplementation.control_definition_id == cd.control_definition_id,
+                                                                 ControlImplementation.record_seq <= cutoff)).scalars():
             impl_ids.add(ci.control_implementation_id)
             add(ci.valid_from, ci.valid_to)
             for pol in db.execute(select(ControlTestPolicy).where(ControlTestPolicy.tenant_id == tenant_id,
-                                                                  ControlTestPolicy.control_implementation_id == ci.control_implementation_id)).scalars():
+                                                                  ControlTestPolicy.control_implementation_id == ci.control_implementation_id,
+                                                                  ControlTestPolicy.record_seq <= cutoff)).scalars():
                 for td in db.execute(select(TestDefinition).where(TestDefinition.tenant_id == tenant_id,
                                                                   TestDefinition.policy_version_id == pol.policy_version_id)).scalars():
                     for run in db.execute(select(TestRun).where(TestRun.tenant_id == tenant_id,
@@ -593,7 +718,7 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                         add(run.window_from, run.window_to)
                         for eid in run.evidence_ids:
                             art = db.get(EvidenceArtifact, eid)
-                            if art and art.tenant_id == tenant_id:
+                            if art and art.tenant_id == tenant_id and art.record_seq <= cutoff:
                                 add(art.valid_until)
     comps = db.execute(select(Compensation).where(Compensation.tenant_id == tenant_id,
                                                   Compensation.obligation_lineage_id == obligation_lineage_id,
@@ -751,6 +876,14 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
         result["evaluation_instant"] = now
     if not persist:
         return result
+    if period_state in OBLIGATION_ISSUE_RULES:
+        # This snapshot will create or find its obligation-level issue (_issue_hooks). Take the organisation's
+        # issue-raising lock before the record sequence, as raise_control_issue does and as issue closure and
+        # cancellation do (one lock order: issue-raising lock -> issue row -> record-sequence row). Without it the
+        # snapshot could find an issue that a concurrent closure is about to end, and its new condition would then be
+        # covered by no active issue (STA §17). The snapshot's content is not affected.
+        from .governance import lock_issue_raising
+        lock_issue_raising(db, tenant_id)
     seq = next_record_seq(db)
     snap = AssuranceSnapshot(tenant_id=tenant_id, entity_id=obl.entity_id, obligation_lineage_id=obligation_lineage_id,
                              obligation_revision_id=obl.revision_id, period_from=period_from, period_to=period_to,
@@ -925,6 +1058,58 @@ def occurrence_states_at(db: Session, tenant_id: str, occs, cutoff: int) -> dict
     return out
 
 
+COMPENSATION_TRANSITIONS = {("PENDING_APPROVAL", "APPROVED"), ("PENDING_APPROVAL", "REJECTED"), ("APPROVED", "REVOKED")}
+
+
+def compensation_states_at(db: Session, tenant_id: str, comps, cutoff: int) -> dict[str, dict]:
+    """Each compensation's status and approver as known at ``cutoff``, from assurance_compensation_event only, with the
+    same discipline as exception_states_at. Read-only; used by historical dossier reads.
+
+    {compensation_id: {"state", "approved_by", "source", "problem", "event_ids"}}. ``state`` is the to_status of the
+    last event recorded by the cutoff; ``approved_by`` the actor of the APPROVED event recorded by then. None, with a
+    problem, when the history is missing (COMPENSATION_HISTORY_MISSING) or does not prove itself
+    (COMPENSATION_HISTORY_INCONSISTENT: no event by the cutoff although the row was recorded by then, an ambiguous
+    order, a first event other than SUBMITTED/BASELINE, a broken from_status chain, a transition the lifecycle does not
+    allow, identity fields that differ from the row, or a projection that disagrees with the full history).
+
+    Unlike _compensation_status_at (the snapshot engine's reader, unchanged: changing its result would change snapshot
+    output), a missing history is never answered with the projection's status and an unknown status is never assumed
+    PENDING_APPROVAL (STA §09: a compensation "never silently inherits its prior approval")."""
+    from ..models import CompensationEvent
+    from .governance import MIGRATION_BASELINE_EVENT as _BASELINE
+    ids = [c.compensation_id for c in comps]
+    events = db.execute(select(CompensationEvent).where(CompensationEvent.tenant_id == tenant_id,
+                                                        CompensationEvent.compensation_id.in_(ids or ["-"]))
+                        .order_by(CompensationEvent.record_seq, CompensationEvent.event_id)).scalars().all()
+    out = {}
+    for c in comps:
+        own = [e for e in events if e.compensation_id == c.compensation_id]
+        known = [e for e in own if e.record_seq <= cutoff]
+        res = {"state": None, "approved_by": None, "source": None, "problem": None,
+               "event_ids": [e.event_id for e in known]}
+        out[c.compensation_id] = res
+        if not own:
+            res["problem"] = "COMPENSATION_HISTORY_MISSING"
+            continue
+        first = own[0]
+        ok = bool(known) and _ordered_unambiguously(own) and first.from_status is None and \
+            (first.event_type == _BASELINE or (first.event_type == "SUBMITTED" and first.to_status == "PENDING_APPROVAL"))
+        for prev, e in zip(own, own[1:]):
+            ok = ok and e.event_type != _BASELINE and e.from_status == prev.to_status and \
+                (e.from_status, e.to_status) in COMPENSATION_TRANSITIONS and e.event_type == e.to_status
+        ok = ok and all(e.obligation_lineage_id == c.obligation_lineage_id
+                        and e.primary_control_key == c.primary_control_key for e in own)
+        ok = ok and own[-1].to_status == c.status  # the full history is recorded; the projection must agree
+        if not ok:
+            res["problem"] = "COMPENSATION_HISTORY_INCONSISTENT"
+            continue
+        res["state"] = known[-1].to_status
+        res["source"] = BASELINE_SOURCE if known[-1].event_type == _BASELINE else "EVENT_HISTORY"
+        approval = next((e for e in reversed(known) if e.event_type == "APPROVED"), None)
+        res["approved_by"] = approval.actor_id if approval is not None else None
+    return out
+
+
 def _explain(state, segments) -> str:
     n = len(segments)
     cnt = sum(1 for s in segments if s["assurance_state"] == state)
@@ -949,10 +1134,18 @@ def _coalesce(segments):
     return out
 
 
+# Obligation-level issue raised by a persisted snapshot in each state: (title, issue type, severity, priority).
+OBLIGATION_ISSUE_RULES = {"FAILING": ("Obligation FAILING", "OBLIGATION_FAILING", "HIGH", "P1"),
+                          "NOT_PROVEN": ("Proof gap", "PROOF_GAP", "MEDIUM", "P2"),
+                          "REQUIRES_REVIEW": ("Assurance requires review", "ASSURANCE_REVIEW", "HIGH", "P1")}
+
+
 def _issue_hooks(db, tenant_id, snap: AssuranceSnapshot, odef: ObligationDefinition):
-    mapping = {"FAILING": ("Obligation FAILING", "OBLIGATION_FAILING", "HIGH", "P1"),
-               "NOT_PROVEN": ("Proof gap", "PROOF_GAP", "MEDIUM", "P2"),
-               "REQUIRES_REVIEW": ("Assurance requires review", "ASSURANCE_REVIEW", "HIGH", "P1")}
+    """Create the obligation-level issue for a persisted snapshot unless an active one (not CLOSED / CANCELLED) already
+    covers the same condition (issue type + obligation lineage). Runs under the organisation's issue-raising lock,
+    taken by compute_snapshot before the snapshot's record sequence, so the active-issue read below sees any closure
+    or cancellation that committed first, and none can commit in between."""
+    mapping = OBLIGATION_ISSUE_RULES
     if snap.state not in mapping:
         return
     title, itype, sev, pri = mapping[snap.state]

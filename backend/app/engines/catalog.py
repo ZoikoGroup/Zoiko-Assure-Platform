@@ -21,7 +21,7 @@ Contract:
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -473,7 +473,9 @@ def draft_source_mapping_problems(db, draft: RuleDraft, ast: dict, *, release: b
 
     ZA-RUL-001 §11 stage 2 "Reference resolution" (source mappings "resolve") is static validation, and §18 an ERROR
     "Blocks review/release": the §08 fields, IDs, AST references, grounding, requirement version / provision existence,
-    their relationship, the instrument and the cited source fingerprint are checked at every stage (release=False).
+    their relationship, the instrument, and the cited source snapshot (grounded and intact, and the fingerprint the
+    mapping cites; reached through the provision when no requirement version is named) are checked at every stage
+    (release=False).
     Whether the cited requirement version / provision is VERIFIED or PUBLISHED is checked with release=True only: INV-09
     ties VERIFIED review to reaching RELEASED, and the established workflow reviews a rule while its requirement is still
     under verification, the publication refusing until it is verified (an open question for the RUL owner: whether
@@ -531,12 +533,7 @@ def draft_source_mapping_problems(db, draft: RuleDraft, ast: dict, *, release: b
                 if odef and rv.instrument_id != odef.instrument_id:
                     problems.append({"code": "RULE_SOURCE_MAPPING_INSTRUMENT_MISMATCH", "source_mapping_id": mid,
                                      "requirement_version_id": rv_id, "message": "Source mapping instrument mismatch"})
-                src_fp = m.get("source_fingerprint")
-                if src_fp:
-                    src = db.get(RegulatorySource, rv.source_id)
-                    if src and src.fingerprint != src_fp:
-                        problems.append({"code": "RULE_SOURCE_MAPPING_FINGERPRINT_MISMATCH", "source_mapping_id": mid,
-                                         "message": "Source mapping cited fingerprint does not match source snapshot"})
+                problems += _cited_source_problems(db, mid, rv, m.get("source_fingerprint"))
         if pid:
             p = db.get(Provision, pid)
             if p is None:
@@ -549,7 +546,34 @@ def draft_source_mapping_problems(db, draft: RuleDraft, ast: dict, *, release: b
                 problems.append({"code": "RULE_SOURCE_MAPPING_PROVISION_MISMATCH", "source_mapping_id": mid,
                                  "provision_id": pid, "requirement_version_id": rv_id,
                                  "message": f"Provision '{pid}' does not belong to requirement '{rv_id}'"})
+            if p is not None and not rv_id:
+                # Grounded by the provision alone: its source snapshot is the one of the requirement version the provision
+                # belongs to, so the cited fingerprint and the grounding are checked against that snapshot as well.
+                problems += _cited_source_problems(db, mid, db.get(RequirementVersion, p.requirement_version_id),
+                                                   m.get("source_fingerprint"))
     return problems
+
+
+def _cited_source_problems(db, mid: str, rv: RequirementVersion | None, cited_fingerprint) -> list[dict]:
+    """The source snapshot behind a mapping's cited content (ZA-RUL-001 §08: requirement_version_id / provision_id are
+    "Exact source-grounded content objects"; source_fingerprint is the "fingerprint of source version"):
+      RULE_SOURCE_MAPPING_SOURCE_NOT_GROUNDED    the snapshot is missing, has no fingerprint or authoritative locator,
+                                                  or its stored text no longer hashes to its fingerprint (grounded /
+                                                  fingerprint_intact, as verify() and release_binding() require);
+      RULE_SOURCE_MAPPING_FINGERPRINT_MISMATCH   the mapping cites a fingerprint the snapshot does not have.
+    Nothing is reported when the requirement version itself is missing (that is reported on its own)."""
+    if rv is None:
+        return []
+    src = db.get(RegulatorySource, rv.source_id)
+    if not grounded(src) or not fingerprint_intact(src):
+        return [{"code": "RULE_SOURCE_MAPPING_SOURCE_NOT_GROUNDED", "source_mapping_id": mid,
+                 "requirement_version_id": rv.requirement_version_id, "source_id": rv.source_id,
+                 "message": "The cited content rests on a source snapshot that is missing, ungrounded or whose stored "
+                            "text no longer matches its fingerprint"}]
+    if cited_fingerprint and src.fingerprint != cited_fingerprint:
+        return [{"code": "RULE_SOURCE_MAPPING_FINGERPRINT_MISMATCH", "source_mapping_id": mid,
+                 "message": "Source mapping cited fingerprint does not match source snapshot"}]
+    return []
 
 
 def publish_bound(ctx, binding: list[dict], *, content_release_id: str, record_seq: int) -> dict:
@@ -614,16 +638,41 @@ def _walk(node: Any, inherited: tuple[str, ...] = ()):
 def mapping_coverage(rule: RuleVersion) -> dict:
     """RUL §08: which source-mapping references the executable AST uses, which resolve to a mapping record, which
     records are grounded in an exact requirement version/provision, and which records nothing uses."""
-    records = {m.get("source_mapping_id"): m for m in (rule.source_mappings or []) if isinstance(m, dict)}
+    return coverage_of(rule.canonical_ast, rule.source_mappings)
+
+
+def coverage_of(ast: Any, source_mappings: list | None) -> dict:
+    """mapping_coverage for any AST and its mapping records, e.g. a draft's: §08 "the release tooling must show coverage
+    and orphaned mappings". Reports only; whether an orphaned record blocks publication is not decided here. A malformed
+    record (not an object, or without a string ID) or reference (not a string) is left out, as validation reports it."""
+    records = {m.get("source_mapping_id"): m for m in (source_mappings or [])
+               if isinstance(m, dict) and isinstance(m.get("source_mapping_id"), str)}
     used: set[str] = set()
     facts: dict[str, set[str]] = {}
-    for node, refs in _walk(rule.canonical_ast):
-        own = node.get("source_mappings") or []
-        used |= set(own)
+
+    def own_refs(node: dict) -> tuple:
+        own = node.get("source_mappings")
+        return tuple(r for r in own if isinstance(r, str)) if isinstance(own, list) else ()
+
+    def walk(node: Any, inherited: tuple = ()):  # as _walk, with malformed references ignored
+        if isinstance(node, dict):
+            refs = own_refs(node) or inherited
+            if "node_type" in node:
+                yield node, refs
+            for k, v in node.items():
+                if k != "source_mappings":
+                    yield from walk(v, refs)
+        elif isinstance(node, list):
+            for v in node:
+                yield from walk(v, inherited)
+
+    for node, refs in walk(ast):
+        used |= set(own_refs(node))
         if node.get("node_type") == "PREDICATE":
-            for arg, _ in _walk(node.get("args") or []):
+            for arg, _ in walk(node.get("args") or []):
                 if arg.get("node_type") == "FACT_REF":
-                    facts.setdefault(arg.get("fact") or "?", set()).update(refs)
+                    fact = arg.get("fact")
+                    facts.setdefault(fact if isinstance(fact, str) and fact else "?", set()).update(refs)
     return {
         "referenced": sorted(used),
         "unresolved": sorted(used - set(records)),
@@ -652,9 +701,62 @@ def requirement_ref(db, rv: RequirementVersion) -> dict:
 
 
 def current_rule_version(db, odef_id: str) -> RuleVersion | None:
+    """The latest PUBLISHED RuleVersion of a definition: the head of its released lineage (the base a new draft starts
+    from). Not necessarily the version in force: see effective_rule_version and rule_effective_status."""
     return db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == odef_id,
                                                 RuleVersion.status == "PUBLISHED")
                       .order_by(RuleVersion.version.desc())).scalars().first()
+
+
+def _today() -> date:
+    """Today's legal date for catalogue effective-version selection (and the obligation-definition cache key): the same
+    conversion as evaluation (Option U, rules.legal_date: the UTC calendar date of the instant)."""
+    from . import rules  # pure module (no I/O); imported here like this module's other engine imports
+    return rules.legal_date(datetime.now(timezone.utc))
+
+
+def effective_rule_version(db, odef_id: str, on: date | None = None) -> RuleVersion | None:
+    """The PUBLISHED RuleVersion in force on ``on`` (today, UTC, by default): the highest version whose valid period
+    [valid_from, valid_to) contains the date. The same selection applicability makes before binding a rule
+    (engines/applicability.resolve_rule), so a catalogue view names the version evaluations actually bind. DOM §13:
+    "exactly one released rule version is effective for a valid instant"; TIM-REQ-026: future-effective PUBLISHED
+    content does not affect current binding applicability before its valid time. Read-only."""
+    from sqlalchemy import or_
+    on = on or _today()
+    return db.execute(select(RuleVersion).where(
+        RuleVersion.obligation_definition_id == odef_id, RuleVersion.status == "PUBLISHED",
+        RuleVersion.valid_from <= on, or_(RuleVersion.valid_to.is_(None), RuleVersion.valid_to > on))
+        .order_by(RuleVersion.version.desc())).scalars().first()
+
+
+def rule_effective_status(rule: RuleVersion, effective: RuleVersion | None, on: date | None = None) -> str:
+    """Whether a PUBLISHED rule version is the one in force on ``on``: EFFECTIVE, NOT_YET_EFFECTIVE (its valid period
+    starts later), NO_LONGER_EFFECTIVE (its valid period has ended) or NOT_SELECTED (in its valid period, but a higher
+    version in force at the same date is the one bound)."""
+    on = on or _today()
+    if effective is not None and effective.rule_version_id == rule.rule_version_id:
+        return "EFFECTIVE"
+    if rule.valid_from > on:
+        return "NOT_YET_EFFECTIVE"
+    if rule.valid_to is not None and rule.valid_to <= on:
+        return "NO_LONGER_EFFECTIVE"
+    return "NOT_SELECTED"
+
+
+def _rule_ref(rule: RuleVersion | None, on: date) -> dict | None:
+    """A rule version as an exact reference with its valid period, as of the date it was resolved for."""
+    if rule is None:
+        return None
+    return {"rule_version_id": rule.rule_version_id, "version": rule.version, "content_release_id": rule.content_release_id,
+            "valid_from": rule.valid_from, "valid_to": rule.valid_to, "effective_on": on}
+
+
+def rule_currency(db, odef_id: str, on: date | None = None) -> dict:
+    """The latest published (head) and the in-force rule versions of a definition, and whether they are the same."""
+    on = on or _today()
+    head, effective = current_rule_version(db, odef_id), effective_rule_version(db, odef_id, on)
+    return {"head": head, "effective": effective, "on": on,
+            "head_status": rule_effective_status(head, effective, on) if head is not None else None}
 
 
 def release_bound_requirements(db, rule: RuleVersion) -> list[dict] | None:
@@ -714,6 +816,15 @@ def trace_rule_version(db, rule: RuleVersion, as_of_record_seq: int | None = Non
     if basis == "DEFINITION_DERIVED":
         # Read from the definition's provision links as they are now, so it cannot prove what the rule was built on.
         problems.append(_problem("NOT_RELEASE_BOUND", "UNVERIFIABLE", content_release_id=rule.content_release_id))
+    elif (diff := links_binding_difference(odef, entries)) is not None:
+        # The definition's links are not the ones its release bound: the definition changed after release, so its
+        # forward trace (links) and this reverse trace (binding) no longer agree. A bound provision that cannot be
+        # found at all is already reported (PROVISION_MISSING) and is not reported twice.
+        gone = {p for r in requirements for p in r["missing_provision_ids"]}
+        diff["bound_not_linked"] = [p for p in diff["bound_not_linked"] if p not in gone]
+        if diff["linked_not_bound"] or diff["bound_not_linked"]:
+            problems.append(_problem("DEFINITION_LINKS_DIFFER_FROM_RELEASE", "MISMATCH",
+                                     obligation_definition_id=odef.obligation_definition_id, **diff))
     cr = db.get(ContentRelease, rule.content_release_id) if rule.content_release_id else None
     problems += _rule_problems(db, rule)  # includes SOURCE_MAPPINGS_MISMATCH against the release's mapping binding
     entry = next((e for e in ((cr.manifest or {}).get("rule_versions") or []) if isinstance(e, dict)
@@ -759,6 +870,41 @@ def _problem(code: str, cls: str, **ids) -> dict:
 def integrity_verdict(problems: list[dict]) -> dict:
     status = next((s for s in _SEVERITY if any(p["class"] == s for p in problems)), "INTACT")
     return {"status": status, "problems": problems, "signature_verified": False, "signature_note": SIGNATURE_NOTE}
+
+
+def with_problems(trace: dict, extra: list[dict]) -> dict:
+    """`trace` with `extra` problems added to its verdict; the trace itself is returned unchanged when there are none
+    (a trace may be shared by several evaluations of one rule version, so it is never modified in place)."""
+    if not extra:
+        return trace
+    return {**trace, "integrity": integrity_verdict([*trace["integrity"]["problems"], *extra])}
+
+
+def links_binding_difference(odef: ObligationDefinition | None, bound: list | None) -> dict | None:
+    """How a definition's provision links differ from what one of its releases bound, or None if they agree.
+
+    A release binds exactly the definition's links at publication (release_binding), and the links cannot change once a
+    rule of the definition is PUBLISHED (_require_unreleased; DAT-REQ-012; no RuleVersion leaves PUBLISHED). So for a
+    release that binds requirements, any difference means released content changed after release (ZA-DOM-001 §13 "each
+    link is explicit"; §1 "Every link preserves the exact versions used")."""
+    if odef is None or bound is None:
+        return None
+    bound_pids = {p for b in bound if isinstance(b, dict) for p in (b.get("provision_ids") or []) if isinstance(p, str)}
+    linked = {p for p in (odef.provision_ids or []) if isinstance(p, str)}
+    if bound_pids == linked:
+        return None
+    return {"linked_not_bound": sorted(linked - bound_pids), "bound_not_linked": sorted(bound_pids - linked)}
+
+
+def evaluation_rule_problems(ev, rule: RuleVersion | None) -> list[dict]:
+    """An evaluation runs a RuleVersion of the obligation definition it evaluates (ZA-DOM-001 §13 ObligationDefinition ->
+    RuleVersion -> ApplicabilityEvaluation; APP-REQ-003 "exact RuleVersion"). One naming another definition's rule
+    would show that other definition's legal basis as this decision's, so it is reported, never traced as intact."""
+    if ev is None or rule is None or rule.obligation_definition_id == ev.obligation_definition_id:
+        return []
+    return [_problem("RULE_DEFINITION_MISMATCH", "MISMATCH", evaluation_id=ev.evaluation_id,
+                     rule_version_id=rule.rule_version_id, obligation_definition_id=ev.obligation_definition_id,
+                     rule_obligation_definition_id=rule.obligation_definition_id)]
 
 
 def _rule_problems(db, rule: RuleVersion) -> list[dict]:
@@ -812,12 +958,15 @@ def obligation_definitions_for(db, provision_ids: set[str]) -> list[ObligationDe
             if provision_ids & set(o.provision_ids or [])]
 
 
-def _downstream(db, provs: list[Provision]) -> list[dict]:
-    """Forward from provisions: the obligation definitions using them and each one's current rule/release."""
+def _downstream(db, provs: list[Provision], on: date) -> list[dict]:
+    """Forward from provisions: the obligation definitions using them and each one's current rule/release. `on` is the
+    one legal date the whole response resolves in-force versions on (read once by the caller: a clock read per
+    definition could put two rows of one response on two dates across a UTC midnight)."""
     pids = {p.provision_id for p in provs}
     out = []
     for o in obligation_definitions_for(db, pids):
-        rule = current_rule_version(db, o.obligation_definition_id)
+        cur = rule_currency(db, o.obligation_definition_id, on)
+        rule = cur["head"]
         bound = release_bound_requirements(db, rule) if rule else None
         out.append({"obligation_definition_id": o.obligation_definition_id, "key": o.key, "title": o.title,
                     "coverage_mode": o.coverage_mode, "provision_ids": sorted(pids & set(o.provision_ids or [])),
@@ -825,7 +974,13 @@ def _downstream(db, provs: list[Provision]) -> list[dict]:
                         "rule_version_id": rule.rule_version_id, "version": rule.version,
                         "content_release_id": rule.content_release_id,
                         "binding_basis": "RELEASE_BOUND" if bound is not None else "DEFINITION_DERIVED",
-                        "release_binds": sorted({b["requirement_version_id"] for b in bound or []})},
+                        "release_binds": sorted({b["requirement_version_id"] for b in bound or []}),
+                        # Whether this forward link (the definition's provisions) is what the rule's release bound,
+                        # i.e. agrees with the rule's reverse trace; None when the release predates binding.
+                        "links_match_release": None if bound is None else links_binding_difference(o, bound) is None,
+                        # The latest published version is not necessarily the one in force (TIM-REQ-026).
+                        "effective_status": cur["head_status"]},
+                    "effective_rule_version": _rule_ref(cur["effective"], cur["on"]),
                     "control_keys": sorted({r["control_key"] for r in _template_roles(db, o)})})
     return out
 
@@ -839,24 +994,26 @@ def trace_requirement(db, rv: RequirementVersion) -> dict:
                        .order_by(Provision.locator, Provision.provision_id)).scalars().all()
     return {"requirement": requirement_ref(db, rv), "source": source_ref(src),
             "newer_source_snapshots": [source_ref(s) for s in snapshots if src and s.record_seq > src.record_seq],
-            "provisions": [provision_ref(p) for p in provs], "obligation_definitions": _downstream(db, provs),
+            "provisions": [provision_ref(p) for p in provs], "obligation_definitions": _downstream(db, provs, _today()),
             "issues": [i for i in validate(db)["issues"] if i.get("requirement_version_id") == rv.requirement_version_id]}
 
 
 def trace_source(db, s: RegulatorySource) -> dict:
     rvs = db.execute(select(RequirementVersion).where(RequirementVersion.source_id == s.source_id)
                      .order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq)).scalars().all()
+    on = _today()  # one legal date for every requirement's downstream definitions in this response
     out = []
     for rv in rvs:
         provs = db.execute(select(Provision).where(Provision.requirement_version_id == rv.requirement_version_id)
                            .order_by(Provision.locator, Provision.provision_id)).scalars().all()
         out.append({"requirement": requirement_ref(db, rv), "provisions": [provision_ref(p) for p in provs],
-                    "obligation_definitions": _downstream(db, provs)})
+                    "obligation_definitions": _downstream(db, provs, on)})
     return {"source": source_ref(s), "snapshots": [source_ref(x) for x in source_versions(db, s)], "requirements": out}
 
 
 def trace_obligation_definition(db, odef: ObligationDefinition) -> dict:
-    rule = current_rule_version(db, odef.obligation_definition_id)
+    cur = rule_currency(db, odef.obligation_definition_id)
+    rule = cur["head"]
     derived = _derive(db, odef)
     missing = sorted(set(odef.provision_ids or []) - {p for d in derived for p in d["provision_ids"]})
     return {"obligation_definition": {"obligation_definition_id": odef.obligation_definition_id, "key": odef.key,
@@ -866,7 +1023,10 @@ def trace_obligation_definition(db, odef: ObligationDefinition) -> dict:
             "requirements": [{"requirement": requirement_ref(db, rv) if (rv := db.get(RequirementVersion, d["requirement_version_id"])) else None,
                               "source": source_ref(db.get(RegulatorySource, d["source_id"])) if d["source_id"] else None,
                               "provision_ids": d["provision_ids"]} for d in derived],
-            "current_rule": trace_rule_version(db, rule) if rule else None,
+            "current_rule": {**trace_rule_version(db, rule), "effective_status": cur["head_status"]} if rule else None,
+            # The version applicability binds today, which differs from current_rule (the latest published) when that
+            # one is not yet, or no longer, in force (TIM-REQ-026; DOM §13).
+            "effective_rule_version": _rule_ref(cur["effective"], cur["on"]),
             # Requirement -> definition -> control roles: the controls the default SatisfactionExpression template
             # maps this obligation to (DOM §6.1 SatisfactionExpressionTemplate "over control roles"; STA §07).
             "control_roles": _template_roles(db, odef)}
@@ -1112,7 +1272,8 @@ def definition_provisions(db, o: ObligationDefinition) -> list[Provision]:
 def definition_view(db, o: ObligationDefinition) -> dict:
     """The definition with each explicit link resolved to its provision, requirement version and source snapshot."""
     inst = db.get(Instrument, o.instrument_id)
-    rule = current_rule_version(db, o.obligation_definition_id)
+    cur = rule_currency(db, o.obligation_definition_id)
+    rule = cur["head"]
     links = []
     for pid in o.provision_ids or []:
         p = db.get(Provision, pid)
@@ -1126,7 +1287,8 @@ def definition_view(db, o: ObligationDefinition) -> dict:
             "links": links, "control_roles": _template_roles(db, o), "released": rule is not None,
             "current_rule_version": None if rule is None else {
                 "rule_version_id": rule.rule_version_id, "version": rule.version,
-                "content_release_id": rule.content_release_id}}
+                "content_release_id": rule.content_release_id, "effective_status": cur["head_status"]},
+            "effective_rule_version": _rule_ref(cur["effective"], cur["on"])}
 
 
 # ---------------------------------------------------------------- traceability validation (missing/broken links)
@@ -1264,6 +1426,10 @@ def validate(db) -> dict:
             issues.append(_issue("RELEASE_REQUIREMENTS_UNBOUND", "WARNING", "The rule's signed release does not name the "
                                  "requirement versions and source fingerprints it was built on (ZA-RUL-001 §02).",
                                  content_release_id=rule.content_release_id, **rid))
+        elif (diff := links_binding_difference(db.get(ObligationDefinition, rule.obligation_definition_id), bound)):
+            issues.append(_issue("RELEASE_BINDING_DEFINITION_MISMATCH", "ERROR", "The obligation definition's provision "
+                                 "links differ from those this rule's signed release bound: released content changed "
+                                 "after release (DAT-REQ-012).", content_release_id=rule.content_release_id, **diff, **rid))
         for b in bound or []:
             src = sources.get(b.get("source_id"))
             if src is None or src.fingerprint != b.get("source_fingerprint"):

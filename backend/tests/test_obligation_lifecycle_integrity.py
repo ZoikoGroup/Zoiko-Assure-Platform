@@ -447,12 +447,13 @@ def _engine_attest(lineage, decision="ADOPT", reason=None):
         db.commit()
 
 
-def _engine_evaluate(sid):
+def _engine_evaluate(sid, effective_at=None, record_cutoff_seq=None):
     from app.engines import applicability as appl
     from app.models import ObligationDefinition, Subject
     with _session() as db:
         ev = appl.evaluate(db, tenant_id=TA, subject=db.get(Subject, sid), odef=db.get(ObligationDefinition, S["odef"]),
-                           effective_at=NOW(), record_cutoff_seq=None, trigger="EXPLICIT_REQUEST", actor_id=CCO)
+                           effective_at=effective_at or NOW(), record_cutoff_seq=record_cutoff_seq,
+                           trigger="EXPLICIT_REQUEST", actor_id=CCO)
         db.commit()
         return ev.evaluation_id
 
@@ -544,7 +545,15 @@ def test_concurrent_adopt_and_reject_of_one_review_decide_once(client, world, pg
 def test_concurrent_identical_evaluations_collapse_to_one(client, world, pg, monkeypatch):
     """APP-REQ-016: the second identical request returns the first's evaluation instead of failing on the unique key."""
     x = _applies_subject(client, "race-identical", evaluate=False)
-    out, waited = _race(monkeypatch, "_derive", lambda: _engine_evaluate(x["sid"]), lambda: _engine_evaluate(x["sid"]))
+    # Identical under ZA-APP-001 §06: the same exact effective_at instant and the same record cutoff (with the same
+    # subject, definition, rule, fact revisions and build). Two requests at "now" are two different keys.
+    from app.db import AdminSession
+    from app.platform import current_watermark
+    with AdminSession() as db:
+        cutoff = current_watermark(db)["record_seq"]
+    at = NOW()
+    out, waited = _race(monkeypatch, "_derive", lambda: _engine_evaluate(x["sid"], at, cutoff),
+                        lambda: _engine_evaluate(x["sid"], at, cutoff))
     assert waited and out["A"][0] == "ok" and out["B"] == out["A"], out
     from app.db import admin_engine
     with admin_engine.connect() as c:

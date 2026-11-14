@@ -205,9 +205,11 @@ def test_reproducing_old_applicability_evaluation_after_new_release(client, worl
     assert rep["replay"]["reproduced_outcome"] == "APPLIES"
     assert rep["replay"]["input_bundle_hash"] == S["ev1"]["input_bundle_hash"]
 
-    # 3. New evaluation request with cutoff_seq = cutoff_1 resolves to rv1, not rv2
+    # 3. New evaluation request with cutoff_seq = cutoff_1 resolves to rv1, not rv2. With the same exact effective_at
+    # too, every APP-001 §06 key component is equal, so it collapses to the historical evaluation.
     replay_ev = client.post("/api/applicability/evaluations", headers=H(cco_a),
                             json={"subject_id": ORGS["A"][1], "obligation_definition_id": S["odef_id"],
+                                  "effective_at": S["ev1"]["effective_at"],
                                   "record_cutoff_seq": S["cutoff_1"]}).json()
     assert replay_ev["evaluation_id"] == ev1_id  # Collapses idempotently to historical evaluation
     assert replay_ev["outcome"] == "APPLIES"

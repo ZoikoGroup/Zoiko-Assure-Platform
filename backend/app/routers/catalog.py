@@ -22,7 +22,7 @@ from ..engines import catalog as cat
 from ..engines import corrections, release_verification
 from ..models import (ApplicabilityEvaluation, AuditEvent, ContentRelease, ControlDefinition, FactDefinition,
                       FrameworkMapping, Instrument, ObligationDefinition, Provision, RegulatorySource,
-                      RequirementVersion, RuleVersion, SetVersion)
+                      RequirementVersion, SetVersion)
 from ..platform import audit, canonical_json, current_watermark, emit, next_record_seq, sha256_hex, to_dict
 from ..security import CONTENT_READERS, DOSSIER_READ, Ctx, authorize
 
@@ -418,6 +418,8 @@ def traceability_validation(ctx: Ctx = Depends(authorize(*CONTENT_READERS))):
 def odefs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     """Global catalogue content, identical for every authorised caller. Authorised first (the dependency); then
     optionally served from the record-watermark-keyed cache (app/cache.py, ZA_CATALOG_CACHE)."""
+    on = cat._today()
+
     def build():
         out = []
         # Stable order (definitions by key, as obligation_definitions_for; each one's provisions in its link order),
@@ -427,13 +429,17 @@ def odefs(ctx: Ctx = Depends(authorize(*CATALOG_READ))):
             d = to_dict(o)
             inst = ctx.db.get(Instrument, o.instrument_id)
             d["instrument"] = inst.identifier
-            rv = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == o.obligation_definition_id,
-                                                          RuleVersion.status == "PUBLISHED").order_by(RuleVersion.version.desc())).scalars().first()
-            d["current_rule_version"] = to_dict(rv) if rv else None
+            # current_rule_version: the latest published version (unchanged meaning: the base of a new draft), now with
+            # whether it is the one in force; effective_rule_version: the one applicability binds today (TIM-REQ-026).
+            cur = cat.rule_currency(ctx.db, o.obligation_definition_id, on)
+            rv = cur["head"]
+            d["current_rule_version"] = {**to_dict(rv), "effective_status": cur["head_status"]} if rv else None
+            d["effective_rule_version"] = cat._rule_ref(cur["effective"], on)
             d["provisions"] = [to_dict(p) for p in cat.definition_provisions(ctx.db, o)]
             out.append(d)
         return out
-    return cached_catalog_read(ctx.db, "obligation_definitions", build)
+    # Which version is in force depends on the date as well as on the records, so the date is part of the cache key.
+    return cached_catalog_read(ctx.db, f"obligation_definitions.{on.isoformat()}", build)
 
 
 @router.get("/obligation-definitions/{odef_id}/trace")
