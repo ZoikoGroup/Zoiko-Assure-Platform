@@ -90,7 +90,7 @@ export default function EvidenceRecord() {
               {e.checkpoint ? (
                 <KV cols={2} items={[["Checkpoint", <Hash key="c" value={e.checkpoint.checkpoint_id} n={8} />], ["TSA", <Badge key="t" code={e.checkpoint.tsa_status} />],
                   ["Merkle root", <Hash key="m" value={e.checkpoint.merkle_root} />], ["Created", fmtDate(e.checkpoint.created_at, true)]]} />
-              ) : <Notice tone="warn">Not checkpointed yet. <A href="/ledger">Create a checkpoint →</A></Notice>}
+              ) : <Notice tone="warn">Not checkpointed yet. <A href="/audit-reporting?tab=ledger">Create a checkpoint →</A></Notice>}
               <div className="mt-4 text-sm font-semibold text-navy-800">Bindings</div>
               {e.bindings.length ? e.bindings.map((b: any) => <div key={b.binding_id} className="text-xs"><span className="mono">{b.target_type}</span> {b.target_id.slice(0, 12)}… {b.rationale && <span className="text-slate-500">— {b.rationale}</span>}</div>) : <p className="text-xs text-slate-500">None</p>}
               <div className="mt-4 text-sm font-semibold text-navy-800">Legal holds</div>

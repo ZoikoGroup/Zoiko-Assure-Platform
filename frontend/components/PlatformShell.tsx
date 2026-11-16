@@ -6,8 +6,8 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
-  ArrowUpFromLine, Bell, Building2, ChevronRight, ClipboardCheck, FileCog, FileText, LayoutGrid, Loader2, LogOut, Menu,
-  Palette, Search, Server, ShieldCheck, UserCog,
+  ArrowUpFromLine, Bell, Building2, ChevronRight, ClipboardCheck, Database, FileCheck2, FileCog, FileText, KeyRound, LayoutGrid, Loader2, LogOut, Menu,
+  Palette, ScrollText, Search, Server, ShieldCheck, UserCog,
 } from "lucide-react";
 import { useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
@@ -36,12 +36,16 @@ const PLATFORM_NAV: Group[] = [
   ] },
   { group: "Governance", items: [
     { label: "Tenants & Entities", icon: Building2, href: "/organisations" },
+    { label: "Tenant Metadata", icon: Database, href: "/tenant-metadata" },
+    { label: "Source Integrity", icon: FileCheck2, href: "/source-integrity" },
+    { label: "JIT Access", icon: KeyRound, href: "/jit-access" },
+    { label: "Administrative Audit", icon: ScrollText, href: "/administrative-audit" },
     { label: "Regulatory Sources", icon: FileText },
     { label: "Evidence Integrity", icon: ShieldCheck },
     { label: "Agent Controls", icon: UserCog },
   ] },
   { group: "Operations", items: [
-    { label: "Services & Cells", icon: Server },
+    { label: "Service Health", icon: Server, href: "/service-health" },
     { label: "Integrations & Jobs", icon: FileCog },
     { label: "Releases & Policies", icon: ArrowUpFromLine },
   ] },
@@ -54,6 +58,27 @@ function platformNav(permissions?: readonly string[]): Group[] {
   return rest.length ? [...PLATFORM_NAV, { group: "Administration", items: rest.map(({ href, label, icon }) => ({ href, label, icon })) }] : PLATFORM_NAV;
 }
 
+type PageTarget = { href: string; label: string; group: string; terms: string };
+
+/** The pages the header search can open: every linked sidebar entry, under the sidebar's own name and group (so the
+ *  platform screens that nav.ts does not list are found, and "/" is "Command Center"), then the other pages NAV offers
+ *  (for example the design system). A page NAV also names differently still matches that name ("Dashboard" finds the
+ *  Command Center). Planned sidebar entries have no page, so they are not offered. */
+function pageTargets(permissions?: readonly string[]): PageTarget[] {
+  const byHref = new Map<string, PageTarget>();
+  for (const g of platformNav(permissions)) {
+    for (const i of g.items) {
+      if (i.href && !byHref.has(i.href)) byHref.set(i.href, { href: i.href, label: i.label, group: g.group, terms: `${i.label} ${g.group}` });
+    }
+  }
+  for (const j of jumpTargets("platform", permissions)) {
+    const known = byHref.get(j.href);
+    if (known) known.terms += ` ${j.label} ${j.group}`;
+    else byHref.set(j.href, { ...j, terms: `${j.label} ${j.group}` });
+  }
+  return [...byHref.values()];
+}
+
 // As in Shell.tsx: "Super Admin (Platform)" → "SA" / "Super Admin".
 const initials = (n?: string) => (n ?? "?").replace(/\(.*\)/, "").trim().split(/\s+/).slice(0, 2).map((x) => x[0]).join("").toUpperCase();
 const shortName = (n?: string) => (n ?? "").replace(/\s*\(.*\)/, "");
@@ -61,7 +86,11 @@ const shortName = (n?: string) => (n ?? "").replace(/\s*\(.*\)/, "");
 /* The sidebar is dark in both themes, so its focus outline uses the accent (the light theme's navy focus colour would
    not show on it). The global :focus-visible rule reads --za-focus. */
 const SIDEBAR_FOCUS = "[--za-focus:var(--za-accent)]";
-const CONTROL = "rounded-control border border-line bg-surface-control/80 text-fg-secondary transition-colors hover:border-line-strong hover:text-fg";
+const CONTROL = "rounded-control border border-line-control bg-surface-control/80 text-fg-secondary transition-colors hover:border-fg-muted hover:text-fg";
+// The page search's popup: the matching pages, or the note that none match. It is at least 16rem wide, but never wider
+// than the room right of the search on a phone (the 16px gutter, the 42px menu button and an 8px gap sit to its left,
+// 5.125rem with the right gutter), so it does not push the page sideways at 320px.
+const POPUP = "absolute left-0 z-40 mt-2 w-full min-w-[min(16rem,calc(100vw_-_5.125rem))] overflow-hidden rounded-card border border-line bg-surface-modal shadow-modal";
 
 export function PlatformFrame({ path, synthetic, children }: { path: string; synthetic: boolean; children: ReactNode }) {
   const { me } = useAuth();
@@ -89,7 +118,8 @@ export function PlatformFrame({ path, synthetic, children }: { path: string; syn
 
 function PlatformSidebar({ path }: { path: string }) {
   const { me } = useAuth();
-  const active = routeMeta(path)?.item.href;
+  // Platform-only screens that NAV does not list (Service Health) are matched by their exact path.
+  const active = routeMeta(path)?.item.href ?? path;
   const groups = useMemo(() => platformNav(me?.permissions), [me]);
   // Keep the current page's item visible in the scrollable sidebar.
   const navRef = useRef<HTMLElement>(null);
@@ -190,8 +220,12 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
   const { me } = useAuth();
   const router = useRouter();
   const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);   // the results popup, shown while the search has focus and text
+  const [active, setActive] = useState(-1);  // the highlighted result (aria-activedescendant); -1 for none
+  const [said, setSaid] = useState("");      // the polite result-count announcement
   const [mac, setMac] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
+  const listId = useId();
 
   // "/" (when not typing) or ⌘K / Ctrl+K moves focus to the search, unless a dialog is open (as in the organisation header).
   useEffect(() => {
@@ -211,10 +245,40 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
   }, []);
 
   // Jumps to the screens this account may open (navigation, not record search), so it says "pages".
-  const hits = useMemo(() => (q ? jumpTargets("platform", me?.permissions).filter((i) => `${i.label} ${i.group}`.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, me]);
+  const targets = useMemo(() => pageTargets(me?.permissions), [me]);
+  const hits = useMemo(() => (q ? targets.filter((i) => i.terms.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, targets]);
+  // A combobox with a list popup (WAI-ARIA APG): focus stays in the field and the highlighted result is referenced by
+  // aria-activedescendant. The popup shows the matches, or says there are none.
+  const shown = open && q !== "";
+  const expanded = shown && hits.length > 0;
+  const current = expanded && active < hits.length ? active : -1;
+  const optionId = (i: number) => `${listId}-option-${i}`;
+  const reset = () => { setQ(""); setOpen(false); setActive(-1); };
+
+  // The number of matches is announced once typing pauses, and only when it changes, not on every keystroke.
+  useEffect(() => {
+    if (!shown) { setSaid(""); return; }
+    const t = setTimeout(() => setSaid(hits.length ? `${hits.length} matching page${hits.length === 1 ? "" : "s"}` : "No matching pages"), 600);
+    return () => clearTimeout(t);
+  }, [shown, hits.length]);
+
   const onSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && hits[0]) { router.push(hits[0].href); setQ(""); }
-    if (e.key === "Escape") setQ("");
+    if (e.nativeEvent.isComposing) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (!hits.length) return;  // nothing to move through: the keys keep their usual caret behaviour
+      e.preventDefault();
+      const down = e.key === "ArrowDown";
+      if (!expanded) { setOpen(true); setActive(e.altKey ? -1 : down ? 0 : hits.length - 1); return; }
+      setActive(down ? (current + 1) % hits.length : current <= 0 ? hits.length - 1 : current - 1);
+    } else if (e.key === "Enter") {
+      // The highlighted result, or else the first match, as before.
+      const target = hits[current >= 0 ? current : 0];
+      if (target) { e.preventDefault(); reset(); router.push(target.href); }
+    } else if (e.key === "Escape") {
+      // The first Escape closes the popup and keeps the text; the next clears the text.
+      if (shown) { e.preventDefault(); setOpen(false); setActive(-1); }
+      else if (q) { e.preventDefault(); setQ(""); }
+    }
   };
 
   return (
@@ -226,21 +290,30 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
 
       <div className="relative min-w-0 flex-1 md:w-96 md:flex-none">
         <Search size={16} aria-hidden className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-fg-muted" />
-        <input ref={searchRef} type="search" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onSearchKey}
+        <input ref={searchRef} type="search" value={q} onKeyDown={onSearchKey}
+          onChange={(e) => { setQ(e.target.value); setOpen(true); setActive(-1); }}
+          onFocus={() => setOpen(true)} onBlur={() => { setOpen(false); setActive(-1); }}
+          role="combobox" aria-autocomplete="list" aria-expanded={expanded} aria-controls={listId}
+          aria-activedescendant={current >= 0 ? optionId(current) : undefined} autoComplete="off"
           placeholder="Search pages…" aria-label="Search Super Admin pages" aria-keyshortcuts="/ Control+K Meta+K"
           className={`${CONTROL} h-10.5 w-full pl-10 type-secondary text-fg placeholder:text-fg-muted focus:border-accent ${q ? "pr-3" : "pr-3 sm:pr-14"}`} />
         {!q && <kbd aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 rounded-chip border border-line px-1.5 type-code text-fg-muted sm:block">{mac ? "⌘K" : "Ctrl K"}</kbd>}
-        {hits.length > 0 && (
-          <ul aria-label="Matching pages" className="absolute left-0 z-40 mt-2 w-full min-w-64 overflow-hidden rounded-card border border-line bg-surface-modal py-1.5 shadow-modal">
-            {hits.map(({ href, label, group }) => (
-              <li key={href}>
-                <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-3 px-3 py-2 type-secondary text-fg hover:bg-fg/5">
-                  {label}<span className="type-caption text-fg-muted">{group}</span>
-                </Link>
-              </li>
-            ))}
-          </ul>
+        {/* Pressing on a result must not blur the field first (which would close the popup before the click lands). */}
+        <div id={listId} role="listbox" aria-label="Matching pages" hidden={!expanded} onMouseDown={(e) => e.preventDefault()}
+          className={`${POPUP} py-1.5`}>
+          {expanded && hits.map(({ href, label, group }, i) => (
+            <Link key={href} href={href} id={optionId(i)} role="option" aria-selected={i === current} tabIndex={-1} onClick={reset}
+              className={`flex items-center justify-between gap-3 px-3 py-2 type-secondary text-fg hover:bg-fg/5 ${i === current ? "bg-accent/10 outline-2 -outline-offset-2 outline-focus" : ""}`}>
+              {label}<span className="sr-only">, </span><span className="type-caption text-fg-muted">{group}</span>
+            </Link>
+          ))}
+        </div>
+        {shown && hits.length === 0 && (
+          <p onMouseDown={(e) => e.preventDefault()} className={`${POPUP} px-3 py-2.5 type-secondary text-fg-secondary`}>
+            No pages match <span className="font-semibold text-fg">“{q}”</span>.
+          </p>
         )}
+        <p role="status" aria-live="polite" className="sr-only">{said}</p>
       </div>
 
       {synthetic && (
@@ -254,13 +327,30 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
         <ThemeToggle className={`${CONTROL} inline-flex h-10.5 w-10.5 items-center justify-center`} iconSize={17} />
         <Dropdown label="Notifications" menuClassName="w-72" buttonClassName={`${CONTROL} relative inline-flex h-10.5 w-10.5 items-center justify-center`}
           button={<Bell size={17} aria-hidden />}>
-          <div className="border-b border-slate-100 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Needs attention</div>
-          <p className="px-3 py-3 text-[13px] text-slate-500">Notifications cover customer-organisation work, so Zoiko staff accounts have none.</p>
+          <NotificationsPanel />
         </Dropdown>
         <span aria-hidden className="hidden h-8 w-px bg-line sm:block" />
         <NowUtc />
       </div>
     </header>
+  );
+}
+
+/** The notifications panel's content. It is not a modal: it takes focus when it opens, so its heading and text are
+ *  announced, and Tab and Shift+Tab move on from it as usual (leaving the panel closes it). Escape closes it and returns
+ *  focus to the bell (the shared Dropdown). */
+function NotificationsPanel() {
+  const ref = useRef<HTMLDivElement>(null);
+  const textId = useId();
+  useEffect(() => { ref.current?.focus(); }, []);
+  // Named with aria-label: the visible heading is upper-cased by CSS, which would otherwise become the spoken name. The
+  // focus indicator is the application's own :focus-visible outline (globals.css), drawn inside the panel so the
+  // panel's rounded, overflow-hidden frame does not clip it (an inline offset, because that rule is not layered).
+  return (
+    <div ref={ref} tabIndex={-1} role="group" aria-label="Needs attention" aria-describedby={textId} style={{ outlineOffset: -2 }}>
+      <p aria-hidden className="border-b border-slate-100 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Needs attention</p>
+      <p id={textId} className="px-3 py-3 text-[13px] text-slate-500">Notifications cover customer-organisation work, so Zoiko staff accounts have none.</p>
+    </div>
   );
 }
 

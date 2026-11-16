@@ -18,7 +18,7 @@ export function PlaneBadge({ plane, withWho = false, size = "md" }: { plane: Pla
   const Icon = p.icon;
   return (
     <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-chip border font-semibold ${size === "sm" ? "px-1.5 type-caption" : "px-2 py-1 type-caption"} ${p.chip}`}>
-      <Icon size={size === "sm" ? 12 : 13} aria-hidden />{p.label}{withWho && <span className="font-normal opacity-80">· {p.who}</span>}
+      <Icon size={size === "sm" ? 12 : 13} aria-hidden />{p.label}{withWho && <span className="font-normal">· {p.who}</span>}
     </span>
   );
 }

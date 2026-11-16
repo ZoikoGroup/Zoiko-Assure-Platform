@@ -28,7 +28,7 @@ export default function OrganisationPage() {
     return (
       <>
         <PageHeader title="Tenants & Entities" />
-        <Notice>The organisation registry is administered by the Zoiko Super Admin. <Link href="/" className="font-semibold underline">Back to your dashboard</Link>.</Notice>
+        <Notice>Tenants &amp; Entities is part of the Zoiko platform control plane and is available to the Zoiko Super Admin only. <Link href="/" className="font-semibold underline">Back to your dashboard</Link>.</Notice>
       </>
     );
   }
@@ -54,7 +54,7 @@ function OrganisationRecord() {
     <div className="space-y-6">
       <Breadcrumbs items={[{ label: "Tenants & Entities", href: "/organisations" }, { label: o?.legal_name ?? "Organisation record" }]} />
       <RegistryHeading kicker="Customer organisation · registry record"
-        title={<span className="inline-flex flex-wrap items-center gap-x-3 gap-y-2"><span className="min-w-0 break-words">{o?.legal_name ?? "Organisation"}</span>{o && <OrganisationStatus status={o.status} />}</span>}
+        title={o?.legal_name ?? "Organisation"} badge={o && <OrganisationStatus status={o.status} />}
         actions={o && <>
           <Button variant="secondary" icon={Pencil} onClick={() => setDialog("edit")}>Edit name</Button>
           <Button variant="secondary" icon={UserPlus} onClick={() => setDialog("admin")}>Appoint Organisation Admin</Button>

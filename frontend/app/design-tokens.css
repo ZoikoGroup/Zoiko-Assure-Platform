@@ -63,15 +63,18 @@
   --za-surface-control: #ffffff;
   --za-line: #e2e8f0;                 /* slate-200 */
   --za-line-strong: #cbd5e1;          /* slate-300 */
+  /* Form-control boundaries (inputs, selects, header controls): at least 3:1 against the surfaces around them
+     (WCAG 1.4.11). Hairlines between content stay --za-line. */
+  --za-line-control: #768292;
 
   --za-fg: #0f172a;                   /* slate-900 */
   --za-fg-secondary: #475569;         /* slate-600 */
-  --za-fg-muted: #5f6b70;             /* slate-brand */
+  --za-fg-muted: #586368;             /* slate-brand, darkened so small text keeps a margin above 4.5:1 on tinted surfaces */
   --za-fg-disabled: #94a3b8;          /* slate-400 */
   --za-fg-inverse: #ffffff;
   /* The sidebar is a dark surface in both themes, so it has its own text, line and hover tokens. */
   --za-sidebar-fg: #e2e8f0;
-  --za-sidebar-muted: #94a3b8;
+  --za-sidebar-muted: #b0bccb;        /* group labels: at least 4.5:1 on the translucent sidebar over the light backdrop */
   --za-sidebar-strong: #ffffff;
   --za-sidebar-line: rgb(255 255 255 / 0.1);
   --za-sidebar-hover: rgb(255 255 255 / 0.06);
@@ -108,6 +111,7 @@
   --za-surface-control: #182030;
   --za-line: rgb(255 225 200 / 0.1);
   --za-line-strong: rgb(255 225 200 / 0.18);
+  --za-line-control: #7b8497;
 
   --za-fg: #f5f7fb;
   --za-fg-secondary: #a3adc2;
@@ -155,6 +159,7 @@
   --color-surface-control: var(--za-surface-control);
   --color-line: var(--za-line);
   --color-line-strong: var(--za-line-strong);
+  --color-line-control: var(--za-line-control);
 
   --color-fg: var(--za-fg);
   --color-fg-secondary: var(--za-fg-secondary);

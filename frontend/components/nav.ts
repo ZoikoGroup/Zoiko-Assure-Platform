@@ -1,9 +1,9 @@
 import type { LucideIcon } from "lucide-react";
 import type { Persona } from "@/lib/actor";
 import {
-  Archive, Bot, Braces, Building2, CalendarRange, ClipboardCheck, Database, FlaskConical, Flag, GitBranch, Globe2,
+  Archive, Bot, Braces, Building2, CalendarRange, ClipboardCheck, Database, FileSearch, FlaskConical, Flag, GitBranch, Globe2,
   HelpCircle, History, Inbox, KeyRound, LayoutDashboard, Library, Link2, Lock, Package, PackageCheck, PlayCircle, Plug,
-  Scale, ShieldAlert, SlidersHorizontal, Users,
+  Scale, Settings2, ShieldAlert, SlidersHorizontal, Users,
 } from "lucide-react";
 
 import SCREEN_ACCESS from "@/lib/screen-access.json";
@@ -76,65 +76,156 @@ export const NAV: NavGroup[] = NAV_ITEMS.map((g) => ({ ...g, items: g.items.map(
 const permitted = (i: NavItem, permissions?: readonly string[]) =>
   !i.perms || !permissions || i.perms.some((p) => permissions.includes(p));
 
-/** The organisation workspace sidebar (customer-organisation users), grouped as the Organization Command Center design.
- *  Each entry opens an existing NAV screen; `more` lists the section's other NAV screens, shown beneath it while one of
- *  them is open. Every tenant screen in NAV appears here exactly once, so no destination is lost. Presentation only:
- *  breadcrumbs, canOpen and "Jump to" keep using NAV. */
-export type OrgNavItem = { href: string; label: string; icon: LucideIcon; more?: string[] };
+/** The organisation workspace sidebar (customer-organisation users): four groups holding 13 standard entries and the
+ *  optional Agent Governance. A consolidated page (`tabs`, components/WorkspaceHub.tsx) holds former screens as tabs,
+ *  and each former address still opens its tab. Rule Authoring and the Rule Test Workbench (Zoiko content-staff tools)
+ *  and Identity Integrations (nothing to configure until enterprise sign-in exists) are not offered to organisation
+ *  users; they stay in NAV, so content staff and the Super Admin keep them, and their pages are unchanged. The staff
+ *  sidebars, breadcrumbs and "Jump to" keep using NAV; organisation users' sidebar, breadcrumbs, document titles, page
+ *  search and post-sign-in check use this. Presentation only: the backend authorises every request. */
+
+/** One tab of a consolidated organisation page. `screen`: the NAV screen it shows. That screen's permissions decide
+ *  whether the tab is offered, and its own address opens this tab. `aliases`: former names the page search also finds
+ *  it by. */
+export type OrgTab = { id: string; label: string; screen: string; aliases?: string[] };
+/** `aliases`: former sidebar or page names the page search also finds the entry by, so none needs a second entry.
+ *  `tabs`: the entry is a consolidated page, offered when any of its tabs is; otherwise it is its own NAV screen. */
+export type OrgNavItem = { href: string; label: string; icon: LucideIcon; aliases?: string[]; tabs?: OrgTab[] };
 export type OrgNavGroup = { group: string; items: OrgNavItem[] };
 const ORG_NAV: OrgNavGroup[] = [
   { group: "Workspace", items: [
-    { href: "/", label: "Overview", icon: LayoutDashboard },
-    { href: "/fact-requests", label: "My Work & Approvals", icon: HelpCircle },
+    { href: "/", label: "Overview", icon: LayoutDashboard, aliases: ["Dashboard", "Organization Command Center", "Home"] },
+    { href: "/fact-requests", label: "My Work & Approvals", icon: HelpCircle, aliases: ["Fact requests", "Tasks"] },
   ] },
-  { group: "Regulation", items: [
-    { href: "/regulatory", label: "Change Radar", icon: Inbox, more: ["/sources", "/rules", "/rules/workbench"] },
-    { href: "/obligations", label: "Obligations", icon: ClipboardCheck },
+  { group: "Obligations", items: [
+    { href: "/obligations", label: "Obligations", icon: ClipboardCheck, tabs: [
+      { id: "current", label: "Current Obligations", screen: "/obligations", aliases: ["Obligation Dossiers"] },
+      { id: "assurance-periods", label: "Assurance Periods", screen: "/assurance", aliases: ["Assurance Reports", "Period assurance"] },
+    ] },
+    { href: "/applicability", label: "Decisions & Attestations", icon: Scale, tabs: [
+      { id: "decisions", label: "Decisions", screen: "/applicability", aliases: ["Applicability Review", "Determinations", "Attest"] },
+      { id: "evaluation-trace", label: "Evaluation Trace", screen: "/applicability/trace", aliases: ["Applicability Trace", "Evaluations"] },
+    ] },
+    { href: "/entities", label: "Entities & Facts", icon: Building2, aliases: ["Entities & Scope", "Subjects"] },
+    { href: "/regulatory-library", label: "Regulatory Library", icon: Library, aliases: ["Change Radar"], tabs: [
+      { id: "sources", label: "Regulatory Sources", screen: "/regulatory", aliases: ["Regulatory Inbox"] },
+      { id: "requirements", label: "Requirements & Provisions", screen: "/sources", aliases: ["Sources & Provisions", "Catalogue & coverage", "Instruments"] },
+      { id: "releases", label: "Content Releases", screen: "/admin/releases" },
+    ] },
+    // Optional in the navigation proposal: meant for organisations that register AI systems. No organisation-level
+    // indicator of that reaches the frontend (GET /org/tenant and /dashboard/attention carry none), and AI systems are
+    // registered on this screen, so hiding it until one exists would remove the way to register the first. It is
+    // therefore offered to everyone whose roles can open it.
+    { href: "/ai", label: "Agent Governance", icon: Bot, aliases: ["AI/Agent Asset Dossiers", "AI assets", "AI systems", "Agents"] },
   ] },
   { group: "Assurance", items: [
-    { href: "/controls", label: "Controls & Testing", icon: SlidersHorizontal },
-    { href: "/evidence", label: "Evidence & IPE", icon: Archive, more: ["/ipe", "/ipe/runs"] },
-    { href: "/governance", label: "Findings & Actions", icon: Flag },
-    { href: "/assurance", label: "Assurance Reports", icon: CalendarRange, more: ["/packages", "/history"] },
-  ] },
-  { group: "Governance", items: [
-    { href: "/entities", label: "Entities & Scope", icon: Building2 },
-    { href: "/applicability", label: "Decisions & Attestations", icon: Scale, more: ["/applicability/trace"] },
-    { href: "/ai", label: "Agent Governance", icon: Bot },
+    { href: "/controls", label: "Controls & Testing", icon: SlidersHorizontal, aliases: ["Controls & Tests"] },
+    { href: "/evidence", label: "Evidence", icon: Archive, aliases: ["Evidence & IPE"], tabs: [
+      { id: "records", label: "Evidence Records", screen: "/evidence", aliases: ["Upload evidence", "Evidence conflicts"] },
+      { id: "ipe", label: "IPE", screen: "/ipe", aliases: ["IPE anomalies", "IPE policies", "Information Produced by the Entity"] },
+      { id: "source-runs", label: "Source Runs", screen: "/ipe/runs" },
+      { id: "retention", label: "Retention & Legal Holds", screen: "/admin/retention", aliases: ["Legal holds", "Erased evidence"] },
+    ] },
+    { href: "/governance", label: "Findings & Actions", icon: Flag, aliases: ["Issues", "Exceptions"] },
+    { href: "/audit-reporting", label: "Audit & Reporting", icon: FileSearch, aliases: ["Audit Trail", "Assurance Reports"], tabs: [
+      { id: "packages", label: "Audit Packages", screen: "/packages", aliases: ["Audit Package Builder", "Verify package"] },
+      { id: "ledger", label: "Ledger", screen: "/ledger", aliases: ["Checkpoints"] },
+      { id: "history", label: "Historical Reconstruction", screen: "/history", aliases: ["History"] },
+      { id: "access-log", label: "Access Log", screen: "/admin/access-log", aliases: ["Privileged Access Log", "Audit events"] },
+    ] },
   ] },
   { group: "Admin", items: [
-    { href: "/admin/users", label: "Team & Access", icon: Users },
-    { href: "/connectors", label: "Integrations", icon: Plug, more: ["/admin/identity"] },
-    { href: "/ledger", label: "Audit Trail", icon: Link2, more: ["/admin/access-log"] },
-    { href: "/admin/cells", label: "Org Settings", icon: Globe2, more: ["/admin/retention", "/admin/releases"] },
+    { href: "/admin/users", label: "Team & Access", icon: Users, aliases: ["Users & Roles", "Sessions"] },
+    { href: "/connectors", label: "Integrations", icon: Plug, aliases: ["Connectors", "Event outbox"] },
+    { href: "/admin/cells", label: "Organisation Settings", icon: Settings2, aliases: ["Org Settings", "Cells & Residency", "Legal entities"] },
   ] },
 ];
 
 const ITEMS = NAV.flatMap((g) => g.items.map((i) => ({ ...i, group: g.group })));
 
-/** The organisation sidebar, limited to screens the tenant navigation offers to someone with `permissions`. `sub`
- *  resolves `more` to NAV items, so each sub-entry keeps its screen's own label and icon. A section whose own screen is
- *  not permitted but one of whose `more` screens is opens that screen instead, so no permitted destination is lost. */
-export function orgNav(permissions?: readonly string[]): { group: string; items: (OrgNavItem & { sub: NavItem[] })[] }[] {
-  const allowed = new Set(navFor("tenant", permissions).flatMap((g) => g.items.map((i) => i.href)));
-  return ORG_NAV.map((g) => ({
-    ...g,
-    items: g.items.flatMap((i) => {
-      const sub = (i.more ?? []).filter((h) => allowed.has(h)).map((h) => ITEMS.find((n) => n.href === h)!);
-      if (allowed.has(i.href)) return [{ ...i, sub }];
-      return sub.length ? [{ ...i, href: sub[0].href, sub: sub.slice(1) }] : [];
-    }),
-  })).filter((g) => g.items.length > 0);
+/** The NAV screens a persona (with `permissions`) can open. */
+export function openableScreens(persona: Persona, permissions?: readonly string[]): Set<string> {
+  return new Set(navFor(persona, permissions).flatMap((g) => g.items.map((i) => i.href)));
 }
 
-/** The organisation sidebar section a path belongs to, for its breadcrumb and active state. */
-export function orgSection(path: string): { group: string; item: OrgNavItem } | null {
-  const href = routeMeta(path)?.item.href;
-  for (const g of ORG_NAV) {
-    const item = g.items.find((i) => i.href === href || i.more?.includes(href ?? ""));
-    if (item) return { group: g.group, item };
+/** The tabs of `item` offered to someone who can open `screens`, in their order. */
+export const offeredTabs = (item: OrgNavItem, screens: Set<string>) => (item.tabs ?? []).filter((t) => screens.has(t.screen));
+const isOffered = (item: OrgNavItem, screens: Set<string>) => (item.tabs ? offeredTabs(item, screens).length > 0 : screens.has(item.href));
+
+/** A tab's address: the page itself for the first of the offered `tabs` (what the page opens on), else `?tab=<id>`. */
+export const tabHref = (item: OrgNavItem, tab: OrgTab, tabs: OrgTab[]) => (tabs[0] === tab ? item.href : `${item.href}?tab=${tab.id}`);
+
+/** The organisation sidebar entry at `href`. */
+export const orgEntry = (href: string) => ORG_NAV.flatMap((g) => g.items).find((i) => i.href === href);
+
+/** The consolidated page and tab a former screen address now opens (for example "/ipe/runs" → Evidence › Source Runs).
+ *  The tab is always named, so a tab this person cannot open is reported as such rather than replaced by another. */
+export function orgTabOf(screen: string): { item: OrgNavItem; tab: OrgTab; href: string } | null {
+  for (const item of ORG_NAV.flatMap((g) => g.items)) {
+    const tab = item.tabs?.find((t) => t.screen === screen);
+    if (tab) return { item, tab, href: `${item.href}?tab=${tab.id}` };
   }
   return null;
+}
+
+/** The organisation sidebar, limited to the entries someone with `permissions` can open (every entry without). */
+export function orgNav(permissions?: readonly string[]): OrgNavGroup[] {
+  const screens = openableScreens("tenant", permissions);
+  return ORG_NAV.map((g) => ({ ...g, items: g.items.filter((i) => isOffered(i, screens)) })).filter((g) => g.items.length > 0);
+}
+
+type OrgMatch = { group: string; item: OrgNavItem; screen: string | null; isDetail: boolean };
+
+/** The organisation sidebar entry a path belongs to: the entry's own page, a former screen that is now one of its tabs,
+ *  or a record page below either (/evidence/{id}, /ipe/{run}, /applicability/{evaluation}, …); the longest match wins.
+ *  `screen`: the NAV screen whose permissions apply, or null for a consolidated page's own address when no tab shares
+ *  it (any offered tab opens it). */
+function orgMatch(path: string): OrgMatch | null {
+  let best: (OrgMatch & { len: number }) | null = null;
+  for (const g of ORG_NAV) {
+    for (const item of g.items) {
+      const own = item.tabs?.find((t) => t.screen === item.href);
+      const roots: [string, string | null][] = [[item.href, item.tabs ? own?.screen ?? null : item.href],
+        ...(item.tabs ?? []).filter((t) => t !== own).map((t): [string, string | null] => [t.screen, t.screen])];
+      for (const [root, screen] of roots) {
+        const exact = path === root;
+        if (!exact && (root === "/" || !path.startsWith(`${root}/`))) continue;
+        if (!best || root.length > best.len) best = { group: g.group, item, screen, isDetail: !exact, len: root.length };
+      }
+    }
+  }
+  return best && { group: best.group, item: best.item, screen: best.screen, isDetail: best.isDetail };
+}
+
+/** Where a path sits in the organisation sidebar (the routeMeta of organisation users): its group, its entry, and
+ *  whether it is a record page below that entry. Null for screens the organisation sidebar does not offer. */
+export function orgRouteMeta(path: string): RouteMeta | null {
+  const m = orgMatch(path);
+  return m && { group: m.group, item: { href: m.item.href, label: m.item.label }, isDetail: m.isDetail };
+}
+
+export type OrgSearchTarget = { href: string; label: string; group: string; tab?: string; terms: string };
+
+/** What organisation users' page search offers: each sidebar entry under its own name, each tab of a consolidated page
+ *  as "<entry> › <tab>" (its first tab is the page itself), then EXTRA. Former names (aliases) match too, so "Change
+ *  Radar" finds Regulatory Library and "Ledger" finds Audit & Reporting › Ledger. */
+export function orgSearchTargets(permissions?: readonly string[]): OrgSearchTarget[] {
+  const screens = openableScreens("tenant", permissions);
+  const out = new Map<string, OrgSearchTarget>();
+  for (const g of ORG_NAV) {
+    for (const item of g.items.filter((i) => isOffered(i, screens))) {
+      out.set(item.href, { href: item.href, label: item.label, group: g.group, terms: [item.label, g.group, ...(item.aliases ?? [])].join(" ") });
+      const tabs = offeredTabs(item, screens);
+      for (const tab of tabs) {
+        const href = tabHref(item, tab, tabs);
+        const terms = [tab.label, ...(tab.aliases ?? [])].join(" ");
+        const known = out.get(href);
+        if (known) known.terms += ` ${terms}`;
+        else out.set(href, { href, label: item.label, group: g.group, tab: tab.label, terms });
+      }
+    }
+  }
+  return [...out.values(), ...EXTRA.map((e) => ({ ...e, terms: `${e.label} ${e.group}` }))];
 }
 
 /** Detail routes whose section is not their URL prefix (the source-run and evaluation-trace detail pages). */
@@ -190,6 +281,13 @@ export function navFor(persona: Persona, permissions?: readonly string[]): NavGr
  *  only: the backend authorises every request regardless. */
 export function canOpen(persona: Persona, path: string, permissions?: readonly string[]): boolean {
   if (PLATFORM_DETAIL.test(path)) return persona === "platform";
+  // Organisation users: what their own sidebar offers (a consolidated page's tabs at their former addresses included),
+  // not the content-staff tools it leaves out.
+  if (persona === "tenant" && !EXTRA.some((e) => e.href === path)) {
+    const m = orgMatch(path);
+    const screens = openableScreens("tenant", permissions);
+    return !!m && (m.screen ? screens.has(m.screen) : isOffered(m.item, screens));
+  }
   const meta = routeMeta(path);
   if (!meta) return false;
   return EXTRA.some((e) => e.href === meta.item.href) || navFor(persona, permissions).some((g) => g.items.some((i) => i.href === meta.item.href));

@@ -15,8 +15,8 @@ import { Badge, EmptyState, ErrorBox, LoadingSkeleton, Notice, PageHeader, usePa
 /* The Organization Command Center. Every figure is read from the backend (dashboard projection, controls, IPE
    anomalies, organisation record) and links to the screen where it is worked. Nothing here derives applicability or
    assurance state in the browser, nothing is a compliance score, and nothing is demonstration data: where the backend
-   records no figure, none is shown. */
-const TITLE = "Organization Command Center";
+   records no figure, none is shown. Its heading is "Overview", the organisation sidebar's name for it. */
+const TITLE = "Overview";
 
 type Tone = "bad" | "warn" | "info" | "ink";
 const VALUE_TONE: Record<Tone, string> = { bad: "text-red-700", warn: "text-yellow-700", info: "text-teal-700", ink: "text-slate-900" };
@@ -120,7 +120,7 @@ function CommandCenterView() {
     ...ctlOff.filter((c) => c.current_state.state === "FAILING").map((c) => ({ key: c.control_implementation_id, level: "high" as const,
       what: c.definition?.title ?? c.method, detail: `Control failing · ${c.subject}`, href: `/controls/${c.control_implementation_id}` })),
     ...openAnomalies.map((a) => ({ key: a.anomaly_id, level: (["CRITICAL", "HIGH"].includes(a.severity) ? "high" : "medium") as Attention["level"],
-      what: `IPE anomaly: ${a.anomaly_class.replace(/_/g, " ").toLowerCase()}`, detail: `${a.severity} · awaiting disposition`, href: "/ipe" })),
+      what: `IPE anomaly: ${a.anomaly_class.replace(/_/g, " ").toLowerCase()}`, detail: `${a.severity} · awaiting disposition`, href: "/evidence?tab=ipe" })),
     ...(issues?.total ? [{ key: "issues", level: (issues.by_severity.CRITICAL || issues.by_severity.HIGH ? "high" : "medium") as Attention["level"],
       what: `${plural(issues.total, "open issue")}`, detail: list(Object.entries(issues.by_severity).filter(([, v]) => v > 0)), href: "/governance" }] : []),
     ...(proposed + inReview ? [{ key: "det", level: "medium" as const, what: `${plural(proposed + inReview, "applicability determination")} awaiting adoption`,
@@ -142,7 +142,7 @@ function CommandCenterView() {
     { perm: "manage_controls", label: "Implement a control", href: "/controls" },
     { perm: "manage_issues", label: "Work open issues", href: "/governance" },
     { perm: "approve_exception", label: "Decide exceptions", href: "/governance" },
-    { perm: "package", label: "Build an audit package", href: "/packages" },
+    { perm: "package", label: "Build an audit package", href: "/audit-reporting?tab=packages" },
     { perm: "manage_ai", label: "Register an AI asset", href: "/ai" },
   ].filter((s) => can(s.perm));
 
@@ -212,7 +212,7 @@ function CommandCenterView() {
                     <dd className="font-semibold tabular-nums text-slate-900">{totals[k] ?? 0}</dd>
                   </div>
                 ))}
-                <div className="pt-1"><Link href="/assurance" className="text-[13px] font-semibold text-teal-700 hover:underline">Open assurance reports</Link></div>
+                <div className="pt-1"><Link href="/obligations?tab=assurance-periods" className="text-[13px] font-semibold text-teal-700 hover:underline">Open assurance periods</Link></div>
               </dl>
             ) : dash.error ? <p className="mt-3 text-[13px] text-slate-500">Unavailable</p> : <LoadingSkeleton rows={3} className="px-0" />}
           </section>

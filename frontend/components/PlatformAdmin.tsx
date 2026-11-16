@@ -11,7 +11,7 @@ import {
   Table, Td, TextInput, Th, Tr, buttonClasses,
 } from "./ds";
 import { STATUS_ICON, STATUS_SURFACE, STATUS_TONE, type StatusKey } from "./ds/Status";
-import { ClassificationBadge, count, organisationItems, type QueueItem } from "./platformQueue";
+import { CLASSIFICATION, ClassificationBadge, count, organisationItems, type QueueItem } from "./platformQueue";
 import { useAction, usePageTitle, useSortedRows } from "./ui";
 
 /* Super Admin: the customer-organisation registry (platform principal, ZA-TEN-001 WF-TEN-01 / ZA-IAM-001). The backend
@@ -100,13 +100,20 @@ export function RegistrySection({ title, description, aside, children, className
   );
 }
 
-/** A page heading in the Platform Command Center and Action Queue style. */
-export function RegistryHeading({ kicker, title, children, actions }: { kicker: string; title: ReactNode; children?: ReactNode; actions?: ReactNode }) {
+/** A page heading in the Platform Command Center and Action Queue style. A badge (for example a status chip) sits
+ *  beside the heading, outside it, so it is not read as part of the page's name. */
+export function RegistryHeading({ kicker, title, badge, children, actions }:
+  { kicker: string; title: ReactNode; badge?: ReactNode; children?: ReactNode; actions?: ReactNode }) {
+  const H1 = "break-words text-[26px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]";
   return (
     <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
       <div className="min-w-0">
         <p className="type-label text-fg-muted">{kicker}</p>
-        <h1 className="mt-1 break-words text-[26px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">{title}</h1>
+        {badge ? (
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-2">
+            <h1 className={`min-w-0 ${H1}`}>{title}</h1>{badge}
+          </div>
+        ) : <h1 className={`mt-1 ${H1}`}>{title}</h1>}
         {children && <div className="mt-2 max-w-3xl text-[15px] text-fg-secondary">{children}</div>}
       </div>
       {actions && <div className="flex shrink-0 flex-wrap gap-2">{actions}</div>}
@@ -173,7 +180,11 @@ export function SuperAdminDashboard({ title = "Super Admin Dashboard" }: { title
       </ul>
 
       <RegistrySection title="Customer organisations"
-        description="Open an organisation to edit its name, suspend or reactivate it, or appoint an Organisation Admin."
+        description={<>
+          Open an organisation to edit its name, suspend or reactivate it, or appoint an Organisation Admin.
+          {flagged.size > 0 && <> <span className="font-semibold text-fg">{CLASSIFICATION.ACTION_REQUIRED.label}</span> marks an active organisation
+            without an Organisation Admin, which the Action Queue lists: only the Super Admin can appoint one.</>}
+        </>}
         aside={!loading && !failure && list.length > 0 && (
           <p className="type-caption text-fg-muted" aria-live="polite">
             {query ? `${count(shown.length, "organisation")} match, of ${list.length}` : count(list.length, "organisation")}
@@ -278,7 +289,7 @@ function Entities({ org }: { org: RegistryOrg }) {
 function AdminSummary({ org, flag }: { org: RegistryOrg; flag?: QueueItem }) {
   if (org.admins.length === 0) {
     return (
-      <div title={flag?.title} className="flex flex-wrap items-center gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
         {flag && <ClassificationBadge classification={flag.classification} />}
         <span className={flag ? "type-caption font-medium text-fg-secondary" : "text-fg-muted"}>None appointed</span>
       </div>

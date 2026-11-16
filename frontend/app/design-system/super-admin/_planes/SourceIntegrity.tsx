@@ -1,19 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import {
-  Button, Card, CriticalPanel, DataTable, DescriptionList, EmptyState, ErrorState, Spinner, StateBadge, TabPanel, Tabs, Timeline, type DataColumn,
+  Button, Card, CriticalPanel, DataTable, DescriptionList, StateBadge, TabPanel, Tabs, Timeline, type DataColumn,
 } from "@/components/ds";
-import { api } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { DemoFrame, Sample, Section } from "../../_shared/demo";
-import { LiveTag } from "./live";
 
 /* Source integrity. Real checks exist (content release, ledger, evidence, package), but only the content release check
-   is reachable without an organisation, and it stores no history and writes no audit event. The opt-in live check
-   below runs it for real (read-only GET); the history table is sample data showing what a recorded history could be.
-   Tenant ledger and evidence checks belong to the customer plane and are deliberately absent. */
+   is reachable without an organisation, and it stores no history and writes no audit event. This proposal does not run
+   it: GET /catalog/releases and /catalog/releases/{id}/verify need catalogue read access, which the Zoiko Super Admin
+   does not hold, so the server would refuse them and record each refusal. The live check is shown disabled with that
+   reason; the history table is sample data showing what a recorded history could be. Tenant ledger and evidence checks
+   belong to the customer plane and are deliberately absent. */
 
 type Check = { id: string; source: string; kind: string; result: "VERIFIED" | "FAILED"; at: string; detail: string; verifier: string; key: string };
 const HISTORY: Check[] = [
@@ -29,34 +29,21 @@ export function SourceIntegrity() {
     <DemoFrame id="sa-integrity" plane="platform" title="Source integrity"
       intro="Whether the content and packages the platform distributes are intact: what was checked, when, with which key, and what failed."
       app={{ screen: "Content Releases (content staff) · no Super Admin screen", route: "/admin/releases", action: "GET /catalog/releases/{id}/verify", enforced: ["Recomputes the manifest hash and checks the signature against the platform key", "Read-only: it changes nothing and records no audit event"] }}
-      availability={{ level: "partial", note: "Release, ledger, evidence and package verifications exist. Only the release check works without an organisation; no verification history is stored. The live check below is real; the history is sample data." }}
+      availability={{ level: "partial", note: "Release, ledger, evidence and package verifications exist. Only the release check works without an organisation, and it is not served to the Super Admin; no verification history is stored. The live check is disabled here; the history is sample data." }}
       empty={{ title: "No verifications yet", description: "Checks appear here once content releases are published and verified." }}>
       <Body />
     </DemoFrame>
   );
 }
 
-type Live = { state: "idle" | "loading" | "ok" | "none" | "error"; error?: unknown; release?: { id: string; label: string; published: string }; v?: { manifest_hash_ok: boolean; signature_ok: boolean; signer_key_id: string } };
-
 function Body() {
   const [filter, setFilter] = useState("ALL");
   const [selected, setSelected] = useState("c4");
-  const [live, setLive] = useState<Live>({ state: "idle" });
+  const liveHint = useId();
   const rows = HISTORY.filter((h) => filter === "ALL" || h.result === filter);
   const failed = HISTORY.filter((h) => h.result === "FAILED");
   const current = HISTORY.find((h) => h.id === selected);
   const last = HISTORY.reduce((a, h) => (h.at > a ? h.at : a), "");
-
-  const runLive = async () => {
-    setLive({ state: "loading" });
-    try {
-      const releases = await api<{ content_release_id: string; label: string; published_at: string }[]>("/catalog/releases");
-      if (!releases.length) { setLive({ state: "none" }); return; }
-      const r = releases[0];
-      const v = await api<{ manifest_hash_ok: boolean; signature_ok: boolean; signer_key_id: string }>(`/catalog/releases/${encodeURIComponent(r.content_release_id)}/verify`);
-      setLive({ state: "ok", release: { id: r.content_release_id, label: r.label, published: r.published_at }, v });
-    } catch (error) { setLive({ state: "error", error }); }
-  };
 
   const columns: DataColumn<Check>[] = [
     { key: "source", header: "Source", sortValue: (h) => h.source, render: (h) => <><span className="block font-medium text-fg">{h.source}</span><span className="type-caption text-fg-muted">{h.kind}</span></> },
@@ -69,23 +56,12 @@ function Body() {
 
   return (
     <div className="space-y-stack">
-      <Card title="Live check" description="Runs the real release verification on this deployment's most recent content release"
-        actions={<Button size="sm" variant="primary" icon={ShieldCheck} loading={live.state === "loading"} onClick={runLive}>{live.state === "ok" ? "Check again" : "Run live check"}</Button>}>
-        {live.state === "idle" && <p className="type-secondary text-fg-secondary">Nothing has been checked yet. The check is read-only: it changes nothing and records no audit event.</p>}
-        {live.state === "loading" && <Spinner showLabel label="Verifying the latest content release…" />}
-        {live.state === "none" && <EmptyState title="No content releases on this deployment" description="Nothing to verify yet." compact />}
-        {live.state === "error" && <ErrorState error={live.error} title="The live check could not run" onRetry={runLive} compact />}
-        {live.state === "ok" && live.v && live.release && (
-          <div className="space-y-3" role="status">
-            <div className="flex flex-wrap items-center gap-2"><LiveTag /><StateBadge code={live.v.manifest_hash_ok && live.v.signature_ok ? "VERIFIED" : "FAILED"} /></div>
-            <DescriptionList items={[
-              ["Release", <span key="r">{live.release.label} <code className="type-code text-fg-muted">{live.release.id}</code></span>], ["Published", fmtDate(live.release.published, true)],
-              ["Manifest hash", live.v.manifest_hash_ok ? "Matches" : "Does not match"], ["Signature", live.v.signature_ok ? "Verifies" : "Does not verify"],
-              ["Signer key", <code key="k" className="type-code">{live.v.signer_key_id}</code>],
-            ]} />
-            <p className="type-caption text-fg-muted">Live result, not sample data. Proves the release is unchanged and signed by the platform key; it says nothing about the content&apos;s legal accuracy.</p>
-          </div>
-        )}
+      <Card title="Live check" description="Release verification on this deployment's most recent content release"
+        actions={<Button size="sm" variant="primary" icon={ShieldCheck} disabled aria-describedby={liveHint}>Run live check</Button>}>
+        <p id={liveHint} className="type-secondary text-fg-secondary">
+          Not available to the Super Admin. Release verification (GET /catalog/releases/{"{id}"}/verify) needs catalogue read access, which this role does
+          not hold, so the server would refuse it and record the refusal. This design proposal therefore does not run it; the history below is sample data.
+        </p>
       </Card>
 
       {failed.length > 0 && (

@@ -294,14 +294,36 @@ export function PageTitleProvider({ children }: { children: ReactNode }) {
 }
 export const usePageTitle = () => useContext(PageTitleCtx);
 
+/* A screen shown as a tab of a consolidated page (components/WorkspaceHub.tsx). The consolidated page owns the heading
+   and the document title, so the screen's own PageHeader becomes the tab's introduction: its subtitle, "About <tab>"
+   and its actions, without repeating a heading. Null everywhere else. */
+const PageSectionCtx = createContext<{ label: string } | null>(null);
+export function PageSection({ label, children }: { label: string; children: ReactNode }) {
+  return <PageSectionCtx.Provider value={{ label }}>{children}</PageSectionCtx.Provider>;
+}
+
 /** `kicker`: what kind of record or workspace the page shows (e.g. "Obligation dossier"), above the title.
  *  `subtitle`: one short sentence saying what the page is for. `help`: the longer explanation (how records behave,
  *  regulatory and control rules), shown on request under "About this page" together with the governing `spec`, so the
- *  working area starts right below the header without losing that context. */
-export function PageHeader({ title, subtitle, actions, spec, kicker, help }:
-  { title: string; subtitle?: string; actions?: ReactNode; spec?: string; kicker?: ReactNode; help?: ReactNode }) {
+ *  working area starts right below the header without losing that context. `documentTitle`: the browser tab's title
+ *  when it should say more than `title` (a consolidated page names its open tab). */
+export function PageHeader({ title, subtitle, actions, spec, kicker, help, documentTitle }:
+  { title: string; subtitle?: string; actions?: ReactNode; spec?: string; kicker?: ReactNode; help?: ReactNode; documentTitle?: string }) {
+  const section = useContext(PageSectionCtx);
   const { setTitle } = usePageTitle();
-  useEffect(() => { setTitle(title); return () => setTitle(""); }, [title, setTitle]);
+  const page = section ? null : documentTitle ?? title;
+  useEffect(() => { if (page === null) return; setTitle(page); return () => setTitle(""); }, [page, setTitle]);
+  if (section) {
+    return (subtitle || help || spec || actions) ? (
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          {subtitle && <p className="max-w-3xl text-[13px] leading-5 text-slate-500">{subtitle}</p>}
+          {(help || spec) && <PageHelp spec={spec} label={`About ${section.label}`}>{help}</PageHelp>}
+        </div>
+        {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+      </div>
+    ) : null;
+  }
   return (
     <div className="mb-5">
       <div className="flex flex-wrap items-start justify-between gap-3">

@@ -31,7 +31,8 @@ export default function UsersAndRoles() {
   const tenant = personaOf(me) === "tenant";
   return (
     <>
-      <PageHeader spec="WF-IAM-01/02 · ZA-IAM-001 §08 · §23" title="Users & Roles"
+      {/* Organisation users' sidebar calls this screen Team & Access; content staff's calls it Users & Roles. */}
+      <PageHeader spec="WF-IAM-01/02 · ZA-IAM-001 §08 · §23" title={tenant ? "Team & Access" : "Users & Roles"}
         subtitle={tenant
           ? `Your own access and sessions, and everyone in ${me?.tenant_name ?? "your organisation"} with their roles.`
           : "Your own access and sessions, then the Zoiko staff accounts. Zoiko staff belong to no customer organisation."} />

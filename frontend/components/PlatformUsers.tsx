@@ -600,12 +600,13 @@ function RoleCard({ code }: { code: string }) {
   const g = ROLE_GRANT[code];
   return (
     <article aria-label={roleLabel(code)} className="flex h-full flex-col gap-2 rounded-card border border-line bg-surface-card p-4">
-      <div className="flex flex-wrap items-start justify-between gap-2">
+      {/* From sm up the plane badge stays beside the title (a long title wraps in its own column); phones keep wrapping. */}
+      <div className="flex flex-wrap items-start justify-between gap-2 sm:flex-nowrap">
         <div className="min-w-0">
           <h3 className="break-words type-secondary font-semibold text-fg">{roleLabel(code)}</h3>
-          <code className="type-code text-fg-muted">{code}</code>
+          <code className="break-all type-code text-fg-muted">{code}</code>
         </div>
-        {g && <PlaneBadge plane={g.plane === "platform" ? "platform" : "workspace"} size="sm" />}
+        {g && <span className="shrink-0"><PlaneBadge plane={g.plane === "platform" ? "platform" : "workspace"} size="sm" /></span>}
       </div>
       {roleAbout(code) && <p className="type-caption text-fg-secondary">{roleAbout(code)}</p>}
       {g && (

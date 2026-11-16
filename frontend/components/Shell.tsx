@@ -9,7 +9,7 @@ import { api } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
 import SCREEN_ACCESS from "@/lib/screen-access.json";
-import { isStandalone, jumpTargets, navFor, orgNav, orgSection, routeMeta } from "./nav";
+import { isStandalone, jumpTargets, navFor, orgNav, orgRouteMeta, orgSearchTargets, routeMeta } from "./nav";
 import { PlatformFrame } from "./PlatformShell";
 import { ThemeToggle } from "./ThemeToggle";
 import {
@@ -57,12 +57,13 @@ function Frame({ children }: { children: React.ReactNode }) {
   const { title } = usePageTitle();
 
   // Each screen gets its own document title (WCAG 2.4.2): the page heading, with its section for detail records, or the
-  // navigation label until the heading is set. The root metadata title stays the fallback.
+  // navigation label until the heading is set. The root metadata title stays the fallback. Organisation users' screens
+  // are named as their own sidebar names them.
   useEffect(() => {
-    const meta = routeMeta(path);
+    const meta = (personaOf(me) === "tenant" ? orgRouteMeta(path) : null) ?? routeMeta(path);
     const page = path === "/login" ? "Sign in" : title ? (meta?.isDetail ? `${title} · ${meta.item.label}` : title) : meta?.item.label;
     document.title = page ? `${page} · Zoiko Assure` : "Zoiko Assure";
-  }, [path, title]);
+  }, [path, title, me]);
   useEffect(() => { try { setCollapsed(localStorage.getItem("za-nav-collapsed") === "1"); } catch {} }, []);
   const toggle = () => { const v = !collapsed; setCollapsed(v); try { localStorage.setItem("za-nav-collapsed", v ? "1" : "0"); } catch {} };
   useEffect(() => setMobile(false), [path]);
@@ -282,12 +283,13 @@ function SidebarBody({ narrow, path, onToggle, showContext }: { narrow: boolean;
 
 const ORG_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300";
 
-/** The Organization Workspace sidebar: dark navy, grouped as ORG_NAV. A section's other screens are listed beneath it
- *  while one of them is open; collapsed, every item is an icon with a tooltip. The footer names the organisation and how
- *  many legal entities the server returned for it. */
+/** The Organization Workspace sidebar: dark navy, grouped as orgNav (components/nav.ts). Every destination is an entry
+ *  of its own; screens that were sub-entries are tabs of their consolidated page. The entry a page belongs to (record
+ *  pages and former addresses included) is highlighted. Collapsed, every entry is an icon with a tooltip. The footer
+ *  names the organisation and how many legal entities the server returned for it. */
 function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; path: string; onToggle?: () => void; entities?: number | null }) {
   const { me } = useAuth();
-  const current = routeMeta(path)?.item.href;
+  const current = orgRouteMeta(path)?.item.href;
   const navRef = useRef<HTMLElement>(null);
   useEffect(() => { navRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "nearest" }); }, [current]);
   // null: this person's roles do not read the organisation record (e.g. a security administrator or external auditor).
@@ -296,14 +298,13 @@ function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; pat
   const scopeTitle = `Organization ${me?.tenant_name ?? ""}. The server authorizes every request against your roles and this organization's boundary; ${
     unreadable ? "your roles do not include reading its legal entities." : scope ? `it returned ${entities} legal ${entities === 1 ? "entity" : "entities"}.` : "entities are loading."}`;
 
-  const link = (href: string, label: string, icon: LucideIcon, sub: boolean, highlighted: boolean) => {
+  const link = (href: string, label: string, icon: LucideIcon) => {
     const here = href === current;
     const el = (
       <Link href={href} aria-current={here ? "page" : undefined} aria-label={narrow ? label : undefined}
-        className={`flex items-center rounded-md transition-colors ${ORG_FOCUS}
-          ${narrow ? `${sub ? "h-8" : "h-9"} w-10 justify-center` : sub ? "h-8 gap-2 px-2.5 text-[13px]" : "h-9 gap-2 px-3 text-[14px]"}
-          ${highlighted ? "bg-teal-400/15 font-medium text-teal-300" : sub && here ? "font-medium text-white" : `${sub ? "text-slate-300" : "text-slate-200"} hover:bg-white/[0.06] hover:text-white`}`}>
-        {narrow ? <NavIcon icon={icon} active={highlighted || here} dark /> : <><span className="truncate">{label}</span><NavPending /></>}
+        className={`flex items-center rounded-md transition-colors ${ORG_FOCUS} ${narrow ? "h-9 w-10 justify-center" : "h-9 gap-2 px-3 text-[14px]"}
+          ${here ? "bg-teal-400/15 font-medium text-teal-300" : "text-slate-200 hover:bg-white/[0.06] hover:text-white"}`}>
+        {narrow ? <NavIcon icon={icon} active={here} dark /> : <><span className="truncate">{label}</span><NavPending /></>}
       </Link>
     );
     return narrow ? <Tooltip content={label} side="right">{el}</Tooltip> : el;
@@ -337,19 +338,7 @@ function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; pat
               {narrow ? (gi > 0 && <div className="mx-1 my-2 border-t border-white/10" />) : (
                 <div id={headingId} className="pb-2 text-[11px] font-semibold uppercase leading-4 tracking-widest text-slate-400">{g.group}</div>
               )}
-              {g.items.map((item) => {
-                const open = item.href === current || item.sub.some((s) => s.href === current);
-                return (
-                  <div key={item.href}>
-                    {link(item.href, item.label, item.icon, false, open)}
-                    {open && item.sub.length > 0 && (
-                      <ul aria-label={`${item.label} screens`} className={narrow ? "mt-px rounded-md bg-white/[0.04]" : "mb-1 ml-[22px] mt-0.5 border-l border-white/10 pl-2"}>
-                        {item.sub.map((s) => <li key={s.href} className="mb-px">{link(s.href, s.label, s.icon, true, false)}</li>)}
-                      </ul>
-                    )}
-                  </div>
-                );
-              })}
+              {g.items.map((item) => <div key={item.href} className="mb-px">{link(item.href, item.label, item.icon)}</div>)}
             </div>
           );
         })}
@@ -437,11 +426,19 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
     ? [...(meta.group !== meta.item.label ? [{ label: meta.group }] : []), { label: meta.item.label, href: meta.item.href },
       ...(meta.isDetail && title ? [{ label: title }] : [])]
     : [{ label: "Zoiko Assure" }];
-  const section = org ? orgSection(path) : null;
+  // Organisation users' screens are named and grouped as their sidebar shows them (a group named like its only entry is
+  // not repeated); a screen that sidebar does not offer keeps its NAV name.
+  const om = org ? orgRouteMeta(path) ?? meta : null;
   const orgCrumbs = path === "/" ? [{ label: "Zoiko Assure" }, { label: "Organization" }]
-    : [{ label: "Zoiko Assure", href: "/" }, ...(section ? [{ label: section.group }] : []),
-      ...(meta ? [{ label: meta.item.label, href: meta.item.href }] : []), ...(meta?.isDetail && title ? [{ label: title }] : [])];
-  const hits = useMemo(() => (q ? jumpTargets(personaOf(me), me?.permissions).filter((i) => `${i.label} ${i.group}`.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, me]);
+    : [{ label: "Zoiko Assure", href: "/" }, ...(om && om.group !== om.item.label ? [{ label: om.group }] : []),
+      ...(om ? [{ label: om.item.label, href: om.item.href }] : []), ...(om?.isDetail && title ? [{ label: title }] : [])];
+  // Organisation users search their sidebar's entries and tabs, by current and former names; staff search NAV.
+  const hits = useMemo(() => {
+    if (!q) return [];
+    const targets: { href: string; label: string; group: string; tab?: string; terms: string }[] = org ? orgSearchTargets(me?.permissions)
+      : jumpTargets(personaOf(me), me?.permissions).map((i) => ({ ...i, terms: `${i.label} ${i.group}` }));
+    return targets.filter((i) => i.terms.toLowerCase().includes(q.toLowerCase())).slice(0, 7);
+  }, [q, me, org]);
   const pending = (alerts?.issues ?? 0) + (alerts?.facts ?? 0);
   // Record watermark: always visible ("derived projection watermark is always visible", Vol. 1 NFRs). Phones show it
   // under the breadcrumb, wider screens beside the account controls; the cell is added where space allows.
@@ -458,10 +455,10 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
   };
   const hitList = hits.length > 0 && (
     <ul aria-label="Matching pages" className="absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
-      {hits.map(({ href, label, group }) => (
+      {hits.map(({ href, label, group, tab }) => (
         <li key={href}>
           <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-2 px-3 py-1.5 text-[13px] text-slate-700 hover:bg-slate-50">
-            {label}<span className="text-[11px] text-slate-500">{group}</span>
+            {tab ? <span className="min-w-0">{label}<span className="text-slate-500"> › {tab}</span></span> : label}<span className="shrink-0 text-[11px] text-slate-500">{group}</span>
           </Link>
         </li>
       ))}
