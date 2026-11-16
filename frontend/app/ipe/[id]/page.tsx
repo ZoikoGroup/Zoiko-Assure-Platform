@@ -93,7 +93,7 @@ export default function SourceRunPage() {
               {d.anomalies.map((x: any) => (
                 <tr key={x.anomaly_id}><td className="td mono text-xs">{x.check_id}</td><td className="td mono text-xs">{x.anomaly_class}</td>
                   <td className="td">{x.affected_count} <span className="mono text-[11px] text-slate-500">{(x.affected_keys || []).slice(0, 5).join(", ")}</span></td>
-                  <td className="td">{x.severity}</td><td className="td text-xs">{x.disposition_code ?? <A href="/ipe">disposition in queue →</A>}</td></tr>
+                  <td className="td">{x.severity}</td><td className="td text-xs">{x.disposition_code ?? <A href="/evidence?tab=ipe">disposition in queue →</A>}</td></tr>
               ))}
             </Table>
           </Card>

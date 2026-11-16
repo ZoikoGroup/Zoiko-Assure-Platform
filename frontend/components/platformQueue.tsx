@@ -95,7 +95,7 @@ export function organisationItems(orgs: Org[]): QueueItem[] {
         rule: "Organisation status is SUSPENDED.",
         observed: facts, source: REGISTRY,
         action: { label: "Go to organisation record", href,
-          hint: "Activate is there. It needs a reason and is recorded as organisation.status_changed." },
+          hint: "Use Reactivate there. It needs a reason and is recorded as organisation.status_changed." },
       });
     }
   }
@@ -204,11 +204,12 @@ export function usePlatformQueue(): PlatformQueue {
 }
 
 /* ----------------------------------------------------------------------------------------------------------- badges */
-/** An item's classification, as a labelled chip (colour is never the only signal). */
+/** An item's classification, as a labelled chip (colour is never the only signal). What it means is not a hover title:
+ *  each screen that shows the chip says it in visible text (CLASSIFICATION's meanings, or the item's own reason). */
 export function ClassificationBadge({ classification }: { classification: Classification }) {
   const c = CLASSIFICATION[classification];
   return (
-    <span title={`Classification: ${c.label}, ${c.meaning}`}
+    <span
       className={`inline-flex items-center gap-1 whitespace-nowrap rounded-chip border px-2 py-0.5 type-caption font-semibold ${c.tone}`}>
       <c.icon size={12} strokeWidth={2.5} aria-hidden className="shrink-0" /><span className="sr-only">Classification: </span>{c.label}
     </span>

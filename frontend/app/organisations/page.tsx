@@ -14,7 +14,7 @@ export default function Organisations() {
     return (
       <>
         <PageHeader title="Tenants & Entities" />
-        <Notice>The organisation registry is administered by the Zoiko Super Admin. <Link href="/" className="font-semibold underline">Back to your dashboard</Link>.</Notice>
+        <Notice>Tenants &amp; Entities is part of the Zoiko platform control plane and is available to the Zoiko Super Admin only. <Link href="/" className="font-semibold underline">Back to your dashboard</Link>.</Notice>
       </>
     );
   }

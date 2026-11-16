@@ -12,7 +12,7 @@ import { AlertCircle, Check, ChevronDown, Minus, Search, Upload, X } from "lucid
 type FieldState = { id: string; describedBy?: string; invalid: boolean; required?: boolean; disabled?: boolean };
 const FieldContext = createContext<FieldState | null>(null);
 
-const CONTROL = "w-full rounded-control border border-line-strong bg-surface-control px-3 type-secondary text-fg placeholder:text-fg-muted "
+const CONTROL = "w-full rounded-control border border-line-control bg-surface-control px-3 type-secondary text-fg placeholder:text-fg-muted "
   + "transition-colors enabled:hover:border-fg-muted focus:border-focus disabled:cursor-not-allowed disabled:border-line disabled:text-fg-disabled "
   + "aria-invalid:border-status-critical";
 const TEXT_ONLY = "read-only:bg-surface-raised";  // :read-only also matches <select>, so text controls only

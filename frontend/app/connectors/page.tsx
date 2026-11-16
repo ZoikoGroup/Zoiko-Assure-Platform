@@ -14,7 +14,8 @@ export default function Connectors() {
   const tabsId = useId();
   return (
     <>
-      <PageHeader spec="FR-CON-001..004 · INV-11 · WF-EVT-03" title="Connectors"
+      {/* Organisation users' sidebar calls this screen Integrations; content staff's calls it Connectors. */}
+      <PageHeader spec="FR-CON-001..004 · INV-11 · WF-EVT-03" title={tenantUser ? "Integrations" : "Connectors"}
         subtitle="Source connectors, their certification, and outbound events."
         help="Customer-visible connector status is read only from the certification registry." />
       <PermissionNote perms={["manage_connectors"]} />

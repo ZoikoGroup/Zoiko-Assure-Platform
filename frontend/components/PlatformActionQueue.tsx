@@ -252,7 +252,7 @@ function Sources({ q }: { q: PlatformQueue }) {
 /* ---------------------------------------------------------------------------------------------- not monitored yet */
 const NOT_MONITORED: { title: string; icon: LucideIcon; text: string }[] = [
   { title: "Platform incidents and alerts", icon: Siren, text: "No incident or alert model exists in the platform." },
-  { title: "Service and cell health", icon: ServerCog, text: "GET /health answers from the API process only. There are no service or cell health checks." },
+  { title: "Service and cell health", icon: ServerCog, text: "GET /health checks the API, its PostgreSQL database and, when configured, Redis (see Service Health), but adds no items to this queue. No other services or cells are checked." },
   { title: "Organisation Admin first sign-in", icon: KeyRound, text: "Whether a newly appointed admin has replaced their temporary password is not served to the Super Admin role." },
   { title: "Platform security events", icon: ShieldAlert, text: "Failed sign-ins, lockouts and refused requests are recorded in the audit trail, but no Super Admin view of them exists." },
   { title: "Content release integrity", icon: FileCheck2, text: "Release signature verification exists for catalogue readers, but is not served to the Super Admin role." },

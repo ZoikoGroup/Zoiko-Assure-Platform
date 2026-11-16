@@ -8,7 +8,7 @@ import { Badge, Card, ErrorBox, KV, LoadingSkeleton, Modal, PageHeader, Permissi
 export default function CellsAndResidency() {
   return (
     <>
-      <PageHeader spec="WF-TEN-01/02 · TEN-REQ-013" title="Cells & Residency"
+      <PageHeader spec="WF-TEN-01/02 · TEN-REQ-013" title="Organisation Settings"
         subtitle="Your organisation, its legal entities and where their data is held."
         help="Raw entity evidence and customer assurance state stay in the entity's home cell (TEN-REQ-013)." />
       <PermissionNote perms={["manage_tenant"]} />

@@ -350,7 +350,7 @@ With the backend running:
 | http://127.0.0.1:8000/docs | Interactive API documentation (Swagger UI) |
 | http://127.0.0.1:8000/redoc | API reference (ReDoc) |
 | http://127.0.0.1:8000/openapi.json | OpenAPI schema |
-| http://127.0.0.1:8000/api/health | Liveness: `status`, cell ID and dictionary version. No sign-in; it does not query the database |
+| http://127.0.0.1:8000/api/health | Health: `status` (`ok`, `degraded` or `unavailable`, the last with HTTP 503), cell ID, dictionary version and the state of the API, PostgreSQL (a live query) and Redis (a live check when configured). No sign-in |
 
 There is no separate readiness endpoint. The API does not start unless its database checks pass. Most other endpoints
 need a signed-in session.

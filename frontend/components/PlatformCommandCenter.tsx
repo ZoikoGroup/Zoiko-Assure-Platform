@@ -1,95 +1,123 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, useEffect } from "react";
+import { useEffect, useId, useState } from "react";
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
-import {
-  Archive, ArrowRight, ArrowUp, Briefcase, ChevronRight, ClipboardCheck, Eye, RefreshCw, Server, ShieldCheck, TriangleAlert,
-} from "lucide-react";
-import { useApi } from "@/lib/api";
+import { ArrowRight, Building2, ChevronRight, ClipboardCheck, Eye, RefreshCw, Server } from "lucide-react";
+import { ApiError, api } from "@/lib/api";
 import { Alert, Button, EmptyState, ErrorState, Skeleton, buttonClasses } from "./ds";
-import { STATUS_SURFACE, STATUS_TEXT, STATUS_TONE, type StatusKey } from "./ds/Status";
+import { STATUS_SURFACE, STATUS_TEXT, type StatusKey } from "./ds/Status";
 import {
-  CategoryBadge, ClassificationBadge, count, errorText, failedSources, fmtUtcSeconds, usePlatformQueue, type Org, type PlatformQueue,
+  CLASSIFICATION, CategoryBadge, ClassificationBadge, count, errorText, failedSources, fmtUtcSeconds, usePlatformQueue, type PlatformQueue,
 } from "./platformQueue";
-import { useSyntheticDataBadge } from "./Shell";
 import { usePageTitle } from "./ui";
 
-/* The Platform Command Center: the Zoiko Super Admin's home ("/"), laid out as the Platform Command Center reference.
+/* The Platform Command Center: the Zoiko Super Admin's home ("/").
 
-   Live: the Action Queue figure and Needs attention are the Platform Action Queue itself (components/platformQueue.tsx,
-   the same reads, rules and order as /action-queue): organisation-registry metadata (GET /platform/organisations,
-   served to the Super Admin role, manage_organisations) and the signed-in person's own sessions (GET /sessions), read
-   on opening this page and on Refresh, never on a timer, because every registry read is an audit record. Tenant fleet
-   uses that same registry read (no second request), and the cell pill reads the public API health check (GET /health).
-   Synthetic: no incident, regulatory-intake, evidence-integrity, agent-hold, cell-check, governance-gate or read-model
-   feed is served to this role, so those figures are the reference design's demonstration values, each marked SYNTHETIC
-   and never presented as this platform's state. Nothing here reads or shows customer evidence, facts or assurance
-   records (INV-14, IAM-REQ-024). The organisation registry itself is Tenants & Entities (/organisations). */
+   Every figure is read from this deployment. The Action Queue figure and Needs attention are the Platform Action Queue
+   itself (components/platformQueue.tsx, the same reads, rules and order as /action-queue): organisation-registry
+   metadata (GET /platform/organisations, served to the Super Admin role, manage_organisations) and the signed-in
+   person's own sessions (GET /sessions), read on opening this page and on Refresh, never on a timer, because every
+   registry read is an audit record. The organisation count uses that same registry read (no second request). Service
+   health and the cell pill read the public API health check (GET /health) once when the page opens, the way Service
+   Health reads it: a 503 carrying a health report is the API answering "unavailable", not a failure to answer.
+
+   No incident, regulatory-intake, evidence-integrity, agent-hold, governance-gate or read-model feed is served to this
+   role, so none is shown: the reference design's demonstration figures were removed rather than presented beside real
+   ones. Nothing here reads or shows customer evidence, facts or assurance records (INV-14, IAM-REQ-024). The
+   organisation registry itself is Tenants & Entities (/organisations). */
 const TITLE = "Platform Command Center";
 
-type Health = { status: string; cell_id: string; dictionary_version: string };
+/* ------------------------------------------------------------------------------------------ the API health check */
+const HEALTH_TIMEOUT_MS = 20_000;
 
-/* ------------------------------------------------------------------------------------- synthetic demonstration data */
-type Kpi = {
-  key: string; label: string; value: ReactNode; hint: string; tone: StatusKey; icon: LucideIcon;
-  plainIcon?: boolean; valueClass?: string; corner?: ReactNode;
-  /** A decorative trend: synthetic figures only, since no history is recorded for any figure here. */
-  bars?: number[];
-  /** Replaces the SYNTHETIC tag (a live figure passes its LIVE tag). */
-  tag?: ReactNode;
-  /** Sits where the trend bars would, beside the value (a live figure's link). */
-  aside?: ReactNode;
-  /** A read for this figure is in flight. */
-  busy?: boolean;
+/** The outcome of GET /health. A report is an answer carrying a health report, HTTP 503 included; no answer (a
+ *  connection failure or a timeout) and an answer without a report (for example a gateway error page) are kept apart. */
+type HealthView =
+  | { kind: "checking" }
+  | { kind: "report"; status: string; cellId: string | null; http503: boolean }
+  | { kind: "no-answer"; timedOut: boolean }
+  | { kind: "bad-response"; httpStatus: number | null };
+
+/** The fields this page uses from a health report (backend/app/routers/core.py `health`), or null when it is not one. */
+function healthReport(x: unknown): { status: string; cellId: string | null } | null {
+  if (!x || typeof x !== "object" || Array.isArray(x)) return null;
+  const o = x as Record<string, unknown>;
+  if (typeof o.status !== "string") return null;
+  return { status: o.status, cellId: typeof o.cell_id === "string" && o.cell_id ? o.cell_id : null };
+}
+
+/** One read when the page opens, never on a timer. It is a plain GET, so identical in-flight reads share one request
+ *  (lib/api.ts); a read that has not answered after HEALTH_TIMEOUT_MS is reported as no answer. */
+function useHealthCheck(): HealthView {
+  const [view, setView] = useState<HealthView>({ kind: "checking" });
+  useEffect(() => {
+    let current = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<HealthView>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: "no-answer", timedOut: true }), HEALTH_TIMEOUT_MS);
+    });
+    const answer = api<unknown>("/health").then(
+      (body): HealthView => {
+        const r = healthReport(body);
+        return r ? { kind: "report", ...r, http503: false } : { kind: "bad-response", httpStatus: null };
+      },
+      (e: unknown): HealthView => {
+        // The API client raises on any non-2xx answer. A 503 carrying a health report is the API saying "unavailable".
+        const r = e instanceof ApiError && e.status === 503 ? healthReport(e.detail) : null;
+        if (r) return { kind: "report", ...r, http503: true };
+        return e instanceof ApiError ? { kind: "bad-response", httpStatus: e.status } : { kind: "no-answer", timedOut: false };
+      });
+    void Promise.race([answer, timeout]).then((v) => { if (current) setView(v); }).finally(() => clearTimeout(timer));
+    return () => { current = false; clearTimeout(timer); };
+  }, []);
+  return view;
+}
+
+type Look = { tone: StatusKey; label: string };
+const REPORTED: Record<string, Look> = {
+  ok: { tone: "verified", label: "Healthy" },
+  degraded: { tone: "warning", label: "Degraded" },
+  unavailable: { tone: "critical", label: "Unavailable" },
 };
-const KPIS: Kpi[] = [
-  { key: "incidents", label: "Critical incidents", value: "03", hint: "Platform runtime", tone: "critical", icon: TriangleAlert,
-    bars: [8, 14, 10, 19, 28], corner: <Delta value="2" /> },
-  { key: "intake", label: "Regulatory intake", value: "DEGRADED", hint: "2 stale sources", tone: "warning", icon: Archive,
-    valueClass: `text-[26px] tracking-normal ${STATUS_TEXT.warning}`, bars: [14, 22, 9, 26, 18] },
-  { key: "evidence", label: "Evidence integrity", value: "02", hint: "Platform verification failures", tone: "critical", icon: ShieldCheck,
-    plainIcon: true, bars: [5, 14, 8, 20, 28] },
-  { key: "agents", label: "Agent actions held", value: "07", hint: "Policy-gated holds", tone: "info", icon: Briefcase, bars: [10, 16, 12, 24, 16] },
-  { key: "cells", label: "Cell health", value: <>98.9<span className="ml-0.5 text-[0.6em] font-semibold leading-none text-fg-secondary">%</span></>,
-    hint: "Scheduled checks passing", tone: "verified", icon: Server, bars: [18, 26, 14, 28, 22],
-    corner: <span className="type-caption font-semibold text-status-verified">Healthy</span> },
-];
 
-const GATES = [
-  { label: "Awaiting human decision", count: 6 },
-  { label: "Release holds", count: 2 },
-  { label: "JIT sessions active", count: 1, info: true },
-];
+function healthLook(v: HealthView): Look {
+  switch (v.kind) {
+    case "checking": return { tone: "unknown", label: "Checking…" };
+    case "report": return REPORTED[v.status] ?? { tone: "unknown", label: v.status || "Not reported" };
+    case "no-answer": return { tone: "critical", label: "Not answering" };
+    case "bad-response": return { tone: "critical", label: "Unexpected answer" };
+  }
+}
 
-const SIGNALS = [
-  { steps: ["Regulation", "requirement"], value: "3 ingestion retries", owner: "Source operations" },
-  { steps: ["Control", "test", "proof"], value: "2 verify failures", owner: "Evidence operations" },
-  { steps: ["Decision", "action"], value: "7 agent holds", owner: "AI governance" },
-];
+function healthDetail(v: HealthView): string {
+  switch (v.kind) {
+    case "checking": return "Checking the API health endpoint…";
+    case "report": return `Reported by GET /health${v.http503 ? " with HTTP 503" : ""}${v.cellId ? ` from cell ${v.cellId}` : ""}`;
+    case "no-answer": return v.timedOut ? `No answer within ${HEALTH_TIMEOUT_MS / 1000} seconds` : "Could not connect to the API";
+    case "bad-response": return v.httpStatus ? `HTTP ${v.httpStatus} without a health report` : "An answer without a health report";
+  }
+}
 
 /* ---------------------------------------------------------------------------------------------------------- styles */
 const PANEL = "rounded-[22px] border border-line bg-surface-raised/70 p-5 shadow-panel sm:p-6";
 const H2 = "text-[18px] font-semibold leading-7 text-fg";
 // Literal class names per tone, so Tailwind generates them.
-const BAR: Record<StatusKey, string> = {
-  critical: "bg-status-critical", warning: "bg-status-warning", info: "bg-status-info", verified: "bg-status-verified", unknown: "bg-status-unknown",
-};
 const GLOW: Record<StatusKey, string> = {
   critical: "bg-status-critical/20", warning: "bg-status-warning/20", info: "bg-status-info/20", verified: "bg-status-verified/15", unknown: "bg-status-unknown/15",
 };
-const BAR_OPACITY = ["opacity-35", "opacity-55", "opacity-55", "opacity-80", "opacity-100"];
+const DOT: Record<StatusKey, string> = {
+  critical: "bg-status-critical", warning: "bg-status-warning", info: "bg-status-info", verified: "bg-status-verified", unknown: "bg-fg-muted",
+};
 
 export function PlatformCommandCenter() {
   const { setTitle } = usePageTitle();
   useEffect(() => { setTitle(TITLE); return () => setTitle(""); }, [setTitle]);
-  useSyntheticDataBadge();
-  const health = useApi<Health>("/health");
-  // The Action Queue's own reads: its items, and the organisation registry that Tenant fleet counts.
+  const health = useHealthCheck();
+  // The Action Queue's own reads: its items, and the organisation registry that the organisation figure counts.
   const q = usePlatformQueue();
-  // The live Action Queue figure takes the reference design's second place (its synthetic "Actions awaiting").
-  const kpis = [...KPIS.slice(0, 1), queueKpi(q), ...KPIS.slice(1)];
+  const kpis = [queueKpi(q), organisationsKpi(q), healthKpi(health)];
 
   return (
     <div>
@@ -108,57 +136,44 @@ export function PlatformCommandCenter() {
         {kpis.map((k) => <KpiTile key={k.key} k={k} />)}
       </ul>
 
-      <div className="mt-6 grid grid-cols-1 gap-5 xl:grid-cols-3">
-        <NeedsAttention q={q} className="xl:col-span-2" />
-        <div className="grid content-start gap-5 md:grid-cols-2 xl:grid-cols-1">
-          <GovernanceGates />
-          <DataProvenance health={health} />
-        </div>
-      </div>
-
-      <AssuranceSignals orgs={{ data: q.orgs, error: q.orgError, loading: q.loading }} />
+      <NeedsAttention q={q} className="mt-6" />
 
       <p className="mt-6 max-w-4xl type-caption text-fg-muted">
-        Figures marked <span className="font-semibold text-fg-secondary">SYNTHETIC</span> are demonstration values from the reference design, not platform
-        records: no incident, regulatory-intake, evidence-integrity, agent-hold, cell-check, governance-gate or read-model feed is served to the Super Admin
-        role yet, and no figure here has a recorded history. Figures marked <span className="font-semibold text-fg-secondary">LIVE</span> are read from this
-        deployment: the Action Queue (worked out from the organisation registry and your own sessions on opening this page and on Refresh), the tenant
-        fleet from that same registry read, and the API health check. Customer evidence, facts and assurance records are never shown here.
+        Every figure here is read from this deployment: the Action Queue and the organisation count from the organisation registry and your own
+        sessions (on opening this page and on Refresh; each registry read is recorded in the platform&apos;s audit trail), and service health from the
+        API health check when the page opens. The first pill at the top names the API cell that answered that check, with the status it reported;
+        the deployment environment&apos;s name is not reported to the browser, so it is not shown. Global metadata is organisation registry metadata
+        across every organisation on this cell. No incident, regulatory-intake, evidence-integrity, agent-hold, governance-gate or read-model feed is
+        served to the Super Admin role, so none is shown. Customer evidence, facts and assurance records are never shown here.
       </p>
     </div>
   );
 }
 
 /* --------------------------------------------------------------------------------------------------------- pieces */
-/** The live API cell (GET /health) and the scope this role works in. No API reports the deployment's environment name
- *  to the browser, so the cell that answered is shown in its place. */
-function ContextPills({ health }: { health: { data: Health | null; error: unknown } }) {
-  const h = health.data;
-  const dot = health.error ? "bg-status-critical" : h ? (h.status === "ok" ? "bg-status-verified" : "bg-status-warning") : "bg-fg-muted";
-  const cell = h?.cell_id ?? (health.error ? "API not answering" : "Checking API…");
-  const tip = h ? `Live from GET /health: the API answered "${h.status}" from cell ${h.cell_id}. The deployment environment's name is not reported to the browser, so it is not shown.`
-    : health.error ? "The API health check (GET /health) did not answer." : "Checking the API health endpoint…";
+/** The API cell (GET /health) and the scope this role works in. No API reports the deployment's environment name to
+ *  the browser, so the cell that answered is shown in its place, followed by the reported status as a word (the dot
+ *  repeats it in colour only). What the API answered in detail is the Service health figure's caption; what the two
+ *  pills mean is in the page's footnote. */
+function ContextPills({ health }: { health: HealthView }) {
+  const look = healthLook(health);
+  const cell = health.kind === "report" ? health.cellId ?? "Cell not reported"
+    : health.kind === "checking" ? "Checking API…"
+    : health.kind === "no-answer" ? "API not answering" : "Unexpected API answer";
   return (
     <div role="group" aria-label="Dashboard context"
       className="flex w-fit max-w-full flex-wrap items-center rounded-control border border-line bg-surface-control/70 text-[14px] text-fg shadow-card">
-      <span title={tip} className="flex min-w-0 items-center gap-2 px-4 py-2.5">
-        <span aria-hidden className={`h-2 w-2 shrink-0 rounded-full ${dot}`} />
+      <span className="flex min-w-0 items-center gap-2 px-4 py-2.5">
+        <span aria-hidden className={`h-2 w-2 shrink-0 rounded-full ${DOT[look.tone]}`} />
         <span className="sr-only">API cell, live: </span><span className="truncate">{cell}</span>
+        {health.kind === "report" && <>
+          <span aria-hidden className="text-fg-muted">·</span>
+          <span className="whitespace-nowrap font-semibold"><span className="sr-only">, status </span>{look.label}</span>
+        </>}
       </span>
       <span aria-hidden className="h-5 w-px bg-line-strong" />
-      <span title="Organisation registry metadata across every organisation on this cell; never customer evidence, facts or assurance records."
-        className="px-4 py-2.5">Scope: Global metadata</span>
+      <span className="px-4 py-2.5">Scope: Global metadata</span>
     </div>
-  );
-}
-
-/** Marks a figure or panel as synthetic demonstration data, never a platform record. */
-function SyntheticTag() {
-  return (
-    <span title="Synthetic demonstration data from the reference design, not a platform record"
-      className="inline-flex shrink-0 items-center rounded-chip border border-dashed border-line-strong px-1.5 text-[10px] font-semibold uppercase leading-4 tracking-[0.06em] text-fg-muted">
-      Synthetic<span className="sr-only"> demonstration data, not a platform record</span>
-    </span>
   );
 }
 
@@ -172,22 +187,15 @@ function LiveTag() {
   );
 }
 
-function Delta({ value }: { value: string }) {
-  return (
-    <span className={`inline-flex items-center gap-0.5 rounded-chip border px-1.5 py-0.5 type-caption font-semibold tabular-nums ${STATUS_TONE.critical}`}>
-      <ArrowUp size={12} aria-hidden /><span className="sr-only">Up </span>{value}
-    </span>
-  );
-}
-
-/** A decorative five-step trend; the figure beside it carries the meaning. */
-function Bars({ heights, tone }: { heights: number[]; tone: StatusKey }) {
-  return (
-    <span aria-hidden className="flex h-7 shrink-0 items-end gap-1.5 pb-1">
-      {heights.map((h, i) => <span key={i} className={`w-1.5 rounded-xs ${BAR[tone]} ${BAR_OPACITY[i]}`} style={{ height: h }} />)}
-    </span>
-  );
-}
+type Kpi = {
+  key: string; label: string; value: ReactNode; hint: string; tone: StatusKey; icon: LucideIcon;
+  /** Replaces the default value styling (a status word rather than a number). */
+  valueClass?: string;
+  /** Sits beside the value: the link to the figure's own screen. */
+  aside: ReactNode;
+  /** A read for this figure is in flight. */
+  busy?: boolean;
+};
 
 function KpiTile({ k }: { k: Kpi }) {
   const Icon = k.icon;
@@ -195,16 +203,16 @@ function KpiTile({ k }: { k: Kpi }) {
     <li aria-busy={k.busy || undefined} className="relative isolate min-w-0 overflow-hidden rounded-[18px] border border-line bg-surface-card/70 p-5 shadow-card">
       <span aria-hidden className={`pointer-events-none absolute -right-14 -top-20 -z-10 h-48 w-48 rounded-full blur-3xl ${GLOW[k.tone]}`} />
       <div className="flex items-start justify-between gap-3">
-        <span aria-hidden className={`flex h-10.5 w-10.5 shrink-0 items-center justify-center rounded-[11px] border ${k.plainIcon
-          ? "border-line-strong bg-fg/5 text-fg" : `${STATUS_SURFACE[k.tone]} ${STATUS_TEXT[k.tone]}`}`}>
+        <span aria-hidden className={`flex h-10.5 w-10.5 shrink-0 items-center justify-center rounded-[11px] border ${STATUS_SURFACE[k.tone]} ${STATUS_TEXT[k.tone]}`}>
           <Icon size={18} />
         </span>
-        <span className="flex flex-wrap items-center justify-end gap-2">{k.corner}{k.tag ?? <SyntheticTag />}</span>
+        <LiveTag />
       </div>
       <p className="mt-5 text-[14px] leading-5 text-fg-secondary">{k.label}</p>
-      <div className="mt-1.5 flex items-end justify-between gap-3">
-        <p className={`min-w-0 font-bold leading-9 tabular-nums transition-opacity ${k.busy ? "opacity-60" : ""} ${k.valueClass ?? "text-[32px] tracking-tight text-fg"}`}>{k.value}</p>
-        {k.aside ?? (k.bars && <Bars heights={k.bars} tone={k.tone} />)}
+      {/* The value keeps its full width; when a status word and the link do not fit side by side, the link wraps below. */}
+      <div className="mt-1.5 flex flex-wrap items-end justify-between gap-x-3 gap-y-1">
+        <p className={`font-bold leading-9 tabular-nums transition-opacity ${k.busy ? "opacity-60" : ""} ${k.valueClass ?? "text-[32px] tracking-tight text-fg"}`}>{k.value}</p>
+        {k.aside}
       </div>
       <p className="mt-2 type-caption text-fg-muted">{k.hint}</p>
     </li>
@@ -218,7 +226,7 @@ function KpiTile({ k }: { k: Kpi }) {
 function queueKpi(q: PlatformQueue): Kpi {
   const action = q.items.filter((i) => i.classification === "ACTION_REQUIRED").length;
   const review = q.items.filter((i) => i.classification === "REVIEW").length;
-  const base = { key: "queue", label: "Action Queue", icon: ClipboardCheck, tag: <LiveTag />, aside: <QueueLink />, busy: q.loading };
+  const base = { key: "queue", label: "Action Queue", icon: ClipboardCheck, aside: <TileLink href="/action-queue" label="Open Action Queue" />, busy: q.loading };
   if (q.loading && !q.complete) {
     return { ...base, tone: "unknown", hint: q.firstLoad ? "Loading the queue…" : "Refreshing…",
       value: <span role="status" aria-label="Loading the Action Queue" className="skeleton my-0.5 block h-8 w-14" /> };
@@ -232,10 +240,38 @@ function queueKpi(q: PlatformQueue): Kpi {
     hint: q.loading ? "Refreshing…" : `${action} action required · ${review} to review` };
 }
 
-function QueueLink() {
+/** The organisations in the registry, from the Action Queue's own registry read (no second request). A failed read is
+ *  said so, never shown as zero. */
+function organisationsKpi(q: PlatformQueue): Kpi {
+  const base = { key: "organisations", label: "Organisations", icon: Building2, aside: <TileLink href="/organisations" label="Open Tenants & Entities" />, busy: q.loading };
+  if (!q.orgs) {
+    if (q.loading) {
+      return { ...base, tone: "unknown", hint: q.firstLoad ? "Loading the registry…" : "Refreshing…",
+        value: <span role="status" aria-label="Loading the organisation registry" className="skeleton my-0.5 block h-8 w-14" /> };
+    }
+    return { ...base, tone: "unknown", value: <><span aria-hidden>—</span><span className="sr-only">Not available</span></>,
+      hint: "Unavailable: the organisation registry could not be loaded" };
+  }
+  const active = q.orgs.filter((o) => o.status === "ACTIVE").length;
+  const suspended = q.orgs.filter((o) => o.status === "SUSPENDED").length;
+  return { ...base, tone: "info", value: String(q.orgs.length), hint: q.loading ? "Refreshing…" : `${active} active · ${suspended} suspended` };
+}
+
+/** Service health as GET /health reported it when the page opened; Service Health has the components and re-checks. */
+function healthKpi(health: HealthView): Kpi {
+  const look = healthLook(health);
+  return {
+    key: "health", label: "Service health", icon: Server, tone: look.tone, busy: health.kind === "checking",
+    value: health.kind === "checking" ? <span role="status" aria-label="Checking service health" className="skeleton my-0.5 block h-8 w-28" /> : look.label,
+    valueClass: health.kind === "checking" ? undefined : `text-[26px] tracking-normal ${STATUS_TEXT[look.tone]}`,
+    hint: healthDetail(health), aside: <TileLink href="/service-health" label="Open Service Health" />,
+  };
+}
+
+function TileLink({ href, label }: { href: string; label: string }) {
   return (
-    <Link href="/action-queue" className="mb-0.5 inline-flex min-h-6 shrink-0 items-center gap-0.5 rounded-chip type-caption font-semibold text-accent-fg hover:underline">
-      Open Action Queue<ChevronRight size={14} aria-hidden />
+    <Link href={href} className="mb-0.5 inline-flex min-h-6 shrink-0 items-center gap-0.5 rounded-chip type-caption font-semibold text-accent-fg hover:underline">
+      {label}<ChevronRight size={14} aria-hidden />
     </Link>
   );
 }
@@ -247,6 +283,7 @@ const ATTENTION_ROWS = 5;
  *  references or severities, so none are shown. */
 function NeedsAttention({ q, className = "" }: { q: PlatformQueue; className?: string }) {
   const rows = q.items.slice(0, ATTENTION_ROWS);
+  const hintIds = useId();  // each row's action hint describes its action link
   const failed = failedSources(q);
   const nothingLoaded = !q.orgs && !q.sessions;
   const pending = q.loading && nothingLoaded;  // no answer to show until this read completes
@@ -306,107 +343,35 @@ function NeedsAttention({ q, className = "" }: { q: PlatformQueue; className?: s
             description="Checked on the last refresh: active organisations without an Organisation Admin, suspended organisations and other sessions on your account." />
         )
       ) : (
-        <ul aria-label="Action Queue items needing attention" className="mt-3 divide-y divide-line">
-          {rows.map((i) => (
-            <li key={i.key} className="flex flex-col gap-3 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:gap-5">
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <ClassificationBadge classification={i.classification} />
-                  <CategoryBadge category={i.category} />
+        <>
+          {/* What each classification means, as on the Action Queue (the chips name it; this says what it is). */}
+          <p className="mt-1 max-w-3xl type-caption text-fg-muted">
+            <span className="font-semibold text-fg-secondary">{CLASSIFICATION.ACTION_REQUIRED.label}</span>: {CLASSIFICATION.ACTION_REQUIRED.meaning}.{" "}
+            <span className="font-semibold text-fg-secondary">{CLASSIFICATION.REVIEW.label}</span>: {CLASSIFICATION.REVIEW.meaning}.
+          </p>
+          <ul aria-label="Action Queue items needing attention" className="mt-3 divide-y divide-line">
+            {rows.map((i, n) => (
+              <li key={i.key} className="flex flex-col gap-3 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:gap-5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <ClassificationBadge classification={i.classification} />
+                    <CategoryBadge category={i.category} />
+                  </div>
+                  <p className="mt-2 text-[14px] font-medium leading-5 text-fg">{i.title}</p>
+                  {i.organisation && (
+                    <p className="mt-0.5 break-words type-caption text-fg-secondary">Organisation: <span className="font-semibold text-fg">{i.organisation.name}</span></p>
+                  )}
+                  <p id={`${hintIds}-${n}`} className="mt-1 type-caption text-fg-muted">{i.action.hint}</p>
                 </div>
-                <p className="mt-2 text-[14px] font-medium leading-5 text-fg">{i.title}</p>
-                {i.organisation && (
-                  <p className="mt-0.5 break-words type-caption text-fg-secondary">Organisation: <span className="font-semibold text-fg">{i.organisation.name}</span></p>
-                )}
-              </div>
-              <Link href={i.action.href} title={i.action.hint} className={`${buttonClasses({ variant: "secondary", size: "sm" })} w-full shrink-0 sm:w-auto`}>
-                {i.action.label}{i.organisation && <span className="sr-only"> for {i.organisation.name}</span>}
-                <ArrowRight size={14} aria-hidden />
-              </Link>
-            </li>
-          ))}
-        </ul>
+                <Link href={i.action.href} aria-describedby={`${hintIds}-${n}`} className={`${buttonClasses({ variant: "secondary", size: "sm" })} w-full shrink-0 sm:w-auto`}>
+                  {i.action.label}{i.organisation && <span className="sr-only"> for {i.organisation.name}</span>}
+                  <ArrowRight size={14} aria-hidden />
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
-    </section>
-  );
-}
-
-function GovernanceGates() {
-  return (
-    <section aria-labelledby="pcc-gates-h" className={PANEL}>
-      <div className="flex items-center justify-between gap-3">
-        <h2 id="pcc-gates-h" className={H2}>Governance gates</h2>
-        <SyntheticTag />
-      </div>
-      <ul className="mt-4 space-y-2.5">
-        {GATES.map((g) => (
-          <li key={g.label} className="flex items-center justify-between gap-3 rounded-xl border border-line bg-fg/3 px-4 py-3 text-[14px] text-fg-secondary">
-            {g.label}
-            <span className={`inline-flex h-6 min-w-6 shrink-0 items-center justify-center rounded-full px-1.5 text-[12px] font-semibold tabular-nums ${g.info ? `border ${STATUS_TONE.info}` : "bg-fg/10 text-fg"}`}>{g.count}</span>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function DataProvenance({ health }: { health: { data: Health | null; error: unknown } }) {
-  const h = health.data;
-  return (
-    <section aria-labelledby="pcc-provenance-h" className={PANEL}>
-      <div className="flex items-center justify-between gap-3">
-        <h2 id="pcc-provenance-h" className={H2}>Data provenance</h2>
-        <SyntheticTag />
-      </div>
-      <p className="mt-3 text-[14px] font-medium leading-5 text-accent-fg">Read models: healthy / 4m lag max</p>
-      <p className="mt-1.5 type-caption text-fg-muted">
-        Sources: signed<span aria-hidden className="mx-1.5">•</span><span className="sr-only">, </span>Metrics: reconciled
-      </p>
-      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-3 type-caption text-fg-secondary">
-        <LiveTag />
-        {h ? <span>API health <span className="font-semibold uppercase">{h.status}</span> · cell <span className="type-code">{h.cell_id}</span></span>
-          : health.error ? <span>The API health check did not answer</span> : <span>Checking API health…</span>}
-      </div>
-    </section>
-  );
-}
-
-/** "Control → test → proof", read by screen readers as "Control to test to proof". */
-function Flow({ steps }: { steps: string[] }) {
-  return <>{steps.map((s, i) => <Fragment key={s}>{i > 0 && <><span aria-hidden> → </span><span className="sr-only"> to </span></>}{s}</Fragment>)}</>;
-}
-
-function AssuranceSignals({ orgs }: { orgs: { data: Org[] | null; error: unknown; loading: boolean } }) {
-  const list = orgs.data;
-  const suspended = list?.filter((o) => o.status === "SUSPENDED").length ?? 0;
-  const card = "h-full rounded-[14px] border border-line bg-surface-card/60 p-4";
-  return (
-    <section aria-labelledby="pcc-signals-h" className={`${PANEL} mt-6`}>
-      <h2 id="pcc-signals-h" className={H2}>Platform assurance signals</h2>
-      <ul className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {SIGNALS.map((s) => (
-          <li key={s.owner} className={`min-w-0 ${card}`}>
-            <h3 className="text-[14px] font-semibold leading-5 text-fg"><Flow steps={s.steps} /></h3>
-            <p className="mt-1.5 text-[14px] leading-5 text-fg-secondary">{s.value}</p>
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 type-caption text-fg-muted"><span className="whitespace-nowrap">{s.owner}</span><SyntheticTag /></div>
-          </li>
-        ))}
-        <li className="min-w-0">
-          <Link href="/organisations" title="Open Tenants & Entities, the organisation registry"
-            className={`group block transition-colors hover:border-line-strong ${card}`}>
-            <h3 className="text-[14px] font-semibold leading-5 text-fg">Tenant fleet</h3>
-            <div className="mt-1.5 text-[14px] leading-5 text-fg-secondary">
-              {list ? `${list.length} ${list.length === 1 ? "organisation" : "organisations"} · ${suspended} suspended`
-                : orgs.error ? "Registry unavailable"
-                : <span role="status" aria-label="Loading the organisation registry" className="skeleton my-0.5 block h-4 w-40" />}
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-2 type-caption text-fg-muted">
-              Metadata only
-              <span className="flex items-center gap-1.5"><LiveTag /><ChevronRight size={14} aria-hidden className="shrink-0 transition-colors group-hover:text-fg" /></span>
-            </div>
-          </Link>
-        </li>
-      </ul>
     </section>
   );
 }
