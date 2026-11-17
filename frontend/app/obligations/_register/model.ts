@@ -57,6 +57,26 @@ export type Filters = { q: string } & Record<FilterKey, string>;
 export const FILTER_KEYS: FilterKey[] = ["lifecycle", "state", "schedule", "subject"];
 export const NO_FILTERS: Filters = { q: "", lifecycle: "", state: "", schedule: "", subject: "" };
 export const isFiltered = (f: Filters) => !!f.q.trim() || FILTER_KEYS.some((k) => !!f[k]);
+/** The longest search (and address value) the register accepts. */
+export const SEARCH_MAX = 100;
+
+/* The search and filters are also kept in the page address (`?q=…&lifecycle=…&state=…&schedule=…&subject=…`), so Back
+   from a dossier, a refresh or a shared link reopens the same view. A value the register does not hold matches nothing;
+   its filter still offers it (count 0), so it can be seen and cleared. */
+const QUERY_KEYS: (keyof Filters)[] = ["q", ...FILTER_KEYS];
+
+/** The search and filters named in an address (an absent parameter = no filter). */
+export function filtersFromQuery(params: { get(name: string): string | null }): Filters {
+  const f = { ...NO_FILTERS };
+  QUERY_KEYS.forEach((k) => { f[k] = (params.get(k) ?? "").slice(0, SEARCH_MAX); });
+  return f;
+}
+
+/** Writes the search and filters into `params`, leaving every other parameter (such as the hub's `tab`) as it is. An
+ *  empty value removes its parameter, so a register with no search or filter has a plain address. */
+export function writeFiltersToQuery(params: URLSearchParams, f: Filters) {
+  QUERY_KEYS.forEach((k) => { if (f[k].trim()) params.set(k, f[k]); else params.delete(k); });
+}
 
 const VALUE: Record<FilterKey, (o: ObligationRecord) => string> = { lifecycle: (o) => o.lifecycle, state: stateOf, schedule: scheduleOf, subject: subjectKey };
 

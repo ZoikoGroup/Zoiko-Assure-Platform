@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Building2, Clock, Lock, RefreshCw, RotateCcw } from "lucide-react";
 import { errText, useApi } from "@/lib/api";
@@ -9,7 +10,7 @@ import { fmtDate } from "@/lib/format";
 import { rolesText } from "@/lib/roles";
 import { canOpen } from "@/components/nav";
 import { Card, EmptyState, ErrorState, LoadingSkeleton, PageHeader } from "@/components/ui";
-import { ASSURANCE_MEANING, LIFECYCLE_MEANING, NO_FILTERS, figures, isFiltered, matches, type Filters } from "./model";
+import { ASSURANCE_MEANING, LIFECYCLE_MEANING, NO_FILTERS, figures, filtersFromQuery, isFiltered, matches, writeFiltersToQuery, type Filters } from "./model";
 import { RegisterSummary, type SummaryStatus } from "./RegisterSummary";
 import { RegisterTable } from "./RegisterTable";
 import { RegisterToolbar } from "./RegisterToolbar";
@@ -26,7 +27,9 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 export function ObligationsRegister() {
   const { me } = useAuth();
   const { data, error, loading, reload } = useApi<ObligationRecord[]>("/obligations");
-  const [filters, setFilters] = useState<Filters>(NO_FILTERS);
+  const params = useSearchParams();
+  // The search and filters start from the address, so Back from a dossier, a refresh or a shared link reopens this view.
+  const [filters, setFilters] = useState<Filters>(() => filtersFromQuery(params));
   const [retrievedAt, setRetrievedAt] = useState<string | null>(null);
   const searchId = useId();
   const results = useRef<HTMLDivElement>(null);
@@ -37,6 +40,14 @@ export function ObligationsRegister() {
   // A refusal is shown once and not requested again on its own (each refusal is an audit record).
   const denied = error?.status === 403;
   useEffect(() => { if (rows) setRetrievedAt(new Date().toISOString()); }, [rows]);
+  // ...and are written back to it in place (no history entry per keystroke), beside the hub's `tab` and anything else
+  // there. Also re-run when the address changes, so a link to this same page (the sidebar entry) cannot leave it out of
+  // step. `null` state lets Next.js keep useSearchParams in step with the new address.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    writeFiltersToQuery(url.searchParams, filters);
+    if (url.href !== window.location.href) window.history.replaceState(null, "", url);
+  }, [filters, params]);
 
   const shown = useMemo(() => (rows ?? []).filter((o) => matches(o, filters)), [rows, filters]);
   const figs = useMemo(() => (rows ? figures(rows) : null), [rows]);

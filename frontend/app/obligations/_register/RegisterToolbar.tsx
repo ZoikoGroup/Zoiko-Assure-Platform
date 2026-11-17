@@ -4,7 +4,7 @@ import { useId, useMemo } from "react";
 import type { ReactNode } from "react";
 import { X } from "lucide-react";
 import { Button, Field, SearchInput, Select } from "@/components/ui";
-import { FILTER_KEYS, facet, isFiltered, type FacetOption, type FilterKey, type Filters } from "./model";
+import { FILTER_KEYS, SEARCH_MAX, facet, isFiltered, type FacetOption, type FilterKey, type Filters } from "./model";
 import type { ObligationRecord } from "./types";
 
 const FILTER_TEXT: Record<FilterKey, { label: string; all: string }> = {
@@ -27,7 +27,7 @@ export function RegisterToolbar({ rows, filters, onChange, onClear, searchId, di
     <div role="search" aria-label="Search and filter obligations" className="border-b border-slate-200 p-4">
       <div className="grid gap-3 min-[360px]:grid-cols-2 lg:grid-cols-4 xl:grid-cols-[minmax(0,1.4fr)_repeat(4,minmax(0,1fr))] xl:items-end">
         <Field label="Search" htmlFor={searchId} className="min-[360px]:col-span-2 lg:col-span-4 xl:col-span-1">
-          <SearchInput id={searchId} placeholder="Obligation title or key" maxLength={100} autoComplete="off" spellCheck={false}
+          <SearchInput id={searchId} placeholder="Obligation title or key" maxLength={SEARCH_MAX} autoComplete="off" spellCheck={false}
             value={filters.q} disabled={disabled} onChange={(e) => onChange({ ...filters, q: e.target.value })} />
         </Field>
         {FILTER_KEYS.map((k) => (
