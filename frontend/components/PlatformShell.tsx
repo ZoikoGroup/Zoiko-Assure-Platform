@@ -1,25 +1,29 @@
 "use client";
 
-import Link, { useLinkStatus } from "next/link";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
-  ArrowUpFromLine, Bell, Building2, ChevronRight, ClipboardCheck, Database, FileCheck2, FileCog, FileText, KeyRound, LayoutGrid, Loader2, LogOut, Menu,
-  Palette, ScrollText, Search, Server, ShieldCheck, UserCog,
+  ArrowUpFromLine, Bell, Building2, ChevronDown, ClipboardCheck, Database, FileCheck2, FileCog, FileText, KeyRound, LayoutGrid, LogOut, Menu,
+  Palette, PanelLeftClose, PanelLeftOpen, ScrollText, Server, ShieldCheck, UserCog,
 } from "lucide-react";
 import { useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
+import { PLANES } from "./ds/Plane";
 import { jumpTargets, navFor, routeMeta } from "./nav";
-import { Logo } from "./Shell";
+import { Logo, NavIcon, NavPending, ORG_FOCUS, OrgBreadcrumb } from "./Shell";
 import { ThemeToggle } from "./ThemeToggle";
-import { Drawer, Dropdown, DropdownItem } from "./ui";
+import { Drawer, Dropdown, DropdownItem, IconButton, Tooltip, usePageTitle } from "./ui";
 
-/* The Platform Control Plane chrome for the Zoiko Super Admin (persona "platform"): a floating sidebar and a header with
-   page search, theme, notifications and the time, over the themed backdrop. It is built only from the foundation
-   tokens (app/design-tokens.css), so it follows the one application theme (data-theme on <html>), as Design Governance
-   does. Customer-organisation users and content staff keep their own chrome (components/Shell.tsx).
+/* The chrome for the Zoiko Super Admin (persona "platform"), drawn as the Organization Workspace chrome is
+   (components/Shell.tsx), so both belong to one product: the navy sidebar (with the same collapse setting), the white
+   header with the breadcrumb, page search, alerts, theme toggle and account menu, over the slate page. The organisation
+   chrome's own breadcrumb, navigation icon, pending spinner and focus ring are reused. The frame carries
+   data-za-chrome="workspace", which gives the foundation tokens that the Super Admin screens and the design-system
+   components are built on the Organization Workspace values (app/design-tokens.css). Customer-organisation users and
+   content staff keep their own chrome (components/Shell.tsx).
 
    The navigation follows the Platform Command Center reference. An area with no Super Admin screen yet is listed as
    planned, not as a link: its nearest existing screen belongs to customer organisations or content staff, and the
@@ -79,118 +83,157 @@ function pageTargets(permissions?: readonly string[]): PageTarget[] {
   return [...byHref.values()];
 }
 
+/** The header breadcrumb, as the organisation header builds it: "Zoiko Assure / Super Admin" on the Command Center
+ *  (the organisation's reads "Zoiko Assure / Organization"), elsewhere the sidebar's group and entry (a group named like
+ *  its only entry is not repeated), and a record's title on its own page. */
+function platformCrumbs(path: string, groups: Group[], title: string): { label: string; href?: string }[] {
+  if (path === "/") return [{ label: "Zoiko Assure" }, { label: PLANES.platform.who }];
+  const meta = routeMeta(path);
+  const href = meta?.item.href ?? path;
+  const group = groups.find((g) => g.items.some((i) => i.href === href));
+  const item = group?.items.find((i) => i.href === href);
+  const page = item ? { label: item.label, href } : meta ? { label: meta.item.label, href: meta.item.href } : null;
+  return [{ label: "Zoiko Assure", href: "/" }, ...(group && group.group !== page?.label ? [{ label: group.group }] : []),
+    ...(page ? [page] : []), ...(meta?.isDetail && title ? [{ label: title }] : [])];
+}
+
 // As in Shell.tsx: "Super Admin (Platform)" → "SA" / "Super Admin".
 const initials = (n?: string) => (n ?? "?").replace(/\(.*\)/, "").trim().split(/\s+/).slice(0, 2).map((x) => x[0]).join("").toUpperCase();
 const shortName = (n?: string) => (n ?? "").replace(/\s*\(.*\)/, "");
 
-/* The sidebar is dark in both themes, so its focus outline uses the accent (the light theme's navy focus colour would
-   not show on it). The global :focus-visible rule reads --za-focus. */
-const SIDEBAR_FOCUS = "[--za-focus:var(--za-accent)]";
-const CONTROL = "rounded-control border border-line-control bg-surface-control/80 text-fg-secondary transition-colors hover:border-fg-muted hover:text-fg";
-// The page search's popup: the matching pages, or the note that none match. It is at least 16rem wide, but never wider
-// than the room right of the search on a phone (the 16px gutter, the 42px menu button and an 8px gap sit to its left,
-// 5.125rem with the right gutter), so it does not push the page sideways at 320px.
-const POPUP = "absolute left-0 z-40 mt-2 w-full min-w-[min(16rem,calc(100vw_-_5.125rem))] overflow-hidden rounded-card border border-line bg-surface-modal shadow-modal";
+// The page search's popup (matching pages, or the note that none match), as the organisation header's.
+const POPUP = "absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white shadow-lg";
+const SCOPE_TITLE = "Zoiko platform administration. You belong to no customer organisation and see registry metadata only.";
 
-export function PlatformFrame({ path, synthetic, children }: { path: string; synthetic: boolean; children: ReactNode }) {
+export function PlatformFrame({ path, synthetic, collapsed = false, onToggle, children }:
+  { path: string; synthetic: boolean; collapsed?: boolean; onToggle?: () => void; children: ReactNode }) {
   const { me } = useAuth();
   const [mobile, setMobile] = useState(false);
   useEffect(() => setMobile(false), [path]);
+  // The sidebar is navy in both themes, so it keeps the palette it is drawn with (the light theme's), as the
+  // organisation sidebar does.
   return (
-    <div className="min-h-screen bg-backdrop text-fg">
-      <a href="#main" className="sr-only z-[80] rounded-control bg-accent px-3 py-2 text-on-accent focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
-      <aside aria-label="Primary navigation"
-        className={`fixed inset-y-4 left-4 z-30 hidden w-sidebar flex-col overflow-hidden rounded-panel border border-sidebar-line bg-surface-sidebar/85 shadow-panel backdrop-blur-md lg:flex ${SIDEBAR_FOCUS}`}>
-        <PlatformSidebar path={path} />
+    <div data-za-chrome="workspace" className="min-h-screen bg-slate-100 dark:bg-canvas">
+      <a href="#main" className="sr-only z-[80] rounded-md bg-navy-700 px-3 py-2 text-white focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
+      <aside aria-label="Primary navigation" data-theme="light"
+        className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-navy-950 bg-navy-900 transition-[width] duration-200 lg:flex ${collapsed ? "w-16" : "w-[220px]"}`}>
+        <PlatformSidebar narrow={collapsed} path={path} onToggle={onToggle} />
       </aside>
-      <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[280px]">
-        <div className={`-m-4 flex h-[calc(100vh-49px)] flex-col bg-surface-sidebar ${SIDEBAR_FOCUS}`}><PlatformSidebar path={path} /></div>
+      <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[260px]">
+        <div data-theme="light" className="-m-4 flex h-[calc(100vh-49px)] flex-col bg-navy-900"><PlatformSidebar narrow={false} path={path} /></div>
       </Drawer>
-      <div className="lg:pl-[calc(var(--spacing-sidebar)+2.5rem)]">
-        <div className="mx-auto flex min-h-screen w-full max-w-content flex-col px-4 sm:px-6 lg:pl-0 lg:pr-8">
-          <PlatformHeader synthetic={synthetic} onMenu={() => setMobile(true)} />
-          <main id="main" key={me?.actor_id} className="flex-1 pb-10 pt-6">{children}</main>
-        </div>
+      <div className={`flex min-h-screen flex-col transition-[padding] duration-200 ${collapsed ? "lg:pl-16" : "lg:pl-[220px]"}`}>
+        <PlatformHeader path={path} synthetic={synthetic} onMenu={() => setMobile(true)} />
+        <main id="main" key={me?.actor_id} className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-5 sm:px-6">{children}</main>
       </div>
     </div>
   );
 }
 
-function PlatformSidebar({ path }: { path: string }) {
+/** The Super Admin sidebar, laid out as the organisation sidebar: the wordmark and collapse control, the plane it
+ *  works in, the grouped navigation (labels; icons with tooltips when collapsed) and, at the foot, the scope it works
+ *  in. The current page's entry, or the entry a record page belongs to, is highlighted. */
+function PlatformSidebar({ narrow, path, onToggle }: { narrow: boolean; path: string; onToggle?: () => void }) {
   const { me } = useAuth();
   // Platform-only screens that NAV does not list (Service Health) are matched by their exact path.
   const active = routeMeta(path)?.item.href ?? path;
   const groups = useMemo(() => platformNav(me?.permissions), [me]);
+  const c = workContext(me);
   // Keep the current page's item visible in the scrollable sidebar.
   const navRef = useRef<HTMLElement>(null);
   useEffect(() => { navRef.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "nearest" }); }, [active]);
   return (
     <>
-      <div className="shrink-0 px-sidebar-inset pt-sidebar-inset">
-        {/* White in both themes: the navy wordmark needs it. */}
-        <Link href="/" aria-label="Zoiko Assure, Command Center" className="inline-flex rounded-card bg-[#fff] px-4 py-3 shadow-card">
-          <Logo width={104} onDark={false} />
-        </Link>
-        <p className="mt-5 type-label text-sidebar-fg">Control plane</p>
+      <div className={`shrink-0 ${narrow ? "flex flex-col items-center gap-2 pt-4" : "px-[18px] pt-6"}`}>
+        <div className={narrow ? "contents" : "flex items-start justify-between gap-2"}>
+          <Link href="/" aria-label="Zoiko Assure, Command Center" className={`rounded ${ORG_FOCUS}`}><Logo mark={narrow} width={110} onDark /></Link>
+          {onToggle && (
+            <button type="button" onClick={onToggle} aria-label={narrow ? "Expand sidebar" : "Collapse sidebar"} title={narrow ? "Expand sidebar" : "Collapse sidebar"}
+              className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-white ${narrow ? "" : "-mr-2 -mt-1"} ${ORG_FOCUS}`}>
+              {narrow ? <PanelLeftOpen size={16} aria-hidden /> : <PanelLeftClose size={16} aria-hidden />}
+            </button>
+          )}
+        </div>
+        {!narrow && (
+          <div className="mt-3">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.04em] text-slate-200">{PLANES.platform.label}</div>
+            <div className="mt-1.5 text-[9px] font-medium uppercase tracking-[0.08em] text-slate-400">{PLANES.platform.who}</div>
+          </div>
+        )}
       </div>
-      <nav ref={navRef} aria-label="Super Admin" className="scroll-thin flex-1 overflow-y-auto px-4 pb-4 pt-6">
-        {groups.map((g) => <NavGroup key={g.group} group={g} active={active} />)}
+
+      <nav ref={navRef} aria-label="Super Admin" className={`flex-1 overflow-y-auto overflow-x-hidden pb-4 ${narrow ? "no-scrollbar px-3 pt-2" : "scroll-thin px-[11px] pt-3"}`}>
+        {groups.map((g, gi) => <NavGroup key={g.group} group={g} active={active} narrow={narrow} first={gi === 0} />)}
       </nav>
-      <div className="shrink-0 border-t border-sidebar-line p-3"><ProfileMenu /></div>
+
+      <div className={`shrink-0 border-t border-white/10 ${narrow ? "flex justify-center py-3" : "px-[18px] py-3.5"}`}>
+        {narrow ? (
+          <span title={SCOPE_TITLE} className="flex h-8 w-8 items-center justify-center rounded-md bg-white/[0.06] text-slate-300">
+            <ShieldCheck size={15} aria-hidden /><span className="sr-only">{SCOPE_TITLE}</span>
+          </span>
+        ) : (
+          <div title={SCOPE_TITLE} className="min-w-0">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">{c.label}</div>
+            <div className="mt-1 truncate text-[12px] font-medium text-slate-100">{c.name}</div>
+            <div className="mt-0.5 text-[12px] text-slate-300">Registry metadata only</div>
+          </div>
+        )}
+      </div>
     </>
   );
 }
 
-function NavGroup({ group, active }: { group: Group; active?: string }) {
+function NavGroup({ group, active, narrow, first }: { group: Group; active?: string; narrow: boolean; first: boolean }) {
   const id = useId();
   return (
-    <div role="group" aria-labelledby={id} className="mt-3 first:mt-0">
-      <div id={id} className="mb-1.5 px-2 type-label text-sidebar-muted">{group.group}</div>
-      <ul className="space-y-1">
-        {group.items.map(({ label, icon: Icon, href }) => (
-          <li key={label}>
-            {href ? (
-              <Link href={href} aria-current={href === active ? "page" : undefined}
-                className={`flex h-10 items-center gap-3 rounded-nav px-3 type-body transition-colors ${href === active
-                  ? "bg-linear-to-r from-accent-strong to-accent font-semibold text-on-accent shadow-glow"
-                  : "text-sidebar-fg hover:bg-sidebar-hover hover:text-sidebar-strong"}`}>
-                <NavIcon icon={Icon} /><span className="truncate">{label}</span>
-              </Link>
-            ) : (
-              <span aria-disabled="true" title="Planned: there is no Super Admin screen for this area yet"
-                className="flex h-10 cursor-not-allowed items-center gap-3 rounded-nav px-3 type-body text-sidebar-muted">
-                <Icon size={17} aria-hidden className="shrink-0" /><span className="truncate">{label}</span><span className="sr-only"> (planned)</span>
-              </span>
-            )}
-          </li>
-        ))}
+    <div role="group" aria-labelledby={narrow ? undefined : id} aria-label={narrow ? group.group : undefined} className={narrow ? "" : "pt-6 first:pt-3"}>
+      {narrow ? (!first && <div className="mx-1 my-2 border-t border-white/10" />) : (
+        <div id={id} className="pb-2 text-[11px] font-semibold uppercase leading-4 tracking-widest text-slate-400">{group.group}</div>
+      )}
+      <ul>
+        {group.items.map((item) => <li key={item.label} className="mb-px"><NavEntry item={item} here={!!item.href && item.href === active} narrow={narrow} /></li>)}
       </ul>
     </div>
   );
 }
 
-/** A link's icon, swapped for a spinner while its navigation is pending (as in the application sidebar). */
-function NavIcon({ icon: Icon }: { icon: LucideIcon }) {
-  const { pending } = useLinkStatus();
-  return pending ? (
-    <><Loader2 size={17} aria-hidden className="shrink-0 motion-safe:animate-spin" /><span className="sr-only">Loading</span></>
-  ) : <Icon size={17} aria-hidden className="shrink-0" />;
+/** One sidebar entry: a link styled as the organisation sidebar's, or a planned area, which is not a link. */
+function NavEntry({ item: { label, icon: Icon, href }, here, narrow }: { item: Item; here: boolean; narrow: boolean }) {
+  const shape = narrow ? "h-9 w-10 justify-center" : "h-9 gap-2 px-3 text-[14px]";
+  if (!href) {
+    return (
+      <span aria-disabled="true" title={`${narrow ? `${label}. ` : ""}Planned: there is no Super Admin screen for this area yet`}
+        className={`flex cursor-not-allowed items-center rounded-md text-slate-400 ${shape}`}>
+        {narrow ? <Icon size={16} aria-hidden /> : <span className="truncate">{label}</span>}
+        <span className="sr-only">{narrow ? `${label} (planned)` : " (planned)"}</span>
+      </span>
+    );
+  }
+  const link = (
+    <Link href={href} aria-current={here ? "page" : undefined} aria-label={narrow ? label : undefined}
+      className={`flex items-center rounded-md transition-colors ${ORG_FOCUS} ${shape}
+        ${here ? "bg-teal-400/15 font-medium text-teal-300" : "text-slate-200 hover:bg-white/[0.06] hover:text-white"}`}>
+      {narrow ? <NavIcon icon={Icon} active={here} dark /> : <><span className="truncate">{label}</span><NavPending /></>}
+    </Link>
+  );
+  return narrow ? <Tooltip content={label} side="right">{link}</Tooltip> : link;
 }
 
-/** The sidebar's identity block, which opens the account menu (the same entries as the application header's). */
-function ProfileMenu() {
+/** The account menu in the header, as the organisation header's: who is signed in, their roles, and that they belong to
+ *  no customer organisation. */
+function AccountMenu() {
   const { me, logout } = useAuth();
   const c = workContext(me);
   return (
-    <Dropdown label={`Account menu, ${shortName(me?.display_name)}`} align="left" menuClassName="bottom-full mb-2 w-full"
-      buttonClassName="flex w-full items-center gap-3 rounded-nav px-2 py-2 text-left transition-colors hover:bg-sidebar-hover"
+    <Dropdown label={`Account menu, ${shortName(me?.display_name)}`} menuClassName="w-72"
+      buttonClassName="flex items-center gap-2 rounded-md py-1 pl-1 pr-1.5 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
       button={<>
-        <span aria-hidden className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#fff] type-caption font-bold text-midnight-950">{initials(me?.display_name)}</span>
-        <span className="min-w-0 flex-1" title={rolesText(me)}>
-          <span className="block truncate type-secondary font-medium text-sidebar-strong">{shortName(me?.display_name)}</span>
-          <span className="block truncate type-caption text-sidebar-muted">{c.name}</span>
+        <span aria-hidden className="flex h-7 w-7 items-center justify-center rounded-full bg-navy-700 text-[11px] font-semibold text-white">{initials(me?.display_name)}</span>
+        <span className="hidden text-left 2xl:block" title={rolesText(me)}>
+          <span className="block max-w-[160px] truncate text-[12px] font-medium text-slate-900">{shortName(me?.display_name)}</span>
+          <span className="block max-w-[160px] truncate text-[11px] text-slate-500">{me?.roles[0] ? roleLabel(me.roles[0]) : ""}</span>
         </span>
-        <ChevronRight size={16} aria-hidden className="shrink-0 text-sidebar-muted" />
+        <ChevronDown size={14} aria-hidden className="text-slate-400" />
       </>}>
       {(close) => (
         <>
@@ -216,9 +259,10 @@ function ProfileMenu() {
   );
 }
 
-function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () => void }) {
+function PlatformHeader({ path, synthetic, onMenu }: { path: string; synthetic: boolean; onMenu: () => void }) {
   const { me } = useAuth();
   const router = useRouter();
+  const { title } = usePageTitle();
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);   // the results popup, shown while the search has focus and text
   const [active, setActive] = useState(-1);  // the highlighted result (aria-activedescendant); -1 for none
@@ -244,6 +288,7 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
+  const crumbs = useMemo(() => platformCrumbs(path, platformNav(me?.permissions), title), [path, me, title]);
   // Jumps to the screens this account may open (navigation, not record search), so it says "pages".
   const targets = useMemo(() => pageTargets(me?.permissions), [me]);
   const hits = useMemo(() => (q ? targets.filter((i) => i.terms.toLowerCase().includes(q.toLowerCase())).slice(0, 7) : []), [q, targets]);
@@ -281,56 +326,58 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
     }
   };
 
-  return (
-    <header className="flex items-center gap-2 pt-4 sm:gap-3">
-      <button type="button" onClick={onMenu} aria-label="Open navigation" title="Open navigation"
-        className={`${CONTROL} inline-flex h-10.5 w-10.5 shrink-0 items-center justify-center lg:hidden`}>
-        <Menu size={18} aria-hidden />
-      </button>
+  // Phones put the badge on the second line so the breadcrumb keeps its room (as in the organisation header).
+  const badge = (placement: string) => synthetic && (
+    <span title="This page includes synthetic demonstration figures, each marked SYNTHETIC. Figures marked LIVE are read from this deployment."
+      className={`${placement} shrink-0 items-center whitespace-nowrap rounded-full border border-slate-200 bg-slate-100 px-2.5 py-[3px] text-[10px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-600 md:text-[11px]`}>
+      Synthetic<span className="hidden lg:inline">&nbsp;demo data</span>
+    </span>
+  );
 
-      <div className="relative min-w-0 flex-1 md:w-96 md:flex-none">
-        <Search size={16} aria-hidden className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-fg-muted" />
-        <input ref={searchRef} type="search" value={q} onKeyDown={onSearchKey}
-          onChange={(e) => { setQ(e.target.value); setOpen(true); setActive(-1); }}
-          onFocus={() => setOpen(true)} onBlur={() => { setOpen(false); setActive(-1); }}
-          role="combobox" aria-autocomplete="list" aria-expanded={expanded} aria-controls={listId}
-          aria-activedescendant={current >= 0 ? optionId(current) : undefined} autoComplete="off"
-          placeholder="Search pages…" aria-label="Search Super Admin pages" aria-keyshortcuts="/ Control+K Meta+K"
-          className={`${CONTROL} h-10.5 w-full pl-10 type-secondary text-fg placeholder:text-fg-muted focus:border-accent ${q ? "pr-3" : "pr-3 sm:pr-14"}`} />
-        {!q && <kbd aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 rounded-chip border border-line px-1.5 type-code text-fg-muted sm:block">{mac ? "⌘K" : "Ctrl K"}</kbd>}
-        {/* Pressing on a result must not blur the field first (which would close the popup before the click lands). */}
-        <div id={listId} role="listbox" aria-label="Matching pages" hidden={!expanded} onMouseDown={(e) => e.preventDefault()}
-          className={`${POPUP} py-1.5`}>
-          {expanded && hits.map(({ href, label, group }, i) => (
-            <Link key={href} href={href} id={optionId(i)} role="option" aria-selected={i === current} tabIndex={-1} onClick={reset}
-              className={`flex items-center justify-between gap-3 px-3 py-2 type-secondary text-fg hover:bg-fg/5 ${i === current ? "bg-accent/10 outline-2 -outline-offset-2 outline-focus" : ""}`}>
-              {label}<span className="sr-only">, </span><span className="type-caption text-fg-muted">{group}</span>
-            </Link>
-          ))}
-        </div>
-        {shown && hits.length === 0 && (
-          <p onMouseDown={(e) => e.preventDefault()} className={`${POPUP} px-3 py-2.5 type-secondary text-fg-secondary`}>
-            No pages match <span className="font-semibold text-fg">“{q}”</span>.
-          </p>
-        )}
-        <p role="status" aria-live="polite" className="sr-only">{said}</p>
+  return (
+    <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4 sm:px-6">
+      <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="lg:hidden" />
+      <div className="min-w-0 flex-1 overflow-x-clip">
+        <div className="flex min-w-0 items-center gap-3"><OrgBreadcrumb items={crumbs} />{badge("hidden md:inline-flex")}</div>
+        <div className="mt-0.5 flex items-center gap-2 md:hidden">{badge("inline-flex")}</div>
       </div>
 
-      {synthetic && (
-        <span title="This page includes synthetic demonstration figures, each marked SYNTHETIC. Figures marked LIVE are read from this deployment."
-          className="hidden shrink-0 items-center whitespace-nowrap rounded-full border border-dashed border-line-strong px-2.5 py-1 type-label text-fg-secondary xl:inline-flex">
-          Synthetic demo data
-        </span>
-      )}
+      <div className="flex min-w-0 items-center gap-1 sm:gap-2">
+        <div className="relative hidden shrink-0 md:block">
+          <input ref={searchRef} type="search" value={q} onKeyDown={onSearchKey}
+            onChange={(e) => { setQ(e.target.value); setOpen(true); setActive(-1); }}
+            onFocus={() => setOpen(true)} onBlur={() => { setOpen(false); setActive(-1); }}
+            role="combobox" aria-autocomplete="list" aria-expanded={expanded} aria-controls={listId}
+            aria-activedescendant={current >= 0 ? optionId(current) : undefined} autoComplete="off"
+            placeholder="Search pages…" aria-label="Search Super Admin pages" aria-keyshortcuts="/ Control+K Meta+K"
+            className={`w-52 rounded-md border border-transparent bg-transparent py-1.5 pl-2.5 pr-2.5 text-[14px] text-slate-900 transition-colors placeholder:text-slate-500 hover:border-slate-200 focus:border-navy-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-navy-100 xl:w-72 ${q ? "" : "xl:pr-16"}`} />
+          {!q && <kbd aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 font-sans text-[13px] text-slate-500 xl:block">/ {mac ? "⌘K" : "Ctrl K"}</kbd>}
+          {/* Pressing on a result must not blur the field first (which would close the popup before the click lands). */}
+          <div id={listId} role="listbox" aria-label="Matching pages" hidden={!expanded} onMouseDown={(e) => e.preventDefault()}
+            className={`${POPUP} py-1`}>
+            {expanded && hits.map(({ href, label, group }, i) => (
+              <Link key={href} href={href} id={optionId(i)} role="option" aria-selected={i === current} tabIndex={-1} onClick={reset}
+                className={`flex items-center justify-between gap-2 px-3 py-1.5 text-[13px] text-slate-700 hover:bg-slate-50 ${i === current ? "bg-slate-100 text-slate-900 outline-2 -outline-offset-2 outline-focus" : ""}`}>
+                {label}<span className="sr-only">, </span><span className="shrink-0 text-[11px] text-slate-500">{group}</span>
+              </Link>
+            ))}
+          </div>
+          {shown && hits.length === 0 && (
+            <p onMouseDown={(e) => e.preventDefault()} className={`${POPUP} px-3 py-2 text-[13px] text-slate-600`}>
+              No pages match <span className="font-semibold text-slate-900">“{q}”</span>.
+            </p>
+          )}
+          <p role="status" aria-live="polite" className="sr-only">{said}</p>
+        </div>
 
-      <div className="ml-auto flex shrink-0 items-center gap-2 sm:gap-3">
-        <ThemeToggle className={`${CONTROL} inline-flex h-10.5 w-10.5 items-center justify-center`} iconSize={17} />
-        <Dropdown label="Notifications" menuClassName="w-72" buttonClassName={`${CONTROL} relative inline-flex h-10.5 w-10.5 items-center justify-center`}
-          button={<Bell size={17} aria-hidden />}>
+        <Dropdown label="Alerts" menuClassName="w-72"
+          buttonClassName="relative inline-flex h-8 min-w-8 items-center justify-center rounded-md px-2 text-[14px] font-medium text-slate-800 hover:bg-slate-100 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
+          button={<><Bell size={16} aria-hidden className="sm:hidden" /><span className="hidden sm:inline">Alerts</span></>}>
           <NotificationsPanel />
         </Dropdown>
-        <span aria-hidden className="hidden h-8 w-px bg-line sm:block" />
         <NowUtc />
+        <ThemeToggle className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-slate-200 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400" />
+        <AccountMenu />
       </div>
     </header>
   );
@@ -338,7 +385,7 @@ function PlatformHeader({ synthetic, onMenu }: { synthetic: boolean; onMenu: () 
 
 /** The notifications panel's content. It is not a modal: it takes focus when it opens, so its heading and text are
  *  announced, and Tab and Shift+Tab move on from it as usual (leaving the panel closes it). Escape closes it and returns
- *  focus to the bell (the shared Dropdown). */
+ *  focus to its button (the shared Dropdown). */
 function NotificationsPanel() {
   const ref = useRef<HTMLDivElement>(null);
   const textId = useId();
@@ -367,9 +414,9 @@ function NowUtc() {
   const date = now.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
   const time = now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
   return (
-    <time dateTime={now.toISOString()} title={`${now.toUTCString()} (your local time: ${now.toLocaleString()})`} className="hidden leading-tight sm:block">
-      <span className="block type-caption text-fg-secondary">{date}</span>
-      <span className="block type-secondary font-semibold tabular-nums text-fg">{time} <span className="font-normal text-fg-muted">UTC</span></span>
+    <time dateTime={now.toISOString()} title={`${now.toUTCString()} (your local time: ${now.toLocaleString()})`} className="hidden px-1 leading-tight sm:block">
+      <span className="block text-[11px] text-slate-500">{date}</span>
+      <span className="block text-[13px] font-semibold tabular-nums text-slate-800">{time} <span className="font-normal text-slate-500">UTC</span></span>
     </time>
   );
 }

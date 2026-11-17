@@ -307,9 +307,23 @@ def test_guarded_rows_change_only_in_their_completion_columns(engines):
                 tx.rollback()
 
 
+# The rules app/seed.py releases for the synthetic Customer Zero fixture (the client fixture seeds it): content no other
+# module authors, over seeded facts and subjects only, with no DECIMAL literal.
+SEEDED_RULES = {"EUAIA_DEPLOYER_HR_OVERSIGHT", "EUAIA_TRANSPARENCY_INTERACTION", "DORA_ICT_RISK_FRAMEWORK",
+                "DORA_ICT_INCIDENT_PROCESS"}
+
+
 def _verified_draft(client) -> tuple[dict, str]:
     """A republication draft of a current rule version, taken through every gate before release (author, peer, legal,
-    shadow). Returns the rule version it supersedes and the draft ID."""
+    shadow). Returns the rule version it supersedes and the draft ID.
+
+    The base is a seeded rule. Other modules release rules into the same session database that cannot be republished
+    unchanged, by design, and /rules/versions puts them first at random: test_decimal_canonicalization_guard and
+    test_decimal_fact_integrity release the threshold "50000000.00", stored canonicalized as "5E+7" (canonicalize keeps
+    the value but may use exponent form, outside the DECIMAL owner decision), which review rightly refuses to take back
+    as an authored literal (RUL_TYPE_MISMATCH: not a canonical decimal string, RUL §05); and test_decimal_fact_integrity
+    keeps subjects with non-finite stored DECIMAL facts, so a republication of its rules records shadow execution
+    errors and publication rightly refuses it (SHADOW_IMPACT_INCOMPLETE). Neither is what these tests are about."""
     from conftest import H
     from app.db import AdminSession
     from app.engines.catalog import RELEASABLE
@@ -326,7 +340,8 @@ def _verified_draft(client) -> tuple[dict, str]:
                 p.lifecycle in RELEASABLE and db.get(RequirementVersion, p.requirement_version_id).lifecycle in RELEASABLE
                 for p in provs)
     base = next(v for v in client.get("/api/rules/versions", headers=H("actor-content-analyst")).json()
-                if v["superseded_by"] is None and republishable(v["obligation_definition_id"]))
+                if v["obligation_definition"] in SEEDED_RULES and v["superseded_by"] is None
+                and republishable(v["obligation_definition_id"]))
     draft = client.post("/api/rules/drafts", headers=H("actor-content-analyst"), json={
         "obligation_definition_id": base["obligation_definition_id"], "authoring_mode": "AST",
         "ast": base["canonical_ast"], "golden_vectors": base["golden_vectors"], "source_mappings": base["source_mappings"],

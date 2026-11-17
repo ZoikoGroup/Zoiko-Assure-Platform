@@ -220,3 +220,36 @@
 /* Inside a themed subtree the focus outline uses that theme's focus colour (the global navy outline is too dark on
    dark surfaces). Screens without data-theme keep the global outline. */
 [data-theme] :focus-visible { outline-color: var(--za-focus); }
+
+/* The Super Admin screens in the Organization Workspace look. The Super Admin frame (components/PlatformShell.tsx) is
+   marked data-za-chrome="workspace"; while it is on the page, the foundation tokens its screens and the design-system
+   components (components/ds) are built on take the values the Organization Workspace is drawn with (app/page.tsx
+   Overview, components/ui.tsx, globals.css). The rule sits on <html>, so dialogs portalled into <body> follow it too.
+   Palette steps are the application palette (theme.css), so each value follows the light and dark theme exactly as the
+   organisation screens do. No other screen carries the marker, so nothing else changes; the design system's own pages
+   (/design-system) are drawn outside the Super Admin frame and keep the reference values. Text, lines, status colours,
+   form-control borders (--za-line-control, WCAG 1.4.11) and the focus colour already match and are unchanged. */
+:root:has([data-za-chrome="workspace"]) {
+  /* Wells (table heads, code, quotes, hover): bg-slate-50, as the organisation kit's table heads and buttons. */
+  --za-surface-raised: var(--color-slate-50);
+  /* One interactive colour, navy, as btn-primary, the selected tab and links are drawn (globals.css, ui.tsx Tabs,
+     WorkspaceHub): a flat navy fill with white text, without the gradient or the glow. */
+  --za-accent: var(--color-navy-700);
+  --za-accent-strong: var(--color-navy-700);
+  --za-accent-fg: var(--color-navy-700);
+  --za-on-accent: var(--color-white);
+  --za-shadow-glow: 0 0 #0000;
+  /* The Overview's panels and figure cards (app/page.tsx); dialogs as ui.tsx Modal (shadow-xl). */
+  --za-shadow-card: 0 1px 3px rgb(15 23 42 / 0.06);
+  --za-shadow-panel: 0 1px 3px rgb(15 23 42 / 0.06);
+  --za-shadow-modal: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+  /* Corners: rounded-xl panels and figure cards, rounded-lg dialogs, rounded-md controls, buttons and navigation,
+     rounded badges. */
+  --radius-panel: 0.75rem;
+  --radius-card: 0.75rem;
+  --radius-modal: 0.5rem;
+  --radius-control: 0.375rem;
+  --radius-button: 0.375rem;
+  --radius-nav: 0.375rem;
+  --radius-chip: 0.25rem;
+}

@@ -437,7 +437,7 @@ function NotStored() {
 function MetadataLoading() {
   return (
     <div role="status" aria-label="Reading the organisation registry" className="space-y-6">
-      <div className="rounded-panel border border-line bg-surface-raised/70 p-5 sm:p-6">
+      <div className="rounded-panel border border-line bg-surface-card p-5 sm:p-6">
         <Skeleton className="h-5 w-48" />
         <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {[0, 1, 2, 3, 4, 5].map((i) => (
@@ -447,7 +447,7 @@ function MetadataLoading() {
           ))}
         </div>
       </div>
-      <div className="rounded-panel border border-line bg-surface-raised/70 p-5 sm:p-6">
+      <div className="rounded-panel border border-line bg-surface-card p-5 sm:p-6">
         <Skeleton className="h-5 w-56" />
         {[0, 1, 2].map((i) => <Skeleton key={i} className="mt-4 h-10 w-full" />)}
       </div>

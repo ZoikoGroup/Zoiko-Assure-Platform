@@ -101,12 +101,9 @@ function healthDetail(v: HealthView): string {
 }
 
 /* ---------------------------------------------------------------------------------------------------------- styles */
-const PANEL = "rounded-[22px] border border-line bg-surface-raised/70 p-5 shadow-panel sm:p-6";
+const PANEL = "rounded-panel border border-line bg-surface-card p-5 shadow-panel sm:p-6";
 const H2 = "text-[18px] font-semibold leading-7 text-fg";
 // Literal class names per tone, so Tailwind generates them.
-const GLOW: Record<StatusKey, string> = {
-  critical: "bg-status-critical/20", warning: "bg-status-warning/20", info: "bg-status-info/20", verified: "bg-status-verified/15", unknown: "bg-status-unknown/15",
-};
 const DOT: Record<StatusKey, string> = {
   critical: "bg-status-critical", warning: "bg-status-warning", info: "bg-status-info", verified: "bg-status-verified", unknown: "bg-fg-muted",
 };
@@ -124,8 +121,8 @@ export function PlatformCommandCenter() {
       <p role="status" aria-live="polite" className="sr-only">{q.announcement}</p>
       <div className="mb-6 flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
         <div className="min-w-0">
-          <h1 className="text-[26px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">{TITLE}</h1>
-          <p className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[15px] text-fg-secondary">
+          <h1 className="text-[26px] font-semibold leading-tight text-fg sm:text-[28px]">{TITLE}</h1>
+          <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[14px] text-fg-secondary">
             <span>Cross-tenant metadata only</span><span aria-hidden className="h-4 w-px bg-line-strong" /><span>Super Admin operations</span>
           </p>
         </div>
@@ -200,21 +197,21 @@ type Kpi = {
 function KpiTile({ k }: { k: Kpi }) {
   const Icon = k.icon;
   return (
-    <li aria-busy={k.busy || undefined} className="relative isolate min-w-0 overflow-hidden rounded-[18px] border border-line bg-surface-card/70 p-5 shadow-card">
-      <span aria-hidden className={`pointer-events-none absolute -right-14 -top-20 -z-10 h-48 w-48 rounded-full blur-3xl ${GLOW[k.tone]}`} />
+    // A figure card as on the organisation Overview (app/page.tsx KpiCard): label, value, hint.
+    <li aria-busy={k.busy || undefined} className="min-w-0 rounded-card border border-line bg-surface-card px-4 pb-3 pt-4 shadow-card">
       <div className="flex items-start justify-between gap-3">
-        <span aria-hidden className={`flex h-10.5 w-10.5 shrink-0 items-center justify-center rounded-[11px] border ${STATUS_SURFACE[k.tone]} ${STATUS_TEXT[k.tone]}`}>
-          <Icon size={18} />
+        <span aria-hidden className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-control border ${STATUS_SURFACE[k.tone]} ${STATUS_TEXT[k.tone]}`}>
+          <Icon size={16} />
         </span>
         <LiveTag />
       </div>
-      <p className="mt-5 text-[14px] leading-5 text-fg-secondary">{k.label}</p>
+      <p className="mt-3 text-[14px] font-semibold leading-5 text-fg">{k.label}</p>
       {/* The value keeps its full width; when a status word and the link do not fit side by side, the link wraps below. */}
-      <div className="mt-1.5 flex flex-wrap items-end justify-between gap-x-3 gap-y-1">
-        <p className={`font-bold leading-9 tabular-nums transition-opacity ${k.busy ? "opacity-60" : ""} ${k.valueClass ?? "text-[32px] tracking-tight text-fg"}`}>{k.value}</p>
+      <div className="mt-1 flex flex-wrap items-end justify-between gap-x-3 gap-y-1">
+        <p className={`font-bold leading-8 tabular-nums transition-opacity ${k.busy ? "opacity-60" : ""} ${k.valueClass ?? "text-[28px] text-fg"}`}>{k.value}</p>
         {k.aside}
       </div>
-      <p className="mt-2 type-caption text-fg-muted">{k.hint}</p>
+      <p className="mt-1 text-[13px] leading-[17px] text-fg-muted">{k.hint}</p>
     </li>
   );
 }
