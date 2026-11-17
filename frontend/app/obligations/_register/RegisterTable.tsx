@@ -12,9 +12,11 @@ import type { ObligationRecord } from "./types";
 type BadgeTone = ComponentProps<typeof Badge>["tone"];
 
 /* The shared status palette colours CLOSED as a success (it is also an issue state) and SUSPENDED as a failure. For an
-   obligation both mean "not in force now", which is neither, so this register shows them neutral. Other lifecycle codes
-   keep the shared colours, and an unrecognised one keeps its "unrecognised code" style. */
-const LIFECYCLE_TONE: Record<string, BadgeTone> = { CLOSED: "neutral", SUSPENDED: "neutral" };
+   obligation neither is right, so this register uses two other shared tones: CLOSED (duty ended, history retained) is
+   neutral, a finished record; SUSPENDED (temporarily inactive under an approved condition) is a warning, a pause that
+   still needs attention. Other lifecycle codes keep the shared colours, and an unrecognised one keeps its
+   "unrecognised code" style. */
+const LIFECYCLE_TONE: Record<string, BadgeTone> = { CLOSED: "neutral", SUSPENDED: "warn" };
 
 function LifecycleBadge({ code }: { code: string }) {
   const meaning = LIFECYCLE_MEANING[code];
