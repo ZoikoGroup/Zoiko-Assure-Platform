@@ -57,12 +57,24 @@ def corrected_by(db, release: ContentRelease) -> list[str]:
                            .order_by(ContentRelease.cell_received_seq, ContentRelease.content_release_id)).scalars())
 
 
-def correction_flags(db, release: ContentRelease) -> dict:
-    """API-001 §17 "correction flags" for a release, plus the signed correction statement when it is a correction."""
+def corrections_by_release(db) -> dict[str, list[str]]:
+    """corrected_by() for every release in one query: the correcting releases of each, in record order."""
+    out: dict[str, list[str]] = {}
+    for rid, of in db.execute(select(ContentRelease.content_release_id, ContentRelease.correction_of_release_id)
+                              .where(ContentRelease.correction_of_release_id.is_not(None))
+                              .order_by(ContentRelease.cell_received_seq, ContentRelease.content_release_id)):
+        out.setdefault(of, []).append(rid)
+    return out
+
+
+def correction_flags(db, release: ContentRelease, *, corrections: dict[str, list[str]] | None = None) -> dict:
+    """API-001 §17 "correction flags" for a release, plus the signed correction statement when it is a correction.
+    ``corrections``: corrections_by_release() already read for a list of releases (one query, not one per release)."""
     m = release.manifest or {}
     out = {"is_correction": release.correction_of_release_id is not None,
            "corrects_release_id": release.correction_of_release_id,
-           "corrected_by_release_ids": corrected_by(db, release)}
+           "corrected_by_release_ids": corrected_by(db, release) if corrections is None
+           else list(corrections.get(release.content_release_id, []))}
     if release.correction_of_release_id is not None:
         c = m.get("correction") if isinstance(m.get("correction"), dict) else {}
         # A correction published before the reason was part of the signed manifest has none: say so, never invent one.

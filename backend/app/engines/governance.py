@@ -1060,11 +1060,14 @@ def resolve_evidence_conflict(
 # mutations; due dates are never edited.
 
 def _current_obligation(db: Session, tenant_id: str, lineage_id: str):
-    """The current revision of one of this organisation's obligations (404 otherwise, for another organisation's too)."""
+    """The current revision of one of this organisation's obligations (404 otherwise, for another organisation's too).
+    Two current revisions are refused, never one chosen by row order (selection.AmbiguousSelection)."""
     from ..models import ObligationInstance
-    obl = db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant_id,
-                                                      ObligationInstance.lineage_id == lineage_id,
-                                                      ObligationInstance.record_to_seq.is_(None))).scalars().first()
+    from .selection import one_or_none
+    obl = one_or_none(db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant_id,
+                                                                  ObligationInstance.lineage_id == lineage_id,
+                                                                  ObligationInstance.record_to_seq.is_(None))).scalars(),
+                      record_type="ObligationInstance", selection="obligation_current", id_attr="revision_id")
     if obl is None:
         raise HTTPException(404, "obligation not found")
     return obl

@@ -26,6 +26,7 @@ from sqlalchemy import select
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, ObligationInstance,
                       RuleVersion)
 from . import catalog
+from .selection import AmbiguousSelection, one_or_none
 
 
 def evaluation_summary(db, ev: ApplicabilityEvaluation | None) -> dict | None:
@@ -110,23 +111,26 @@ def _decision(db, tenant_id: str, det: ApplicabilityDetermination | None, att: A
 
 
 def _closing(db, tenant_id: str, rev: ObligationInstance, origin: ApplicabilityDetermination | None):
-    """The adopted non-APPLIES determination revision and its attestation recorded at the closure's record sequence."""
+    """The adopted non-APPLIES determination revision and its attestation recorded at the closure's record sequence.
+    The closing attestation records one determination revision of the lineage in its own transaction (one record
+    sequence), so each is unique; more than one candidate of either raises selection.AmbiguousSelection rather than
+    naming the lowest ID as the closing decision (the caller reports it)."""
     if origin is None:
         return None, None
-    det = db.execute(select(ApplicabilityDetermination).where(
+    det = one_or_none(db.execute(select(ApplicabilityDetermination).where(
         ApplicabilityDetermination.tenant_id == tenant_id,
         ApplicabilityDetermination.lineage_id == origin.lineage_id,
         ApplicabilityDetermination.record_from_seq == rev.record_from_seq,
-        ApplicabilityDetermination.state == "ADOPTED")
-        .order_by(ApplicabilityDetermination.revision_id)).scalars().first()
+        ApplicabilityDetermination.state == "ADOPTED")).scalars(),
+        record_type="ApplicabilityDetermination", selection="closure_determination", id_attr="revision_id")
     att = db.execute(select(AdoptionAttestation).where(
         AdoptionAttestation.tenant_id == tenant_id, AdoptionAttestation.record_seq == rev.record_from_seq,
-        AdoptionAttestation.target_type == "ApplicabilityDetermination")
-        .order_by(AdoptionAttestation.attestation_id)).scalars().all()
+        AdoptionAttestation.target_type == "ApplicabilityDetermination")).scalars().all()
     lineage_revs = {r for r in db.execute(select(ApplicabilityDetermination.revision_id).where(
         ApplicabilityDetermination.tenant_id == tenant_id,
         ApplicabilityDetermination.lineage_id == origin.lineage_id)).scalars()}
-    att = next((a for a in att if a.target_revision_id in lineage_revs), None)
+    att = one_or_none([a for a in att if a.target_revision_id in lineage_revs], record_type="AdoptionAttestation",
+                      selection="closure_attestation", id_attr="attestation_id")
     return det, att
 
 
@@ -205,15 +209,22 @@ def obligation_decision_history(db, tenant_id: str, lineage_id: str, as_of_recor
                  "origin": origin_view}
         rev_problems = list(origin_problems)
         if rev.lifecycle == "CLOSED":
-            cdet, catt = _closing(db, tenant_id, rev, origin)
-            if cdet is None and catt is None:
-                rev_problems.append(catalog._problem("CLOSURE_DECISION_UNRESOLVED", "INCOMPLETE",
-                                                     revision_id=rev.revision_id))
+            try:
+                cdet, catt = _closing(db, tenant_id, rev, origin)
+            except AmbiguousSelection as e:  # the chain is reported, not resolved by picking one (DAT-REQ-010)
+                rev_problems.append(catalog._problem("CLOSURE_DECISION_AMBIGUOUS", "MISMATCH",
+                                                     revision_id=rev.revision_id, record_type=e.record_type,
+                                                     candidate_ids=e.candidate_ids))
                 entry["closure"] = None
             else:
-                entry["closure"], closing_problems = _decision(db, tenant_id, cdet, catt,
-                                                               {"DOES_NOT_APPLY"}, "closure", as_of_record_seq)
-                rev_problems += closing_problems
+                if cdet is None and catt is None:
+                    rev_problems.append(catalog._problem("CLOSURE_DECISION_UNRESOLVED", "INCOMPLETE",
+                                                         revision_id=rev.revision_id))
+                    entry["closure"] = None
+                else:
+                    entry["closure"], closing_problems = _decision(db, tenant_id, cdet, catt,
+                                                                   {"DOES_NOT_APPLY"}, "closure", as_of_record_seq)
+                    rev_problems += closing_problems
         entry["problems"] = rev_problems
         problems += [{**x, "revision_id": rev.revision_id} for x in rev_problems]
         entries.append(entry)

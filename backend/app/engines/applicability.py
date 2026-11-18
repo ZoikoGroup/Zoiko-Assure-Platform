@@ -15,12 +15,12 @@ from sqlalchemy.orm import Session
 
 from .. import codes
 from ..db import CELL_ID
-from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, ContentRelease,
-                      FactDefinition, FactRequest, Issue, ObligationDefinition, ObligationInstance, RuleVersion,
-                      SatisfactionExpressionVersion, SetVersion, Subject, new_id)
+from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, AssuranceSnapshot,
+                      ContentRelease, FactDefinition, FactRequest, Issue, ObligationDefinition, ObligationInstance,
+                      RuleVersion, SatisfactionExpressionVersion, SetVersion, Subject, new_id)
 from ..platform import audit, canonical_json, digest, emit, ensure_utc, next_record_seq, sha256_hex
-from . import idempotency, rules
-from .facts import resolve_fact
+from . import idempotency, rules, selection
+from .facts import display_value, overlaps, resolve_fact, visible_at
 from .locks import xact_lock
 
 ATTESTATION_STATEMENT_V = "ATT-STMT-1.0"
@@ -45,7 +45,9 @@ def resolve_rule(db: Session, odef: ObligationDefinition, effective: date, cutof
     published = select(RuleVersion).where(RuleVersion.obligation_definition_id == odef.obligation_definition_id,
                                           RuleVersion.status == "PUBLISHED", RuleVersion.record_seq <= cutoff_seq)
     effective_now = (RuleVersion.valid_from <= effective) & or_(RuleVersion.valid_to.is_(None), RuleVersion.valid_to > effective)
-    rv = db.execute(published.where(effective_now).order_by(RuleVersion.version.desc())).scalars().first()
+    # The highest version in force (the existing supersession policy). Two rows sharing that number are refused, never
+    # one of them bound by row order (DAT-REQ-010; DOM §13 "exactly one released rule version is effective").
+    rv = selection.highest_version(db.execute(published.where(effective_now)).scalars(), selection="rule_version_bound")
     # The effective period is read from the mutable row. A newer PUBLISHED version passed over because its period does
     # not cover `effective` is skipped only if that period is the one its signed release declares; otherwise its row was
     # altered below the application and binding an older version would be a silent fallback (Task 0; APP-REQ-006,
@@ -174,9 +176,7 @@ def integrity_fail_closed(db: Session, *, actor, tenant_id: str | None):
 
 
 def _display(fd: dict, value):
-    if fd["sensitivity"] in ("RESTRICTED_PERSONAL", "LEGAL_PRIVILEGED"):
-        return "••• (redacted)"
-    return value
+    return display_value(fd["sensitivity"], value)  # the one redaction policy (facts.REDACTED_SENSITIVITIES)
 
 
 # ---------------------------------------------------------------- decision-scope serialisation
@@ -405,28 +405,36 @@ def digest_safe(obj):
     return json.loads(canonical_json(obj))
 
 
+def _one_current_determination(rows) -> ApplicabilityDetermination | None:
+    """The one current determination revision of a scope or lineage. This code keeps one lineage per (organisation,
+    subject, obligation definition), revised under the decision-scope lock (lock_decision), and closes the prior revision
+    in the transaction that records the next, so more than one current revision is a state it never writes. No valid-time
+    slicing exists to choose between several (APP §15 "only one current adopted/rejected determination per subject +
+    obligation definition + compatible valid slice"), so none is chosen (selection.AmbiguousSelection)."""
+    return selection.one_or_none(rows, record_type="ApplicabilityDetermination", selection="determination_current",
+                                 id_attr="revision_id")
+
+
 def current_determination(db: Session, tenant_id: str, subject_id: str, odef_id: str) -> ApplicabilityDetermination | None:
-    return db.execute(select(ApplicabilityDetermination).where(
+    return _one_current_determination(db.execute(select(ApplicabilityDetermination).where(
         ApplicabilityDetermination.tenant_id == tenant_id, ApplicabilityDetermination.subject_id == subject_id,
         ApplicabilityDetermination.obligation_definition_id == odef_id,
-        ApplicabilityDetermination.record_to_seq.is_(None)).order_by(
-        ApplicabilityDetermination.record_from_seq.desc())).scalars().first()
+        ApplicabilityDetermination.record_to_seq.is_(None))).scalars())
 
 
 def current_determinations(db: Session, tenant_id: str, pairs: set[tuple[str, str]]) -> dict[tuple[str, str], ApplicabilityDetermination]:
     """current_determination() for many (subject_id, obligation_definition_id) pairs in one query (list views)."""
-    out: dict[tuple[str, str], ApplicabilityDetermination] = {}
+    found: dict[tuple[str, str], list[ApplicabilityDetermination]] = {}
     if not pairs:
-        return out
+        return {}
     for d in db.execute(select(ApplicabilityDetermination).where(
             ApplicabilityDetermination.tenant_id == tenant_id,
             ApplicabilityDetermination.subject_id.in_({s for s, _ in pairs}),
-            ApplicabilityDetermination.record_to_seq.is_(None)).order_by(
-            ApplicabilityDetermination.record_from_seq.desc())).scalars():
+            ApplicabilityDetermination.record_to_seq.is_(None))).scalars():
         key = (d.subject_id, d.obligation_definition_id)
         if key in pairs:
-            out.setdefault(key, d)
-    return out
+            found.setdefault(key, []).append(d)
+    return {key: _one_current_determination(rows) for key, rows in found.items()}
 
 
 def _new_det_revision(db, prev: ApplicabilityDetermination | None, *, tenant_id, subject_id, odef_id, evaluation,
@@ -612,11 +620,11 @@ def attest(db: Session, *, ctx, determination_lineage_id: str, decision: str, au
         raise HTTPException(422, "authority_basis is required (APP §13: named actor, authority basis, exact revision)")
 
     def current():
-        return db.execute(select(ApplicabilityDetermination).where(
+        return _one_current_determination(db.execute(select(ApplicabilityDetermination).where(
             ApplicabilityDetermination.tenant_id == ctx.tenant,
             ApplicabilityDetermination.lineage_id == determination_lineage_id,
             ApplicabilityDetermination.record_to_seq.is_(None))
-            .execution_options(populate_existing=True)).scalars().first()
+            .execution_options(populate_existing=True)).scalars())
     cur = current()
     if not cur:
         raise HTTPException(404, "Determination not found")
@@ -711,10 +719,7 @@ def _close_obligation(db, tenant_id, subject_id, odef_id, seq, at, *, closing_de
     (prospective; the retroactive valid-time policy of APP §11 C step 6 is not specified). The revision keeps naming
     its originating adoption; the closing decision is recorded at the same record sequence and in the
     `obligation.revised` event (ZA-EVT-001 "Bitemporal obligation revision recorded")."""
-    cur = db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant_id,
-                                                      ObligationInstance.subject_id == subject_id,
-                                                      ObligationInstance.obligation_definition_id == odef_id,
-                                                      ObligationInstance.record_to_seq.is_(None))).scalars().first()
+    cur = current_obligation_for_scope(db, tenant_id, subject_id, odef_id)
     if not (cur and cur.lifecycle == "ADOPTED"):
         return None
     cur.record_to_seq = seq
@@ -734,11 +739,20 @@ def _close_obligation(db, tenant_id, subject_id, odef_id, seq, at, *, closing_de
     return closed
 
 
+def current_obligation_for_scope(db, tenant_id: str, subject_id: str, odef_id: str) -> ObligationInstance | None:
+    """The one current obligation revision of (organisation, subject, obligation definition): the revision an adoption
+    revises or a closure closes. DOM §13 "Adopted Determination -> ObligationInstance 1 : 0..1 per canonical scoped
+    obligation revision" (audit F-05); attestation creates and revises it under the decision-scope lock, closing the
+    prior revision in the same transaction. Two current revisions are never written by this code; revising or closing an
+    arbitrary one of them would leave the other current, so neither is chosen (selection.AmbiguousSelection)."""
+    return selection.one_or_none(db.execute(select(ObligationInstance).where(
+        ObligationInstance.tenant_id == tenant_id, ObligationInstance.subject_id == subject_id,
+        ObligationInstance.obligation_definition_id == odef_id, ObligationInstance.record_to_seq.is_(None))).scalars(),
+        record_type="ObligationInstance", selection="obligation_current", id_attr="revision_id")
+
+
 def _activate_obligation(db, det, att, subject, odef, seq, actor_id) -> ObligationInstance:
-    cur = db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == det.tenant_id,
-                                                      ObligationInstance.subject_id == subject.subject_id,
-                                                      ObligationInstance.obligation_definition_id == odef.obligation_definition_id,
-                                                      ObligationInstance.record_to_seq.is_(None))).scalars().first()
+    cur = current_obligation_for_scope(db, det.tenant_id, subject.subject_id, odef.obligation_definition_id)
     lineage = cur.lineage_id if cur else new_id()
     if cur:
         cur.record_to_seq = seq
@@ -849,6 +863,153 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
         fr.status = "RESOLVED"
         fr.resolution = "Resolved by recorded FactAssertion; linked evaluations re-run."
     return results
+
+
+def _consumed(ev: ApplicabilityEvaluation, fact_key: str) -> dict | None:
+    """How the evaluation's frozen bundle consumed `fact_key`: the exact assertion revision, or the unknown reason; None
+    when the bundle does not name the fact. No value and no value hash (facts.input_bundle_view)."""
+    b = ev.input_bundle if isinstance(ev.input_bundle, dict) else {}
+    for f in b.get("fact_inputs") or []:
+        if isinstance(f, dict) and f.get("fact_definition") == fact_key:
+            return {"fact_assertion_revision_id": f.get("fact_assertion_revision_id"),
+                    "provenance_class": f.get("provenance_class")}
+    for u in b.get("unknown_facts") or []:
+        if isinstance(u, dict) and u.get("fact_definition") == fact_key:
+            return {"unknown_reason": u.get("reason_code")}
+    return None
+
+
+def _snapshot_record_seqs(db: Session, tenant_id: str, snapshot_ids: list[str]) -> dict[str, int]:
+    """The record sequence at which each snapshot was persisted: that of its assurance.snapshot_created event, written
+    in the snapshot's own transaction (asr.compute_snapshot; DAT-REQ-014). The rule of the dossier's historical read
+    (routers/assurance._snapshot_record_seqs); a snapshot without one is absent from the result."""
+    from ..models import OutboxEvent
+    if not snapshot_ids:
+        return {}
+    out: dict[str, int] = {}
+    for sid, seq in db.execute(select(OutboxEvent.aggregate_id, OutboxEvent.record_seq).where(
+            OutboxEvent.tenant_id == tenant_id, OutboxEvent.aggregate_type == "AssuranceSnapshot",
+            OutboxEvent.event_type == "assurance.snapshot_created", OutboxEvent.aggregate_id.in_(snapshot_ids))):
+        out[sid] = min(seq, out.get(sid, seq))
+    return out
+
+
+def _within(point: datetime, valid_from: datetime, valid_to: datetime | None) -> bool:
+    """point in the half-open valid interval [valid_from, valid_to) (TIM-REQ-002; None = open-ended)."""
+    point = ensure_utc(point)
+    return not point < valid_from and (valid_to is None or point < valid_to)
+
+
+def fact_change_dependents(db: Session, *, tenant_id: str, holder: Subject, fd: FactDefinition, valid_from: datetime,
+                           valid_to: datetime | None, known_seq: int) -> list[dict]:
+    """What depends on a proposed change of `fd` held by `holder` over the valid interval [valid_from, valid_to).
+
+    ZA-APP-001 §16 WF-APP-02 "Impact preview": "Which obligation definitions/evaluations depend on a proposed fact
+    change; no predicted legal result shown unless shadow evaluation is explicitly run". The dependents are the ZA-TIM-001
+    §17 impact-index ones of a FactAssertion valid-range change: "Applicability evaluations/rules referencing
+    FactDefinition for overlapping subject + valid period; assurance snapshots that depend on resulting obligations".
+    Read-only: nothing is evaluated, written or locked, and no outcome is predicted.
+
+    Record time: everything is read as known at `known_seq`, the watermark the response echoes (TIM-REQ-017; ZA-TIM-001
+    "AS_KNOWN_THEN excludes revisions first recorded after K"), each by the record-time rule this code already applies to
+    it: evaluations by their record_seq; determination and obligation revisions by their record slice (visible_at:
+    record_from <= K < record_to, the ZA-TIM-001 canonical bitemporal lookup); rule versions by their record_seq, as
+    resolve_rule binds a rule at a record cutoff; assurance snapshots by the record sequence of their
+    assurance.snapshot_created event (the rule of the dossier's historical read, routers/assurance._snapshot_record_seqs;
+    the snapshot row has no record column), a snapshot without one being left out. Subjects and obligation definitions
+    carry no record time and are read as stored.
+
+    Scopes, ordered by subject then definition: every (subject, obligation definition) the fact write plans
+    (fact_impact_plan: the holder and, for a legal entity, its subordinate subjects, for every definition with a
+    published rule version that needs the fact) where a version known at K needs it, plus any scope of those subjects
+    with an evaluation recorded by K whose frozen bundle consumed the fact. Per scope:
+      rule_versions        the published versions known at K that need the fact (a coarse prefilter, APP §14; their
+                           legal validity is shown, not compared with the fact's instants: TIM-REQ-003);
+      evaluations          evaluations recorded by K whose frozen bundle consumed the fact (revision or unknown reason)
+                           and whose effective_at lies in [valid_from, valid_to); each with its recorded outcome, never a
+                           predicted one;
+      determination        the scope's determination revision current at K, with whether it rests on a listed
+                           evaluation and whether its valid period overlaps the change;
+      obligation           the scope's obligation revision current at K, with whether its valid period overlaps the
+                           change;
+      assurance_snapshots  snapshots recorded by K of the scope's obligation lineages known at K whose period overlaps
+                           the change."""
+    valid_from, valid_to = ensure_utc(valid_from), ensure_utc(valid_to)
+    plan = fact_impact_plan(db, tenant_id=tenant_id, holder=holder, fd=fd)
+    subjects = {holder.subject_id: holder, **{s.subject_id: s for s, _ in plan}}
+    if holder.subject_type == "LEGAL_ENTITY":
+        subjects.update({s.subject_id: s for s in db.execute(select(Subject).where(
+            Subject.tenant_id == tenant_id, Subject.entity_id == holder.entity_id)).scalars()})
+    evaluations: dict[tuple[str, str], list[ApplicabilityEvaluation]] = {}
+    for ev in db.execute(select(ApplicabilityEvaluation).where(
+            ApplicabilityEvaluation.tenant_id == tenant_id, ApplicabilityEvaluation.subject_id.in_(list(subjects)),
+            ApplicabilityEvaluation.record_seq <= known_seq)
+            .order_by(ApplicabilityEvaluation.record_seq, ApplicabilityEvaluation.evaluation_id)).scalars():
+        if _consumed(ev, fd.key) is not None and _within(ev.effective_at, valid_from, valid_to):
+            evaluations.setdefault((ev.subject_id, ev.obligation_definition_id), []).append(ev)
+    odefs = {od.obligation_definition_id: od for _, od in plan}
+    missing = {od_id for _, od_id in evaluations} - set(odefs)
+    if missing:
+        odefs.update({od.obligation_definition_id: od for od in db.execute(select(ObligationDefinition).where(
+            ObligationDefinition.obligation_definition_id.in_(list(missing)))).scalars()})
+    needing: dict[str, list[RuleVersion]] = {}
+    for od_id in odefs:
+        needing[od_id] = [v for v in db.execute(select(RuleVersion).where(
+            RuleVersion.obligation_definition_id == od_id, RuleVersion.status == "PUBLISHED",
+            RuleVersion.record_seq <= known_seq)
+            .order_by(RuleVersion.version.desc(), RuleVersion.rule_version_id)).scalars()
+            if fd.key in (v.required_facts or [])]
+    scopes = {(s.subject_id, od.obligation_definition_id) for s, od in plan if needing[od.obligation_definition_id]} | {
+        k for k in evaluations if k[1] in odefs}
+    out = []
+    for subject_id, od_id in sorted(scopes, key=lambda k: (k[0], odefs[k[1]].key, k[1])):
+        s, od = subjects[subject_id], odefs[od_id]
+        evs = evaluations.get((subject_id, od_id), [])
+        listed = {e.evaluation_id for e in evs}
+        det = _one_current_determination(db.execute(visible_at(select(ApplicabilityDetermination).where(
+            ApplicabilityDetermination.tenant_id == tenant_id, ApplicabilityDetermination.subject_id == subject_id,
+            ApplicabilityDetermination.obligation_definition_id == od_id), ApplicabilityDetermination, known_seq))
+            .scalars())
+        obl = selection.one_or_none(db.execute(visible_at(select(ObligationInstance).where(
+            ObligationInstance.tenant_id == tenant_id, ObligationInstance.subject_id == subject_id,
+            ObligationInstance.obligation_definition_id == od_id), ObligationInstance, known_seq)).scalars(),
+            record_type="ObligationInstance", selection="obligation_as_of", id_attr="revision_id")
+        lineages = sorted(set(db.execute(select(ObligationInstance.lineage_id).where(
+            ObligationInstance.tenant_id == tenant_id, ObligationInstance.subject_id == subject_id,
+            ObligationInstance.obligation_definition_id == od_id,
+            ObligationInstance.record_from_seq <= known_seq)).scalars()))
+        candidates = [x for x in db.execute(select(AssuranceSnapshot).where(
+            AssuranceSnapshot.tenant_id == tenant_id, AssuranceSnapshot.obligation_lineage_id.in_(lineages or ["-"]))
+            .order_by(AssuranceSnapshot.record_cutoff_seq, AssuranceSnapshot.created_at, AssuranceSnapshot.snapshot_id))
+            .scalars() if overlaps(x.period_from, x.period_to, valid_from, valid_to)]
+        recorded = _snapshot_record_seqs(db, tenant_id, [x.snapshot_id for x in candidates])
+        snapshots = [x for x in candidates if recorded.get(x.snapshot_id, known_seq + 1) <= known_seq]
+        versions = needing[od_id]
+        out.append({
+            "subject": {"subject_id": s.subject_id, "display_name": s.display_name, "subject_type": s.subject_type},
+            "obligation_definition": {"obligation_definition_id": od_id, "key": od.key, "title": od.title},
+            "rule_versions": [{"rule_version_id": v.rule_version_id, "version": v.version, "valid_from": v.valid_from,
+                               "valid_to": v.valid_to} for v in versions],
+            "evaluations": [{"evaluation_id": e.evaluation_id, "effective_at": e.effective_at,
+                             "record_cutoff_seq": e.record_cutoff_seq, "record_seq": e.record_seq,
+                             "rule_version_id": e.rule_version_id, "evaluator_build": e.evaluator_build,
+                             "trigger": e.trigger, "recorded_outcome": e.outcome, "fact_input": _consumed(e, fd.key)}
+                            for e in evs],
+            "determination": None if det is None else {
+                "revision_id": det.revision_id, "lineage_id": det.lineage_id, "state": det.state,
+                "recorded_outcome": det.outcome, "evaluation_id": det.evaluation_id, "valid_from": det.valid_from,
+                "valid_to": det.valid_to, "needs_review": det.needs_review,
+                "rests_on_listed_evaluation": det.evaluation_id in listed,
+                "valid_period_overlaps_change": overlaps(det.valid_from, det.valid_to, valid_from, valid_to)},
+            "obligation": None if obl is None else {
+                "revision_id": obl.revision_id, "lineage_id": obl.lineage_id, "lifecycle": obl.lifecycle,
+                "determination_revision_id": obl.determination_revision_id, "valid_from": obl.valid_from,
+                "valid_to": obl.valid_to,
+                "valid_period_overlaps_change": overlaps(obl.valid_from, obl.valid_to, valid_from, valid_to)},
+            "assurance_snapshots": [{"snapshot_id": x.snapshot_id, "obligation_lineage_id": x.obligation_lineage_id,
+                                     "period_from": x.period_from, "period_to": x.period_to,
+                                     "record_cutoff_seq": x.record_cutoff_seq, "state": x.state} for x in snapshots]})
+    return out
 
 
 def shadow_impact(db: Session, *, odef: ObligationDefinition, candidate_ast: dict, candidate_required: list) -> dict:

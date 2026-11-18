@@ -263,9 +263,12 @@ def create_version(ctx, *, lineage_id: str, ast: dict, valid_from: datetime, val
     db, tenant = ctx.db, ctx.tenant
     # One version change at a time per obligation (the same key compensation approval takes), then read the state.
     xact_lock(db, "satisfaction-expression", tenant, lineage_id)
-    obl = db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant,
-                                                      ObligationInstance.lineage_id == lineage_id,
-                                                      ObligationInstance.record_to_seq.is_(None))).scalars().first()
+    # The one current revision (two are refused, never one chosen by row order: selection.AmbiguousSelection).
+    from .selection import one_or_none
+    obl = one_or_none(db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant,
+                                                                  ObligationInstance.lineage_id == lineage_id,
+                                                                  ObligationInstance.record_to_seq.is_(None))).scalars(),
+                      record_type="ObligationInstance", selection="obligation_current", id_attr="revision_id")
     if obl is None:
         raise HTTPException(404, "obligation not found")
     if valid_to is not None and ensure_utc(valid_to) <= ensure_utc(valid_from):

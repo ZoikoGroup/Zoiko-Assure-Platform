@@ -13,12 +13,74 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..models import FactAssertion, FactConflict, FactDefinition, Subject, new_id
-from ..platform import emit, ensure_utc, next_record_seq
+from ..platform import emit, ensure_utc, next_record_seq, to_dict
 from . import rules
 
 FAR_FUTURE = None  # open upper bound represented as NULL (no sentinel dates, TIM-REQ-002)
 # applicability_fact_assertion_revision.value_text (varchar): the longest TIMESTAMP value a fact write can store as given.
 _VALUE_TEXT_MAX = FactAssertion.__table__.c.value_text.type.length
+
+# ---------------------------------------------------------------- value redaction
+# Fact values are redacted by FactDefinition sensitivity (ZA-APP-001 APP-REQ-018 and §13; ZA-API-001 §25 "redact by field
+# classification and viewer role while preserving stable reference/reason structure"; ZA-TIM-001 §22: the same in
+# historical views). These are the classes and the marker the applicability router and the evaluation trace already
+# used, kept in one place. The specifications name no viewer role that may see such a value, so none is exempt.
+REDACTED_SENSITIVITIES = frozenset({"RESTRICTED_PERSONAL", "LEGAL_PRIVILEGED"})
+REDACTED = "••• (redacted)"
+# Every column of a FactAssertion revision that holds the value itself, read from the table so that a value column added
+# later is withheld without another change here (value_type names the type, not the value).
+VALUE_COLUMNS = tuple(c.key for c in FactAssertion.__table__.columns if c.key.startswith("value_") and c.key != "value_type")
+
+
+def value_redacted(sensitivity: str | None) -> bool:
+    return sensitivity in REDACTED_SENSITIVITIES
+
+
+def display_value(sensitivity: str | None, value):
+    """A resolved fact value as a response may show it."""
+    return REDACTED if value_redacted(sensitivity) else value
+
+
+def assertion_view(a: FactAssertion, fd: FactDefinition) -> dict:
+    """A FactAssertion revision as API responses show it: its columns plus `value`. For a redacted sensitivity `value` is
+    the marker and every typed value column is withheld (None): the same fields, the revision, lineage, provenance and
+    time references unchanged, without the value (ZA-APP-001 §13 "can retain assertion IDs without value"). A response
+    that shows a revision builds it here, never from the row's columns directly (ZA-API-001 §25: not "return full object
+    then hide in UI")."""
+    d = to_dict(a)
+    if value_redacted(fd.sensitivity):
+        for col in VALUE_COLUMNS:
+            d[col] = None
+        d["value"] = REDACTED
+    else:
+        d["value"] = assertion_value(a)
+    return d
+
+
+def input_bundle_view(bundle, sensitivities: dict[str, str | None]):
+    """An evaluation's frozen EvaluationInputBundle as API responses show it (the same policy as assertion_view).
+
+    `fact_inputs[].typed_value_hash` is an unkeyed digest of the consumed value (`digest({"v": value})`). For a
+    low-entropy type (BOOLEAN, ENUM, COUNTRY, a small INTEGER range, ...) hashing each candidate value finds it, so for
+    a redacted sensitivity the hash discloses the value and is withheld (None), as assertion_view withholds the typed
+    value columns. The entry keeps its fact definition, assertion revision ID and provenance class (ZA-APP-001 §13
+    "machine trace can retain assertion IDs without value"; APP-REQ-018 "without removing the underlying assertion
+    reference"; ZA-API-001 §25). Every other field, and every entry of a non-redacted fact, is returned as stored.
+
+    `sensitivities` maps FactDefinition key -> sensitivity. An entry whose definition is not in it is withheld too: its
+    sensitivity cannot show that release is permitted. The stored bundle is never modified (the view is a new structure),
+    so the record, its input_bundle_hash and evaluation_key, and replay are unchanged."""
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("fact_inputs"), list):
+        return bundle
+
+    def entry(fi):
+        if not isinstance(fi, dict):
+            return fi
+        key = fi.get("fact_definition")
+        if "typed_value_hash" in fi and (key not in sensitivities or value_redacted(sensitivities[key])):
+            return {**fi, "typed_value_hash": None}
+        return dict(fi)
+    return {**bundle, "fact_inputs": [entry(fi) for fi in bundle["fact_inputs"]]}
 
 
 def _lt(a: datetime | None, b: datetime | None) -> bool:
@@ -107,6 +169,21 @@ def assertion_value(a: FactAssertion):
     if t.startswith("SET<"):
         return a.value_set
     return a.value_text
+
+
+def overlapping_current_revisions(db: Session, *, tenant_id: str, subject: Subject, fd: FactDefinition,
+                                  valid_from: datetime, valid_to: datetime | None, known_seq: int) -> list[FactAssertion]:
+    """The revisions of `fd` held by `subject` that were current knowledge at record sequence `known_seq` (visible_at:
+    record_from <= K < record_to, the ZA-TIM-001 canonical bitemporal lookup) and whose valid interval overlaps
+    [valid_from, valid_to): the revisions a fact write over that interval would close and carve as known at K
+    (assert_fact, the same overlap predicate; the "old revision refs" of fact.changed, ZA-TIM-001 §17). Read-only.
+    Ordered by valid time, then revision ID."""
+    valid_from, valid_to = ensure_utc(valid_from), ensure_utc(valid_to)
+    rows = db.execute(visible_at(select(FactAssertion).where(
+        FactAssertion.tenant_id == tenant_id, FactAssertion.subject_id == subject.subject_id,
+        FactAssertion.fact_definition_id == fd.fact_definition_id), FactAssertion, known_seq)).scalars().all()
+    hit = [a for a in rows if overlaps(a.valid_from, a.valid_to, valid_from, valid_to)]
+    return sorted(hit, key=lambda a: (ensure_utc(a.valid_from), a.revision_id))
 
 
 def assert_fact(db: Session, *, tenant_id: str, subject: Subject, fd: FactDefinition, value,

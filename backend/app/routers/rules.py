@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from .. import codes
 from ..engines import applicability as appl
-from ..engines import catalog, keys, rules
+from ..engines import catalog, keys, rules, selection
 from ..engines.corrections import shadow_summary_for as _shadow_for
 from ..models import (ApplicabilityEvaluation, ContentRelease, ObligationDefinition, RuleDraft, RuleVersion, Subject,
                       new_id, utcnow)
@@ -103,7 +103,7 @@ def _validate(ctx: Ctx, d: RuleDraft, *, mappings: bool = True) -> dict:
 @router.get("/drafts")
 def list_drafts(ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS))):
     out = []
-    for d in ctx.db.execute(select(RuleDraft).order_by(RuleDraft.updated_at.desc())).scalars():
+    for d in ctx.db.execute(select(RuleDraft).order_by(RuleDraft.updated_at.desc(), RuleDraft.draft_id)).scalars():
         x = to_dict(d)
         x["obligation_definition"] = ctx.db.get(ObligationDefinition, d.obligation_definition_id).key
         x["shadow_report"] = _shadow_for(ctx.actor.tenant_id, d.shadow_report)  # cross-organisation counts (API-001 §17)
@@ -436,8 +436,10 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
     set_hashes = {s: sets[s]["hash"] for s in rep["set_refs"]}
     catalog.validate_draft_source_mappings(ctx.db, d, canon)
     h = rules.ast_hash(canon, set_hashes)
-    prev = ctx.db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == d.obligation_definition_id)
-                          .order_by(RuleVersion.version.desc())).scalars().first()
+    # The version this release supersedes (manifest "supersedes"/"rollback_parent") and numbers after. Two rows sharing
+    # the highest number are refused, never one named by row order (selection.highest_version; DAT-REQ-010).
+    prev = selection.highest_version(ctx.db.execute(select(RuleVersion).where(
+        RuleVersion.obligation_definition_id == d.obligation_definition_id)).scalars(), selection="rule_version_latest")
     if is_correction and (prev is None or prev.content_release_id is None):
         raise HTTPException(409, {"error": "CORRECTION_TARGET_MISSING",
                                   "message": "A CORRECTION must correct a published release of this obligation "
@@ -578,8 +580,11 @@ def _reevaluate_targets(db, odef, rv: RuleVersion, targets: list, candidates: in
            "failed": {}, "potential_unevaluated_subjects": candidates}
     for s in targets:
         prior = appl.latest_evaluation(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
-        before = appl.current_determination(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
         try:
+            # Inside the try: a target whose current determination is ambiguous (selection.AmbiguousSelection) is a
+            # target that could not be evaluated, counted with its code like any other (RUL §15), as it would be if
+            # the evaluation itself met it.
+            before = appl.current_determination(db, s.tenant_id, s.subject_id, odef.obligation_definition_id)
             with db.begin_nested():
                 ev = appl.evaluate(db, tenant_id=s.tenant_id, subject=s, odef=odef, effective_at=at,
                                    record_cutoff_seq=None, trigger="RULE_CHANGED", actor_id="system:impact-scheduler")
@@ -617,7 +622,8 @@ def _impact_summary(i: dict) -> str:
 @router.get("/versions")
 def versions(ctx: Ctx = Depends(authorize(*DOSSIER_READ, *CONTENT_READERS))):
     out = []
-    rows = ctx.db.execute(select(RuleVersion).order_by(RuleVersion.obligation_definition_id, RuleVersion.version)).scalars().all()
+    rows = ctx.db.execute(select(RuleVersion).order_by(RuleVersion.obligation_definition_id, RuleVersion.version,
+                                                       RuleVersion.rule_version_id)).scalars().all()
     for r in rows:
         x = to_dict(r)
         x["obligation_definition"] = ctx.db.get(ObligationDefinition, r.obligation_definition_id).key
