@@ -18,6 +18,13 @@ export default function EvaluationPage() {
   const { can, why } = useCan();
   const det = e?.current_determination;
   const isLatest = det?.evaluation_id === e?.evaluation_id;
+  /* Whether this evaluation once backed the determination (a revision in its history names it). Revisions only move to
+     evaluations with newer knowledge, so such a record has been superseded: historical. An adopted determination
+     flagged for review keeps the evaluation it was adopted on, and no structured field names the evaluation that raised
+     the review, so an evaluation that never backed a flagged determination may be that one, a later one or an older
+     reconstruction: it is not called historical, and nothing is inferred from the review_reason text. */
+  const formerBasis = !!e && (e.determination_history ?? []).some((h: any) => h.evaluation_id === e.evaluation_id);
+  const outsideFlagged = !isLatest && !formerBasis && det?.state === "ADOPTED" && !!det?.needs_review;
   return (
     <>
       <PageHeader spec="WF-APP-02 · ZA-APP-001 §7" title={e ? `${e.obligation_definition.key} · ${e.subject.display_name}` : "Evaluation"}
@@ -29,7 +36,12 @@ export default function EvaluationPage() {
       <ErrorBox error={error} />
       {e && (
         <div className="space-y-4">
-          {!isLatest && det && <Notice tone="warn">A newer evaluation backs the current determination. This record is historical and cannot be attested.</Notice>}
+          {!isLatest && det && (outsideFlagged ? (
+            <Notice tone="warn">The current determination does not rest on this evaluation: it was adopted on another evaluation and is
+              flagged for review{det.review_reason ? <> (&ldquo;{det.review_reason}&rdquo;)</> : null}. The record does not identify, in a
+              structured field, which evaluation raised the review, so this evaluation is not marked as that one or as
+              historical. It cannot be attested from this page.</Notice>
+          ) : <Notice tone="warn">A newer evaluation backs the current determination. This record is historical and cannot be attested.</Notice>)}
           <Card>
             <KV cols={4} items={[
               ["Outcome", <Badge key="o" code={e.outcome} />], ["Determination", det ? <Badge key="d" code={det.state} /> : "—"],

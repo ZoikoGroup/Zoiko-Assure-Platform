@@ -46,7 +46,9 @@ export function ApplicabilityReview() {
           ))}
         </Table>
       </Card>
-      <AttestModal det={att ? { ...att, outcome: evalById[att.evaluation_id]?.outcome ?? att.outcome } : null} onClose={() => setAtt(null)} onDone={() => { setAtt(null); dets.reload(); evals.reload(); }} />
+      {/* Mounted only while open (as on the evaluation page), so each attestation starts empty: no decision, authority
+          basis, acknowledgement or error carries over from another determination. */}
+      {att && <AttestModal key={att.lineage_id} det={{ ...att, outcome: evalById[att.evaluation_id]?.outcome ?? att.outcome }} onClose={() => setAtt(null)} onDone={() => { setAtt(null); dets.reload(); evals.reload(); }} />}
     </>
   );
 }

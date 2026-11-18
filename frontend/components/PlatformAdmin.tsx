@@ -44,7 +44,7 @@ export type AdminEvent = {
 export type RegistryRecord = RegistryOrg & { admin_events: AdminEvent[] };
 
 /* ------------------------------------------------------------------------------------------------- shared pieces */
-const PANEL = "rounded-panel border border-line bg-surface-raised/70 p-5 shadow-panel sm:p-6";  // as on the Action Queue
+const PANEL = "rounded-panel border border-line bg-surface-card p-5 shadow-panel sm:p-6";  // as on the Action Queue
 
 /** The organisation statuses the API uses (ACTIVE, SUSPENDED), in words. Any other code is shown as recorded. */
 const ORG_STATUS: Record<string, { label: string; tone: StatusKey }> = {
@@ -77,7 +77,7 @@ export function actionRequiredByOrganisation(orgs: RegistryOrg[]): Map<string, Q
 /** What this role can and cannot reach, as the Action Queue shows it (stacked on phones so the text keeps its width). */
 export function RegistryScope({ children }: { children: ReactNode }) {
   return (
-    <div className={`flex flex-col gap-2 rounded-card border border-l-4 border-line bg-surface-card/70 px-4 py-3 md:flex-row md:items-start md:gap-4 ${PLANES.platform.edge}`}>
+    <div className={`flex flex-col gap-2 rounded-card border border-l-4 border-line bg-surface-card px-4 py-3 md:flex-row md:items-start md:gap-4 ${PLANES.platform.edge}`}>
       <span className="shrink-0"><PlaneBadge plane="platform" withWho /></span>
       <p className="min-w-0 flex-1 type-caption text-fg-secondary">{children}</p>
     </div>
@@ -104,7 +104,7 @@ export function RegistrySection({ title, description, aside, children, className
  *  beside the heading, outside it, so it is not read as part of the page's name. */
 export function RegistryHeading({ kicker, title, badge, children, actions }:
   { kicker: string; title: ReactNode; badge?: ReactNode; children?: ReactNode; actions?: ReactNode }) {
-  const H1 = "break-words text-[26px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]";
+  const H1 = "break-words text-[26px] font-semibold leading-tight text-fg sm:text-[28px]";  // the Organization Workspace's page title
   return (
     <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
       <div className="min-w-0">
@@ -114,7 +114,7 @@ export function RegistryHeading({ kicker, title, badge, children, actions }:
             <h1 className={`min-w-0 ${H1}`}>{title}</h1>{badge}
           </div>
         ) : <h1 className={`mt-1 ${H1}`}>{title}</h1>}
-        {children && <div className="mt-2 max-w-3xl text-[15px] text-fg-secondary">{children}</div>}
+        {children && <div className="mt-1 max-w-3xl text-[14px] text-fg-secondary">{children}</div>}
       </div>
       {actions && <div className="flex shrink-0 flex-wrap gap-2">{actions}</div>}
     </div>

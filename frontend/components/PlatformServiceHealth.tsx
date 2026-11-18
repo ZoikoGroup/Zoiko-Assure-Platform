@@ -26,7 +26,7 @@ const SOURCE = "GET /api/health";
 /** A hung request would otherwise leave the page loading for good. Redis is given 2 s per attempt by default. */
 const TIMEOUT_MS = 20_000;
 
-const PANEL = "rounded-panel border border-line bg-surface-raised/70 p-5 shadow-panel sm:p-6";
+const PANEL = "rounded-panel border border-line bg-surface-card p-5 shadow-panel sm:p-6";
 const CARD = "rounded-card border border-line bg-surface-card p-card shadow-card";
 const H2 = "text-[18px] font-semibold leading-7 text-fg";
 
@@ -198,8 +198,8 @@ export function PlatformServiceHealth() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div className="min-w-0">
-          <h1 className="text-[26px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">{TITLE}</h1>
-          <p className="mt-2 max-w-3xl text-[15px] text-fg-secondary">
+          <h1 className="text-[26px] font-semibold leading-tight text-fg sm:text-[28px]">{TITLE}</h1>
+          <p className="mt-1 max-w-3xl text-[14px] text-fg-secondary">
             Whether this deployment&apos;s API, its PostgreSQL database and its Redis cache are working, read live from the API&apos;s health check.
           </p>
         </div>
@@ -216,7 +216,7 @@ export function PlatformServiceHealth() {
       <p role="status" aria-live="polite" className="sr-only">{busy ? "" : announcement(check)}</p>
 
       {/* The PlaneBanner layout, stacked on phones so the text keeps its width beside the wide plane badge. */}
-      <div className={`flex flex-col gap-2 rounded-card border border-l-4 border-line bg-surface-card/70 px-4 py-3 md:flex-row md:items-start md:gap-4 ${PLANES.platform.edge}`}>
+      <div className={`flex flex-col gap-2 rounded-card border border-l-4 border-line bg-surface-card px-4 py-3 md:flex-row md:items-start md:gap-4 ${PLANES.platform.edge}`}>
         <span className="shrink-0"><PlaneBadge plane="platform" withWho /></span>
         <p className="min-w-0 flex-1 type-caption text-fg-secondary">
           <span className="font-semibold text-fg">Deployment health only.</span> This page reads the health check of the API serving this

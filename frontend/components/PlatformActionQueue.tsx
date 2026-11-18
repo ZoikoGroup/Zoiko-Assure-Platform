@@ -23,7 +23,7 @@ import { usePageTitle } from "./ui";
 const TITLE = "Action Queue";
 
 /* --------------------------------------------------------------------------------------------------------- the page */
-const PANEL = "rounded-panel border border-line bg-surface-raised/70 p-5 shadow-panel sm:p-6";
+const PANEL = "rounded-panel border border-line bg-surface-card p-5 shadow-panel sm:p-6";
 const H2 = "text-[18px] font-semibold leading-7 text-fg";
 
 export function PlatformActionQueue() {
@@ -39,8 +39,8 @@ export function PlatformActionQueue() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div className="min-w-0">
-          <h1 className="text-[26px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">{TITLE}</h1>
-          <p className="mt-2 max-w-3xl text-[15px] text-fg-secondary">
+          <h1 className="text-[26px] font-semibold leading-tight text-fg sm:text-[28px]">{TITLE}</h1>
+          <p className="mt-1 max-w-3xl text-[14px] text-fg-secondary">
             Platform conditions that need the Super Admin, worked out from the organisation registry and your own sessions each time
             you refresh.
           </p>
@@ -60,7 +60,7 @@ export function PlatformActionQueue() {
       <p role="status" aria-live="polite" className="sr-only">{q.announcement}</p>
 
       {/* The PlaneBanner layout, stacked on phones so the text keeps its width beside the wide plane badge. */}
-      <div className={`flex flex-col gap-2 rounded-card border border-l-4 border-line bg-surface-card/70 px-4 py-3 md:flex-row md:items-start md:gap-4 ${PLANES.platform.edge}`}>
+      <div className={`flex flex-col gap-2 rounded-card border border-l-4 border-line bg-surface-card px-4 py-3 md:flex-row md:items-start md:gap-4 ${PLANES.platform.edge}`}>
         <span className="shrink-0"><PlaneBadge plane="platform" withWho /></span>
         <p className="min-w-0 flex-1 type-caption text-fg-secondary">
           <span className="font-semibold text-fg">Cross-tenant metadata only.</span> This queue reads organisation registry metadata (name,

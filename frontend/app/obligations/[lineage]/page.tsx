@@ -43,7 +43,7 @@ export default function Dossier() {
           {tab === "Period assurance" && <Period d={d} lineage={lineage} reload={reload} />}
           {tab === "Expression & controls" && <Controls d={d} />}
           {tab === "Occurrences" && <Occurrences d={d} lineage={lineage} reload={reload} />}
-          {tab === "Exceptions & compensation" && <ExcComp d={d} lineage={lineage} reload={reload} />}
+          {tab === "Exceptions & compensation" && <ExcComp d={d} lineage={lineage} reload={reload} name={name} />}
           {tab === "Legal basis" && (
             <Card title="Provisions">
               <Table head={["Locator", "Duty bearer", "Modality", "Action", "Evidence expectation"]}>
@@ -359,7 +359,9 @@ function Fulfil({ occ, onClose, onDone }: { occ: any; onClose: () => void; onDon
   );
 }
 
-function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () => void }) {
+/** `name`: the dossier's actor-name resolver (useActorNames), passed down so opening this tab does not read the actor
+ *  directory a second time. */
+function ExcComp({ d, lineage, reload, name }: { d: any; lineage: string; reload: () => void; name: (id?: string | null) => string }) {
   const [exc, setExc] = useState({ reason: "", valid_from: "", valid_to: "" });
   const [comp, setComp] = useState({ primary_control_key: d.controls[0]?.control_key ?? "", compensating: "", rationale: "", valid_from: "" });
   const a = useAction();
@@ -367,7 +369,6 @@ function ExcComp({ d, lineage, reload }: { d: any; lineage: string; reload: () =
   const toast = useToast();
   const { can, why } = useCan();
   const canRequest = can("request_exception");
-  const name = useActorNames();
   const fid = useId();
   // Owner of the primary control's implementation as the dossier resolves it now; shown for reference, never compared.
   const primaryImpl = d.controls.find((c: any) => c.control_key === comp.primary_control_key)?.implementation;

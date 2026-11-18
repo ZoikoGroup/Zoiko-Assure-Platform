@@ -82,11 +82,12 @@ function Frame({ children }: { children: React.ReactNode }) {
   if (!ready || !me) return <ShellSkeleton narrow={collapsed} />;
   if (me.must_change_password) return <ForcedPasswordChange />;
   if (isStandalone(path)) return <>{children}</>;
-  // The platform Super Admin works in the Platform Control Plane chrome (components/PlatformShell.tsx).
+  // The platform Super Admin works in its own chrome (components/PlatformShell.tsx), drawn as the Organization Workspace
+  // is, with the same collapsible sidebar setting.
   if (personaOf(me) === "platform") {
     return (
       <SyntheticCtx.Provider value={setSynthetic}>
-        <PlatformFrame path={path} synthetic={synthetic}>{children}</PlatformFrame>
+        <PlatformFrame path={path} synthetic={synthetic} collapsed={collapsed} onToggle={toggle}>{children}</PlatformFrame>
       </SyntheticCtx.Provider>
     );
   }
@@ -182,7 +183,7 @@ function WorkContext() {
 
 /** A sidebar item's icon, swapped for a spinner while that item's navigation is pending, so the click is acknowledged
  *  at once even when the next page takes a moment (prefetched routes in a production build skip the pending state). */
-function NavIcon({ icon: Icon, active, dark = false }: { icon: LucideIcon; active: boolean; dark?: boolean }) {
+export function NavIcon({ icon: Icon, active, dark = false }: { icon: LucideIcon; active: boolean; dark?: boolean }) {
   const { pending } = useLinkStatus();
   return pending ? (
     <>
@@ -193,7 +194,7 @@ function NavIcon({ icon: Icon, active, dark = false }: { icon: LucideIcon; activ
 }
 
 /** The organisation sidebar's labels have no icons, so a pending navigation shows a spinner after the label instead. */
-function NavPending() {
+export function NavPending() {
   const { pending } = useLinkStatus();
   return pending ? (
     <>
@@ -281,7 +282,7 @@ function SidebarBody({ narrow, path, onToggle, showContext }: { narrow: boolean;
   );
 }
 
-const ORG_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300";
+export const ORG_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300";
 
 /** The Organization Workspace sidebar: dark navy, grouped as orgNav (components/nav.ts). Every destination is an entry
  *  of its own; screens that were sub-entries are tabs of their consolidated page. The entry a page belongs to (record
@@ -361,8 +362,9 @@ function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; pat
   );
 }
 
-/** Organisation header breadcrumb ("ZOIKO ASSURE / ORGANIZATION"). Below xl only the current page is shown. */
-function OrgBreadcrumb({ items }: { items: { label: string; href?: string }[] }) {
+/** Organisation header breadcrumb ("ZOIKO ASSURE / ORGANIZATION"), also used by the Super Admin header. Below xl only
+ *  the current page is shown. */
+export function OrgBreadcrumb({ items }: { items: { label: string; href?: string }[] }) {
   return (
     <nav aria-label="Breadcrumb" className="min-w-0">
       <ol className="flex min-w-0 items-center gap-1.5 text-[13px] font-semibold uppercase tracking-[0.03em] text-slate-600">

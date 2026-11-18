@@ -139,7 +139,7 @@ function IntegrityLoading() {
           </div>
         ))}
       </div>
-      <div className="rounded-panel border border-line bg-surface-raised/70 p-5 sm:p-6">
+      <div className="rounded-panel border border-line bg-surface-card p-5 sm:p-6">
         <Skeleton className="h-5 w-56" />
         {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="mt-4 h-10 w-full" />)}
       </div>
