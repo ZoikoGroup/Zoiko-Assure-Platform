@@ -125,12 +125,12 @@ def _session_view(s: AuthSession, current: str | None) -> dict:
 
 
 def _live_sessions(db, principal_id: str) -> list[AuthSession]:
-    now = datetime.now(timezone.utc)
+    """The principal's sessions that are neither revoked nor expired, newest first (expiry is filtered in the query)."""
     with capability(db, "auth"):
-        rows = db.execute(select(AuthSession).where(AuthSession.actor_id == principal_id,
-                                                    AuthSession.revoked_at.is_(None))
+        return db.execute(select(AuthSession).where(AuthSession.actor_id == principal_id,
+                                                    AuthSession.revoked_at.is_(None),
+                                                    AuthSession.expires_at > datetime.now(timezone.utc))
                           .order_by(AuthSession.created_at.desc(), AuthSession.session_id)).scalars().all()
-    return [s for s in rows if ensure_utc(s.expires_at) > now]
 
 
 @router.get("/sessions")

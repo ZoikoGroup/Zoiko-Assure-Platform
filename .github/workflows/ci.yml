@@ -338,6 +338,7 @@ jobs:
           --require test_tenant_security=28
           --require test_auth_session_security=10
           --require test_role_registry=16
+          --require test_your_access=8
           --require test_governance_events=10
           --require test_governance_projections=8
           --require test_request_hardening=15
