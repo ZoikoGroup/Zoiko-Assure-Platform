@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from .db import capability, get_db, set_principal, set_system_scope, set_tenant_scope
 from .models import Actor, AuthCredential, AuthSession, Tenant
-from .platform import audit, ensure_utc, to_dict
+from .platform import audit, ensure_utc
 
 INTERACTIVE_TYPES = {"HUMAN", "EXTERNAL_AUDITOR"}
 SESSION_HOURS = int(os.environ.get("ZA_SESSION_HOURS", "8"))
@@ -146,18 +146,13 @@ class LoginIn(BaseModel):
 
 
 def _actor_view(db: Session, a: Actor) -> dict:
-    """The signed-in principal, with its roles and permissions read from the role registry (Stage 4b), not from the
-    org_actor.roles cache. `permissions` are those in force organisation- or platform-wide; entity-scoped ones are
-    listed under role_assignments."""
-    from .iam import active_assignments, applies, assignment_view, wide_roles
-    from .security import ROLE_PERMISSIONS
-    grants = active_assignments(db, a)
-    d = to_dict(a)
+    """The signed-in principal as GET /me reports it (app/iam.py ``principal_view``: roles and permissions from the role
+    registry, entity-scoped ones under role_assignments), plus its organisation's name and whether it must change its
+    password before continuing."""
+    from .iam import principal_view
+    d = principal_view(db, a)
     t = db.get(Tenant, a.tenant_id) if a.tenant_id else None
     d["tenant_name"] = t.legal_name if t else "Zoiko content/platform operations"
-    d["roles"] = wide_roles(grants)
-    d["permissions"] = sorted({p for g in grants if applies(g, None) for p in ROLE_PERMISSIONS.get(g.role_code, set())})
-    d["role_assignments"] = [assignment_view(g) for g in grants]
     cred = db.get(AuthCredential, a.actor_id)
     d["must_change_password"] = bool(cred and cred.must_change)
     return d

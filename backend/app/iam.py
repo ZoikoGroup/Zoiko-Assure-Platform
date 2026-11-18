@@ -126,6 +126,21 @@ def assignment_view(a: RoleAssignment) -> dict:
     return d
 
 
+def principal_view(db: Session, actor: Actor, grants: list[RoleAssignment] | None = None) -> dict:
+    """The signed-in principal as ``GET /me`` and the session check (``GET /auth/session``) report it: its account, the
+    roles it holds organisation- or platform-wide, the permissions those confer, and every assignment in force with
+    its scope, validity and permissions (entity-scoped permissions appear only there). Read from the registry, not the
+    org_actor.roles cache; no credential material (IAM-REQ-043). `grants`: the assignments already read for this
+    request, if any."""
+    from .platform import to_dict
+    grants = active_assignments(db, actor) if grants is None else grants
+    d = to_dict(actor)
+    d["roles"] = wide_roles(grants)
+    d["permissions"] = sorted({p for a in grants if applies(a, None) for p in role_permissions(a.role_code)})
+    d["role_assignments"] = [assignment_view(a) for a in grants]
+    return d
+
+
 def effective_access(db: Session, actor: Actor) -> dict:
     """ZA-IAM-001 §23 ``GET /principals/{id}/effective-access``: roles, scopes and the permissions they confer now.
     No credential material (IAM-REQ-043)."""

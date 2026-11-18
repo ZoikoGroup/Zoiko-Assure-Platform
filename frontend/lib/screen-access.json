@@ -316,10 +316,21 @@
    "reads": [
     "/dashboard",
     "/controls",
-    "/ipe/anomalies"
+    "/ipe/anomalies",
+    "/issues",
+    "/exceptions",
+    "/compensations"
    ],
    "perms": [
     "audit_read",
+    "read"
+   ]
+  },
+  "overview_fact_requests": {
+   "reads": [
+    "/fact-requests"
+   ],
+   "perms": [
     "read"
    ]
   }

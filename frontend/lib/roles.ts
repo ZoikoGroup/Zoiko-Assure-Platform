@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback } from "react";
-import { personaOf, useAuth, type Me } from "./actor";
+import { personaOf, useAuth, type Me, type RoleAssignment } from "./actor";
 import SCREEN_ACCESS from "./screen-access.json";
 
 /* Plain-English names for the backend role catalogue (backend/app/security.py ROLE_PERMISSIONS) and the permissions
@@ -75,6 +75,24 @@ export function workContext(me: Me | null): { kind: "organisation" | "platform" 
   if (persona === "tenant") return { kind: "organisation", label: "Organisation", name: me?.tenant_name ?? "", id: me?.tenant_id ?? undefined };
   if (persona === "platform") return { kind: "platform", label: "Zoiko platform", name: "Platform administration" };
   return { kind: "content", label: "Zoiko staff", name: "Content operations" };
+}
+
+/** How a role assignment was granted: the role registry's `source` (backend/app/models.py RoleAssignment). */
+const ASSIGNMENT_SOURCES: Record<string, string> = {
+  BOOTSTRAP: "One-time account bootstrap",
+  SEED: "Demo fixture",
+  MIGRATION: "Carried over from the earlier role list",
+  PLATFORM_APPOINTMENT: "Appointed by the Zoiko Super Admin",
+  ADMIN: "Assigned by an organisation administrator",
+};
+export const assignmentSourceText = (code: string) => ASSIGNMENT_SOURCES[code] ?? code;
+
+/** Where a role assignment applies. A legal entity is shown by its ID: naming it would need a read the person may not
+ *  be served, and every refused read is an audit record. */
+export function scopeText(a: Pick<RoleAssignment, "scope_type" | "scope_id">, me: Pick<Me, "tenant_name"> | null): string {
+  if (a.scope_type === "PLATFORM") return "Zoiko platform";
+  if (a.scope_type === "LEGAL_ENTITY") return `Legal entity · ${a.scope_id ?? "—"}`;
+  return me?.tenant_name ? `Whole organisation · ${me.tenant_name}` : "Whole organisation";
 }
 
 /* The permissions each organisation role confers, generated from the backend catalogue (ROLE_PERMISSIONS) into

@@ -92,12 +92,8 @@ def actors(actor_type: PRINCIPAL_TYPES | None = None,
 
 @router.get("/me")
 def me(ctx: Ctx = Depends(authenticated())):
-    from ..iam import assignment_view, wide_roles
-    d = to_dict(ctx.actor)
-    d["roles"] = wide_roles(ctx.grants())  # from the role registry, not the org_actor.roles cache
-    d["permissions"] = sorted(ctx.perms())
-    d["role_assignments"] = [assignment_view(a) for a in ctx.grants()]
-    return d
+    from ..iam import principal_view
+    return principal_view(ctx.db, ctx.actor, ctx.grants())  # the registry rows this request already read
 
 
 @router.get("/watermark")

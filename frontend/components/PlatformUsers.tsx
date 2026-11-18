@@ -1,29 +1,29 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useId, useMemo, useState } from "react";
-import type { FormEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import { ArrowRight, Building2, Info, KeyRound, LogOut, Search, ShieldCheck, UserRound, Users } from "lucide-react";
-import { api, errText, useApi } from "@/lib/api";
+import { ArrowRight, Building2, Info, KeyRound, Search, ShieldCheck, UserRound, Users } from "lucide-react";
+import { useApi } from "@/lib/api";
 import { useAuth, type Me } from "@/lib/actor";
-import { fmtDate } from "@/lib/format";
-import { ROLE_CODES, permissionText, roleAbout, roleLabel, workContext } from "@/lib/roles";
+import { ROLE_CODES, roleAbout, roleLabel } from "@/lib/roles";
 import {
-  Alert, Button, DescriptionList, EmptyState, ErrorState, Field, KpiCard, Modal, PlaneBadge, SearchInput, Select, Skeleton, StateBadge,
-  TBody, THead, Table, TabPanel, Tabs, Td, Textarea, Th, Tr, buttonClasses,
+  Alert, Button, DescriptionList, EmptyState, ErrorState, KpiCard, PlaneBadge, SearchInput, Select, Skeleton,
+  TBody, THead, Table, TabPanel, Tabs, Td, Th, Tr, buttonClasses,
 } from "./ds";
 import { ClassificationBadge, count } from "./platformQueue";
 import {
   OrganisationStatus, RegistryHeading, RegistryScope, RegistrySection, SortChip, actionRequiredByOrganisation, type RegistryOrg,
 } from "./PlatformAdmin";
-import { Drawer, useAction, usePageTitle, useSortedRows, useToast } from "./ui";
+import { Drawer, usePageTitle, useSortedRows } from "./ui";
+import { YourAccess } from "./your-access/YourAccess";
+import { YourSessions, type Session } from "./your-access/Sessions";
 
 /* Users & Roles for the Zoiko Super Admin (persona "platform") on /admin/users; organisation users and content staff
    keep their own view of that route (app/admin/users/page.tsx).
 
    Reads, all of them served to this role and nothing else (backend tests/read_authorization_matrix.json, SUPER_ADMIN):
-     the signed-in account (from the session check the shell already made, so no extra request), GET /sessions,
+     the signed-in account (from the session check the shell already made; Your Access's Refresh repeats it), GET /sessions,
      GET /actors (this role is served only Zoiko staff accounts, tenant_id null), and GET /platform/organisations.
    Each tab reads its data the first time it is opened and keeps it while the page is open, so switching tabs never
    repeats a request; every registry read is an audit record. The one write is ending one of your own sessions
@@ -44,12 +44,6 @@ const tabItems = TABS.map(({ value, label, short, icon: Icon }) => ({
   label: <><Icon size={15} aria-hidden className="hidden shrink-0 sm:block" /><span className="sm:hidden">{short}</span><span className="hidden sm:inline">{label}</span></>,
 }));
 
-/** A role assignment as the session check returns it (iam.assignment_view). */
-type Assignment = {
-  assignment_id: string; role_code: string; scope_type: string; scope_id: string | null; valid_from: string; valid_to: string | null;
-  status: string; source?: string; in_force?: boolean;
-};
-type Session = { session_id: string; created_at: string; expires_at: string; user_agent: string | null; current: boolean };
 /** A Zoiko staff account from GET /actors. `roles` is the account's cached organisation-/platform-wide roles. */
 type StaffRow = {
   actor_id: string; tenant_id: string | null; actor_type: string; display_name: string; email: string | null; roles: string[] | null;
@@ -133,7 +127,12 @@ export function PlatformUsers() {
       <div>
         <Tabs id="pu" label="Users & Roles" value={tab} onChange={open} items={tabItems} />
         <TabPanel id="pu" value={tab} className="pt-6 focus-visible:outline-offset-4">
-          {tab === "access" && <YourAccess me={me} sessions={sessions} />}
+          {tab === "access" && (
+            <div className="space-y-6">
+              <YourAccess onRefreshed={sessions.reload} />
+              <YourSessions sessions={sessions} />
+            </div>
+          )}
           {tab === "staff" && (
             <StaffTab me={me} staff={staff} filters={{ q: staffQ, type: staffType, role: staffRole }}
               onFilters={(f) => { setStaffQ(f.q); setStaffType(f.type); setStaffRole(f.role); }} />
@@ -147,140 +146,6 @@ export function PlatformUsers() {
 }
 
 type Loaded<T> = { data: T | null; error: unknown; loading: boolean; reload: () => void };
-
-/* ------------------------------------------------------------------------------------------------- Your Access */
-function YourAccess({ me, sessions }: { me: Me; sessions: Loaded<Session[]> }) {
-  const c = workContext(me);
-  const assignments = (me as Me & { role_assignments?: Assignment[] }).role_assignments;
-  return (
-    <div className="space-y-6">
-      <RegistrySection title="Your account" description="Who you are signed in as and where you work. The backend enforces your roles on every request.">
-        <DescriptionList columns={3} items={[
-          ["Name", me.display_name.replace(/\s*\(.*\)/, "")],
-          ["Email", <span key="e" className="break-words type-code"><Email value={me.email} /></span>],
-          ["Workspace", <span key="w">{c.label} · {c.name}<span className="block type-caption text-fg-muted">Not a member of any customer organisation</span></span>],
-          ["Authority basis", me.authority_basis ?? "—"],
-          ["Principal type", <code key="t" className="type-code">{me.actor_type}</code>],
-          ["Account ID", <code key="i" className="break-all type-code">{me.actor_id}</code>],
-        ]} />
-      </RegistrySection>
-
-      <RegistrySection title="Roles and assignments" description="Each role you hold, where it applies and since when, as the role registry records it.">
-        {assignments && assignments.length > 0 ? (
-          <ul aria-label="Your role assignments" className="space-y-3">
-            {assignments.map((a) => (
-              <li key={a.assignment_id} className="rounded-card border border-line bg-surface-card p-4">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="type-secondary font-semibold text-fg">{roleLabel(a.role_code)} <code className="ml-1 type-code font-normal text-fg-muted">{a.role_code}</code></p>
-                    {roleAbout(a.role_code) && <p className="mt-0.5 type-caption text-fg-secondary">{roleAbout(a.role_code)}</p>}
-                  </div>
-                  <span className="flex shrink-0 flex-wrap items-center gap-2">
-                    <StateBadge code={a.status} size="sm" />
-                    {a.status === "ACTIVE" && a.in_force === false && <span className="type-caption text-fg-muted">not in force now</span>}
-                  </span>
-                </div>
-                <DescriptionList columns={3} className="mt-3" items={[
-                  ["Scope", scopeText(a)],
-                  ["Valid", <span key="v">{fmtDate(a.valid_from, true)} → {a.valid_to ? fmtDate(a.valid_to, true) : "open-ended"}</span>],
-                  ["Granted through", a.source ? <code key="s" className="type-code">{a.source}</code> : "—"],
-                ]} />
-              </li>
-            ))}
-          </ul>
-        ) : me.roles.length > 0 ? (
-          <ul aria-label="Your roles" className="space-y-2">
-            {me.roles.map((r) => (
-              <li key={r}><p className="type-secondary font-semibold text-fg">{roleLabel(r)} <code className="ml-1 type-code font-normal text-fg-muted">{r}</code></p>
-                {roleAbout(r) && <p className="type-caption text-fg-secondary">{roleAbout(r)}</p>}</li>
-            ))}
-            <li className="type-caption text-fg-muted">Scope and validity were not returned with your session.</li>
-          </ul>
-        ) : <EmptyState compact title="No roles in force" />}
-      </RegistrySection>
-
-      <RegistrySection title="What you can do" description="The permissions your roles confer now.">
-        {me.permissions.length === 0 ? <EmptyState compact title="No permissions" /> : (
-          <ul aria-label="Your permissions" className="grid gap-x-6 gap-y-1 sm:grid-cols-2">
-            {me.permissions.map((p) => (
-              <li key={p} className="flex flex-wrap items-baseline justify-between gap-x-3 border-b border-line py-1.5">
-                <span className="type-secondary text-fg">{permissionText(p)}</span><code className="type-code text-fg-muted">{p}</code>
-              </li>
-            ))}
-          </ul>
-        )}
-      </RegistrySection>
-
-      <SessionsPanel sessions={sessions} />
-    </div>
-  );
-}
-
-const scopeText = (a: Assignment) => (a.scope_type === "PLATFORM" ? "Zoiko platform" : a.scope_type === "LEGAL_ENTITY" ? "One legal entity" : "Whole organisation");
-
-/** Your own sessions. Ending one is the existing self-service flow (POST /sessions/{id}/revoke, optional reason). */
-function SessionsPanel({ sessions }: { sessions: Loaded<Session[]> }) {
-  const [target, setTarget] = useState<Session | null>(null);
-  const rows = sessions.data;
-  return (
-    <RegistrySection title="Your sessions" description="Every place you are signed in. End any session you do not recognise; to end this one, sign out."
-      aside={rows && <p className="type-caption text-fg-muted">{count(rows.length, "live session")}</p>}>
-      {!rows && sessions.error ? <ErrorState compact error={sessions.error} title="Your sessions could not be loaded" onRetry={() => sessions.reload()} />
-        : !rows ? <ListLoading label="Loading your sessions" rows={2} />
-        : rows.length === 0 ? <EmptyState compact title="No live sessions" />
-        : (
-          <ul aria-label="Your sessions" className="space-y-3">
-            {rows.map((s) => (
-              <li key={s.session_id} className="flex flex-col gap-3 rounded-card border border-line bg-surface-card p-4 md:flex-row md:items-center md:justify-between">
-                <DescriptionList columns={3} className="min-w-0 flex-1" items={[
-                  ["Signed in", fmtDate(s.created_at, true)],
-                  ["Expires", fmtDate(s.expires_at, true)],
-                  ["Device", <span key="d" className="break-all">{s.user_agent || "Not recorded"}</span>],
-                ]} />
-                <div className="shrink-0">
-                  {s.current ? <span className="inline-flex items-center gap-1 rounded-chip border border-status-info-line bg-status-info-tint px-2 py-0.5 type-caption font-semibold text-status-info">
-                    <Info size={12} aria-hidden />This session</span>
-                    : <Button size="sm" variant="secondary" icon={LogOut} onClick={() => setTarget(s)}>End session</Button>}
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      {target && <EndSession session={target} onClose={() => setTarget(null)} onDone={() => sessions.reload()} />}
-    </RegistrySection>
-  );
-}
-
-/** The existing own-session confirmation: the reason is optional, the request body is unchanged, and an API error is
- *  shown in place for a retry. */
-function EndSession({ session, onClose, onDone }: { session: Session; onClose: () => void; onDone: () => void }) {
-  const [reason, setReason] = useState("");
-  const a = useAction();
-  const toast = useToast();
-  const formId = useId();
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    if (a.busy) return;
-    void a.run(async () => {
-      await api(`/sessions/${encodeURIComponent(session.session_id)}/revoke`, { method: "POST", json: reason.trim() ? { reason: reason.trim() } : {} });
-      toast("Session ended", "good");
-      onDone();
-      onClose();
-    });
-  };
-  return (
-    <Modal open onClose={onClose} title="End session" size="sm" footer={<>
-      <Button variant="secondary" onClick={onClose}>Cancel</Button>
-      <Button type="submit" form={formId} variant="danger" loading={a.busy}>{a.busy ? "Ending…" : "End session"}</Button>
-    </>}>
-      <form id={formId} onSubmit={submit} className="space-y-4">
-        {!!a.error && <Alert tone="critical" live="assertive">{errText(a.error)}</Alert>}
-        <p>The session signed in {fmtDate(session.created_at, true)} stops working immediately.</p>
-        <Field label="Reason" optional><Textarea rows={2} maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} /></Field>
-      </form>
-    </Modal>
-  );
-}
 
 /* ------------------------------------------------------------------------------------------------- Zoiko Staff */
 type StaffFilters = { q: string; type: string; role: string };
