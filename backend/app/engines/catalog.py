@@ -30,6 +30,8 @@ from sqlalchemy import select
 from ..models import (ContentRelease, FactDefinition, Instrument, ObligationDefinition, Provision, RegulatorySource,
                       RequirementVersion, RuleVersion)
 from ..platform import audit, emit, next_record_seq, sha256_hex, to_dict
+from . import selection
+from .selection import AmbiguousSelection
 
 # ZA-GLS-001 §04: machine code -> allowed next states.
 TRANSITIONS: dict[str, frozenset[str]] = {
@@ -157,6 +159,23 @@ def versions_of(db, requirement_key: str) -> list[RequirementVersion]:
 def version_number(db, rv: RequirementVersion) -> int:
     ids = [v.requirement_version_id for v in versions_of(db, rv.requirement_key)]
     return ids.index(rv.requirement_version_id) + 1
+
+
+def version_numbers(db, rvs) -> dict[str, int]:
+    """version_number() of every version of these versions' requirement keys, in one query instead of one per version:
+    each version's 1-based position among the versions of its key in (record_seq, id) order, as versions_of orders
+    them."""
+    keys = {r.requirement_key for r in rvs}
+    out: dict[str, int] = {}
+    if not keys:
+        return out
+    seen: dict[str, int] = {}
+    for vid, key in db.execute(select(RequirementVersion.requirement_version_id, RequirementVersion.requirement_key)
+                               .where(RequirementVersion.requirement_key.in_(keys))
+                               .order_by(RequirementVersion.record_seq, RequirementVersion.requirement_version_id)):
+        seen[key] = seen.get(key, 0) + 1
+        out[vid] = seen[key]
+    return out
 
 
 def lock_instrument(db, identifier: str) -> Instrument:
@@ -690,10 +709,12 @@ def provision_ref(p: Provision) -> dict:
             "lifecycle": p.lifecycle}
 
 
-def requirement_ref(db, rv: RequirementVersion) -> dict:
+def requirement_ref(db, rv: RequirementVersion, *, numbers: dict[str, int] | None = None) -> dict:
+    """``numbers``: version_numbers() already read for a list of versions (one query for the list, not one per row)."""
     inst = db.get(Instrument, rv.instrument_id)
     return {"requirement_version_id": rv.requirement_version_id, "requirement_key": rv.requirement_key,
-            "version_number": version_number(db, rv), "title": rv.title, "locator": rv.locator,
+            "version_number": version_number(db, rv) if numbers is None else numbers[rv.requirement_version_id],
+            "title": rv.title, "locator": rv.locator,
             "instrument": {"instrument_id": rv.instrument_id, "identifier": inst.identifier if inst else None,
                            "jurisdiction": inst.jurisdiction if inst else None},
             "valid_from": rv.valid_from, "valid_to": rv.valid_to, "lifecycle": rv.lifecycle, "origin": rv.origin,
@@ -702,10 +723,11 @@ def requirement_ref(db, rv: RequirementVersion) -> dict:
 
 def current_rule_version(db, odef_id: str) -> RuleVersion | None:
     """The latest PUBLISHED RuleVersion of a definition: the head of its released lineage (the base a new draft starts
-    from). Not necessarily the version in force: see effective_rule_version and rule_effective_status."""
-    return db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == odef_id,
-                                                RuleVersion.status == "PUBLISHED")
-                      .order_by(RuleVersion.version.desc())).scalars().first()
+    from). Not necessarily the version in force: see effective_rule_version and rule_effective_status. Two PUBLISHED
+    rows sharing the highest version number are refused, never one of them returned (selection.highest_version)."""
+    return selection.highest_version(db.execute(select(RuleVersion).where(
+        RuleVersion.obligation_definition_id == odef_id, RuleVersion.status == "PUBLISHED")).scalars(),
+        selection="rule_version_latest")
 
 
 def _today() -> date:
@@ -720,13 +742,14 @@ def effective_rule_version(db, odef_id: str, on: date | None = None) -> RuleVers
     [valid_from, valid_to) contains the date. The same selection applicability makes before binding a rule
     (engines/applicability.resolve_rule), so a catalogue view names the version evaluations actually bind. DOM §13:
     "exactly one released rule version is effective for a valid instant"; TIM-REQ-026: future-effective PUBLISHED
-    content does not affect current binding applicability before its valid time. Read-only."""
+    content does not affect current binding applicability before its valid time. Two rows in force sharing the highest
+    version number are refused, as resolve_rule refuses them (selection.highest_version). Read-only."""
     from sqlalchemy import or_
     on = on or _today()
-    return db.execute(select(RuleVersion).where(
+    return selection.highest_version(db.execute(select(RuleVersion).where(
         RuleVersion.obligation_definition_id == odef_id, RuleVersion.status == "PUBLISHED",
-        RuleVersion.valid_from <= on, or_(RuleVersion.valid_to.is_(None), RuleVersion.valid_to > on))
-        .order_by(RuleVersion.version.desc())).scalars().first()
+        RuleVersion.valid_from <= on, or_(RuleVersion.valid_to.is_(None), RuleVersion.valid_to > on))).scalars(),
+        selection="rule_version_effective")
 
 
 def rule_effective_status(rule: RuleVersion, effective: RuleVersion | None, on: date | None = None) -> str:
@@ -755,6 +778,29 @@ def rule_currency(db, odef_id: str, on: date | None = None) -> dict:
     """The latest published (head) and the in-force rule versions of a definition, and whether they are the same."""
     on = on or _today()
     head, effective = current_rule_version(db, odef_id), effective_rule_version(db, odef_id, on)
+    return {"head": head, "effective": effective, "on": on,
+            "head_status": rule_effective_status(head, effective, on) if head is not None else None}
+
+
+def published_rule_versions(db, odef_ids) -> dict[str, list[RuleVersion]]:
+    """The PUBLISHED rule versions of these definitions, read in one query, by definition (for currency_of)."""
+    out: dict[str, list[RuleVersion]] = {}
+    ids = sorted(set(odef_ids))
+    if ids:
+        for r in db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id.in_(ids),
+                                                      RuleVersion.status == "PUBLISHED")).scalars():
+            out.setdefault(r.obligation_definition_id, []).append(r)
+    return out
+
+
+def currency_of(published: list[RuleVersion], on: date) -> dict:
+    """rule_currency() from a definition's PUBLISHED rule versions already read (published_rule_versions), with the same
+    selections in the same order: the latest (current_rule_version), then the one whose [valid_from, valid_to) contains
+    ``on`` (effective_rule_version); a shared highest version number is refused by either, as there."""
+    head = selection.highest_version(published, selection="rule_version_latest")
+    effective = selection.highest_version([r for r in published if r.valid_from <= on and (r.valid_to is None
+                                                                                            or r.valid_to > on)],
+                                          selection="rule_version_effective")
     return {"head": head, "effective": effective, "on": on,
             "head_status": rule_effective_status(head, effective, on) if head is not None else None}
 
@@ -1000,7 +1046,8 @@ def trace_requirement(db, rv: RequirementVersion) -> dict:
 
 def trace_source(db, s: RegulatorySource) -> dict:
     rvs = db.execute(select(RequirementVersion).where(RequirementVersion.source_id == s.source_id)
-                     .order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq)).scalars().all()
+                     .order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq,
+                               RequirementVersion.requirement_version_id)).scalars().all()
     on = _today()  # one legal date for every requirement's downstream definitions in this response
     out = []
     for rv in rvs:
@@ -1269,6 +1316,15 @@ def definition_provisions(db, o: ObligationDefinition) -> list[Provision]:
     return [found[p] for p in dict.fromkeys(ids) if p in found]
 
 
+def definitions_provisions(db, odefs) -> dict[str, list[Provision]]:
+    """definition_provisions() for many definitions from one read of the provisions they link."""
+    links = {o.obligation_definition_id: [p for p in (o.provision_ids or []) if isinstance(p, str)] for o in odefs}
+    wanted = {p for ids in links.values() for p in ids}
+    found = {p.provision_id: p for p in db.execute(select(Provision).where(
+        Provision.provision_id.in_(sorted(wanted) or ["-"]))).scalars()} if wanted else {}
+    return {oid: [found[p] for p in dict.fromkeys(ids) if p in found] for oid, ids in links.items()}
+
+
 def definition_view(db, o: ObligationDefinition) -> dict:
     """The definition with each explicit link resolved to its provision, requirement version and source snapshot."""
     inst = db.get(Instrument, o.instrument_id)
@@ -1305,6 +1361,17 @@ def validate(db) -> dict:
     rvs = {r.requirement_version_id: r for r in db.execute(select(RequirementVersion)).scalars()}
     provs = list(db.execute(select(Provision)).scalars())
     prov_ids = {p.provision_id: p for p in provs}
+    with_provisions = {p.requirement_version_id for p in provs}
+    # Read once and held for the whole check (the session's identity map holds rows weakly): every definition, every
+    # PUBLISHED rule version (each definition's latest is selected from them, as current_rule_version selects it) and
+    # the releases those rules name (release_bound_requirements' db.get then finds them without a query per rule).
+    definitions = db.execute(select(ObligationDefinition)).scalars().all()
+    published = db.execute(select(RuleVersion).where(RuleVersion.status == "PUBLISHED")).scalars().all()
+    published_by_def: dict[str, list[RuleVersion]] = {}
+    for r in published:
+        published_by_def.setdefault(r.obligation_definition_id, []).append(r)
+    held_releases = db.execute(select(ContentRelease).where(ContentRelease.content_release_id.in_(
+        sorted({r.content_release_id for r in published if r.content_release_id}) or ["-"]))).scalars().all()
     for s in sources.values():
         if not fingerprint_intact(s):
             issues.append(_issue("SOURCE_FINGERPRINT_MISMATCH", "ERROR", "Stored source text no longer matches its "
@@ -1334,7 +1401,7 @@ def validate(db) -> dict:
         if rv.origin == "AI_PROPOSED" and rv.lifecycle in RELEASABLE and not rv.reviewed_by:
             issues.append(_issue("AI_CONTENT_WITHOUT_REVIEW", "ERROR", "AI-proposed content is verified or published "
                                  "without a recorded human reviewer (INV-09).", **ids))
-        if released and not any(p.requirement_version_id == rv.requirement_version_id for p in provs):
+        if released and rv.requirement_version_id not in with_provisions:
             issues.append(_issue("REQUIREMENT_WITHOUT_PROVISIONS", "WARNING", "Verified or published requirement "
                                  "version has no atomic provisions.", **ids))
     for key, inst_ids in keys.items():
@@ -1350,9 +1417,16 @@ def validate(db) -> dict:
             issues.append(_issue("PROVISION_LIFECYCLE_AHEAD_OF_REQUIREMENT", "WARNING", "Provision is verified or "
                                  "published while its requirement version is not.", provision_id=p.provision_id,
                                  requirement_version_id=rv.requirement_version_id))
-    for o in db.execute(select(ObligationDefinition)).scalars():
+    for o in definitions:
         oid = {"obligation_definition_id": o.obligation_definition_id, "obligation_key": o.key}
-        rule = current_rule_version(db, o.obligation_definition_id)
+        try:
+            rule = selection.highest_version(published_by_def.get(o.obligation_definition_id, []),
+                                             selection="rule_version_latest")  # = current_rule_version, no query
+        except AmbiguousSelection as e:  # reported by this check, not a failure of the whole report (DAT-REQ-010)
+            issues.append(_issue("RULE_VERSION_AMBIGUOUS", "ERROR", "Two or more PUBLISHED rule versions of the "
+                                 "definition share its latest version number, so no latest or binding version can be "
+                                 "selected.", rule_version_ids=e.candidate_ids, **oid))
+            rule = True  # below, `rule` only says whether a released rule exists: one does
         if not o.provision_ids:
             issues.append(_issue("OBLIGATION_WITHOUT_PROVISIONS", "ERROR" if rule else "WARNING", "Obligation definition "
                                  "links no provision, so it has no source grounding (INV-06).", **oid))
@@ -1370,7 +1444,7 @@ def validate(db) -> dict:
                 issues.append(_issue("OBLIGATION_INSTRUMENT_MISMATCH", "ERROR", "Obligation definition and the "
                                      "requirement version of one of its provisions name different instruments.",
                                      provision_id=pid, requirement_version_id=rv.requirement_version_id, **oid))
-    for rule in db.execute(select(RuleVersion).where(RuleVersion.status == "PUBLISHED")).scalars():
+    for rule in published:
         rid = {"rule_version_id": rule.rule_version_id, "obligation_definition_id": rule.obligation_definition_id}
         cov = mapping_coverage(rule)
         for ref in cov["unresolved"]:
@@ -1440,6 +1514,7 @@ def validate(db) -> dict:
                 issues.append(_issue("RELEASE_BINDING_REQUIREMENT_MISSING", "ERROR", "The release binds a requirement "
                                      "version that does not exist.", content_release_id=rule.content_release_id,
                                      requirement_version_id=b.get("requirement_version_id"), **rid))
+    del held_releases
     issues.sort(key=lambda i: (i["severity"] != "ERROR", i["code"], str(sorted(i.items()))))
     by_code: dict[str, int] = {}
     for i in issues:
@@ -1448,3 +1523,218 @@ def validate(db) -> dict:
     return {"ok": errors == 0, "errors": errors, "warnings": len(issues) - errors, "by_code": by_code,
             "checked": {"sources": len(sources), "requirement_versions": len(rvs), "provisions": len(provs),
                         "instruments": len(insts)}, "issues": issues}
+
+
+# ---------------------------------------------------------------- Regulatory Change Inbox read model (WF-01)
+# ZA-PRD-001 §13 WF-01: "regime, authority, source, publication/effective dates, content-release status, impacted entity
+# count, missing-fact count, reviewer, severity". Read-only and built only from persisted records: nothing is evaluated,
+# shadowed or written. Severity and review assignment have no persisted field (decision + schema work) and are absent.
+SHADOW_COUNTS = ("subjects_evaluated", "adopted_determination_conflicts", "execution_errors")
+SHADOW_MAPS = ("transition_buckets", "missing_fact_counts")
+
+
+def _is_count(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def shadow_result(report: Any) -> dict:
+    """A recorded shadow-impact report (applicability.shadow_impact via POST /rules/drafts/{id}/shadow; copied to the
+    release's ``shadow_summary`` at publication) exactly as recorded, with how complete it is:
+
+    * COMPLETED: every aggregate the shadow run records is present and no subject failed to evaluate;
+    * INCOMPLETE: a report exists, but subjects failed to evaluate (``execution_errors``) or an aggregate was not
+      recorded (an older or seeded summary). The figures present cover only what was recorded; nothing is filled in;
+    * NOT_RECORDED: no report is persisted (never run, not required for the change class, invalidated by a later draft
+      edit, or refused before it ran: a refused run leaves no record, so a failed run cannot be told apart from none).
+
+    An aggregate that was not recorded is null, never 0: null is "not recorded", 0 is a recorded zero."""
+    out: dict[str, Any] = {"status": "NOT_RECORDED", "reasons": [], "completed_at": None,
+                           **{k: None for k in SHADOW_COUNTS + SHADOW_MAPS}}
+    if not isinstance(report, dict):
+        return out
+    reasons = []
+    for k in SHADOW_COUNTS:
+        v = report.get(k)
+        if _is_count(v):
+            out[k] = v
+        else:
+            reasons.append(f"{k.upper()}_NOT_RECORDED")
+    for k in SHADOW_MAPS:
+        v = report.get(k)
+        if isinstance(v, dict) and all(isinstance(n, str) and _is_count(c) for n, c in v.items()):
+            out[k] = dict(sorted(v.items()))
+        else:
+            reasons.append(f"{k.upper()}_NOT_RECORDED")
+    if isinstance(report.get("completed_at"), str):
+        out["completed_at"] = report["completed_at"]
+    else:
+        reasons.append("COMPLETED_AT_NOT_RECORDED")
+    if out["execution_errors"]:
+        reasons.insert(0, "EXECUTION_ERRORS")
+    out["status"] = "INCOMPLETE" if reasons else "COMPLETED"
+    out["reasons"] = reasons
+    return out
+
+
+def _binding_requirement_ids(requirement_versions: Any) -> set[str]:
+    """The requirement version IDs a release manifest's ``requirement_versions`` binding names; entries that are not
+    objects with a string ID are ignored (a release made before binding has none)."""
+    return {b["requirement_version_id"] for b in requirement_versions or []
+            if isinstance(b, dict) and isinstance(b.get("requirement_version_id"), str)}
+
+
+def change_inbox_items(db, sources: list[RegulatorySource], record_seq: int) -> list[dict]:
+    """One inbox item per source snapshot, with what WF-01 can show from persisted records as known at ``record_seq``
+    (the page's pinned watermark): the snapshot's place among snapshots of the same source, the requirement versions
+    grounded in it and their instruments (the regime), the obligation definitions linking their provisions, the signed
+    releases binding them with the release-time shadow impact, and pending rule drafts for those definitions with
+    their recorded shadow impact.
+
+    A fixed number of queries whatever the page size (no query per item). Two are catalogue-wide: obligation
+    definitions (their provision links are a JSON list, matched here as obligation_definitions_for does) and content
+    releases (the requirement versions a release binds are in its signed manifest, the binding authority; a requirement
+    version's ``content_release_id`` names only the release that first published it). No index or relational link
+    exists to narrow either, so both still read every row; they read only the columns the inbox uses (the manifest
+    whole, not the signature, hash or changelog), and each page item is related to them through lookups built once per
+    page, not by rescanning them per item.
+
+    Not pinned (no record-time column): lifecycle codes are current values (catalogue lifecycle history needs migration
+    0014), and rule drafts with their shadow reports are as they are now."""
+    from ..models import RuleDraft
+    if not sources:
+        return []
+    sids = [s.source_id for s in sources]
+    # Snapshots of the same sources (stable identity: authority + jurisdiction + authoritative locator), oldest first.
+    # Only what the chain compares: never the stored text (the page's own snapshots are already loaded in full).
+    snapshots: dict[tuple, list] = {}
+    for x in db.execute(select(RegulatorySource.source_id, RegulatorySource.authority, RegulatorySource.jurisdiction,
+                               RegulatorySource.locator, RegulatorySource.fingerprint)
+                        .where(RegulatorySource.locator.in_({s.locator for s in sources}),
+                               RegulatorySource.record_seq <= record_seq)
+                        .order_by(RegulatorySource.record_seq, RegulatorySource.source_id)):
+        snapshots.setdefault((x.authority, x.jurisdiction, x.locator), []).append(x)
+    rvs = db.execute(select(RequirementVersion).where(RequirementVersion.source_id.in_(sids),
+                                                      RequirementVersion.record_seq <= record_seq)
+                     .order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq,
+                               RequirementVersion.requirement_version_id)).scalars().all()
+    rv_ids = [r.requirement_version_id for r in rvs]
+    numbers: dict[str, int] = {}  # version_number, as version_number() counts it, for every version on the page
+    seen: dict[str, int] = {}
+    for vid, key in db.execute(select(RequirementVersion.requirement_version_id, RequirementVersion.requirement_key)
+                               .where(RequirementVersion.requirement_key.in_({r.requirement_key for r in rvs} or {"-"}))
+                               .order_by(RequirementVersion.record_seq, RequirementVersion.requirement_version_id)):
+        seen[key] = seen.get(key, 0) + 1
+        numbers[vid] = seen[key]
+    provisions: dict[str, list[str]] = {}
+    for pid, rid in db.execute(select(Provision.provision_id, Provision.requirement_version_id)
+                               .where(Provision.requirement_version_id.in_(rv_ids or ["-"]))
+                               .order_by(Provision.locator, Provision.provision_id)):
+        provisions.setdefault(rid, []).append(pid)
+    instruments = {i.instrument_id: i for i in db.execute(select(Instrument).where(
+        Instrument.instrument_id.in_({r.instrument_id for r in rvs} or {"-"}))).scalars()}
+    all_pids = {p for ps in provisions.values() for p in ps}
+    odefs = [o for o in db.execute(select(ObligationDefinition.obligation_definition_id, ObligationDefinition.key,
+                                          ObligationDefinition.title, ObligationDefinition.coverage_mode,
+                                          ObligationDefinition.subject_type, ObligationDefinition.provision_ids)
+                                   .order_by(ObligationDefinition.key, ObligationDefinition.obligation_definition_id))
+             if all_pids & set(o.provision_ids or [])]
+    odefs_by_pid: dict[str, list[int]] = {}  # page provision -> positions in `odefs` of the definitions linking it
+    for n, o in enumerate(odefs):
+        for p in set(o.provision_ids or []) & all_pids:
+            odefs_by_pid.setdefault(p, []).append(n)
+    # The manifest is read whole and its members picked here: extracting them in SQL would make the database parse
+    # every manifest (a json column) on each request, which costs it more than returning the stored document.
+    releases = db.execute(select(ContentRelease.content_release_id, ContentRelease.label, ContentRelease.status,
+                                 ContentRelease.published_at, ContentRelease.cell_received_seq,
+                                 ContentRelease.correction_of_release_id, ContentRelease.shadow_summary,
+                                 ContentRelease.manifest)
+                          .where(ContentRelease.cell_received_seq <= record_seq)
+                          .order_by(ContentRelease.cell_received_seq, ContentRelease.content_release_id)).all()
+    corrected_by: dict[str, list[str]] = {}
+    for r in releases:
+        if r.correction_of_release_id:
+            corrected_by.setdefault(r.correction_of_release_id, []).append(r.content_release_id)
+    binding = {r.content_release_id: _binding_requirement_ids((r.manifest or {}).get("requirement_versions"))
+               for r in releases}
+    page_rv_ids = set(rv_ids)
+    release_pos = {r.content_release_id: n for n, r in enumerate(releases)}
+    releases_by_rv: dict[str, list[int]] = {}  # page requirement version -> positions of the releases binding it
+    for n, r in enumerate(releases):
+        for rid in binding[r.content_release_id] & page_rv_ids:
+            releases_by_rv.setdefault(rid, []).append(n)
+    drafts = db.execute(select(RuleDraft.draft_id, RuleDraft.obligation_definition_id, RuleDraft.status,
+                               RuleDraft.revision, RuleDraft.change_class, RuleDraft.updated_at,
+                               RuleDraft.source_mappings, RuleDraft.shadow_report).where(
+        RuleDraft.obligation_definition_id.in_([o.obligation_definition_id for o in odefs] or ["-"]),
+        RuleDraft.status != "PUBLISHED").order_by(RuleDraft.obligation_definition_id, RuleDraft.draft_id)).all()
+    drafts_by_odef: dict[str, list[int]] = {}
+    for n, d in enumerate(drafts):
+        drafts_by_odef.setdefault(d.obligation_definition_id, []).append(n)
+
+    by_source: dict[str, list[RequirementVersion]] = {}
+    for r in rvs:
+        by_source.setdefault(r.source_id, []).append(r)
+    items = []
+    for s in sources:
+        mine = by_source.get(s.source_id, [])
+        mine_ids = {r.requirement_version_id for r in mine}
+        my_pids = {p for r in mine for p in provisions.get(r.requirement_version_id, [])}
+        chain = snapshots.get((s.authority, s.jurisdiction, s.locator), [])
+        pos = next((i for i, x in enumerate(chain) if x.source_id == s.source_id), None)
+        prev = chain[pos - 1] if pos else None
+        first_published = {r.content_release_id for r in mine if r.content_release_id}
+        # In catalogue order, as before: the releases binding one of these versions or first publishing one.
+        picked = {n for rid in mine_ids for n in releases_by_rv.get(rid, ())}
+        picked |= {release_pos[c] for c in first_published if c in release_pos}
+        my_releases = [releases[n] for n in sorted(picked)]
+        my_odefs = [odefs[n] for n in sorted({n for p in my_pids for n in odefs_by_pid.get(p, ())})]
+        my_odef_ids = {o.obligation_definition_id for o in my_odefs}
+        my_drafts = [drafts[n] for n in sorted(n for o in my_odef_ids for n in drafts_by_odef.get(o, ()))]
+        regimes = {r.instrument_id: instruments[r.instrument_id] for r in mine if r.instrument_id in instruments}
+        items.append({
+            "source": {**source_ref(s), "fetched_at": s.fetched_at},
+            # Fingerprint comparison of consecutive snapshots only (their stored digests); not a text-level diff.
+            "snapshot": {"number": None if pos is None else pos + 1, "of": len(chain) or None,
+                         "previous_source_id": prev.source_id if prev else None,
+                         "fingerprint_changed": None if prev is None else prev.fingerprint != s.fingerprint},
+            # The regime comes from the requirement versions grounded in the snapshot: a source has no persisted
+            # instrument of its own (its classification is recorded in the audit trail only), so null means "no
+            # requirement content yet", not "no regime".
+            "regimes": [{"instrument_id": i.instrument_id, "identifier": i.identifier, "title": i.title,
+                         "jurisdiction": i.jurisdiction, "authority": i.authority, "coverage_mode": i.coverage_mode,
+                         "regime_owner": i.regime_owner}
+                        for i in sorted(regimes.values(), key=lambda i: (i.identifier, i.instrument_id))] if mine else None,
+            "requirement_versions": [{
+                "requirement_version_id": r.requirement_version_id, "requirement_key": r.requirement_key,
+                "version_number": numbers.get(r.requirement_version_id), "title": r.title, "locator": r.locator,
+                "instrument_id": r.instrument_id, "valid_from": r.valid_from, "valid_to": r.valid_to,
+                "lifecycle": r.lifecycle, "origin": r.origin, "reviewed_by": r.reviewed_by, "record_seq": r.record_seq,
+                "provision_count": len(provisions.get(r.requirement_version_id, [])),
+                # The release recorded on the version when it was first published, and every signed release whose
+                # manifest binds it. Both empty: no persisted release link (e.g. content seeded as PUBLISHED).
+                "content_release_id": r.content_release_id,
+                "released_in": [x.content_release_id for x in my_releases
+                                if r.requirement_version_id in binding[x.content_release_id]]} for r in mine],
+            "obligation_definitions": [{
+                "obligation_definition_id": o.obligation_definition_id, "key": o.key, "title": o.title,
+                "coverage_mode": o.coverage_mode, "subject_type": o.subject_type,
+                "linked_provision_ids": [p for p in (o.provision_ids or []) if p in my_pids]} for o in my_odefs],
+            "content_releases": [{
+                "content_release_id": r.content_release_id, "label": r.label, "status": r.status,
+                "published_at": r.published_at, "release_record_seq": r.cell_received_seq,
+                "change_class": (r.manifest or {}).get("change_class"),
+                "is_correction": r.correction_of_release_id is not None,
+                "corrects_release_id": r.correction_of_release_id,
+                "corrected_by_release_ids": corrected_by.get(r.content_release_id, []),
+                "binds_requirement_version_ids": sorted(binding[r.content_release_id] & mine_ids),
+                "first_published_requirement_version_ids": sorted(
+                    x.requirement_version_id for x in mine if x.content_release_id == r.content_release_id),
+                "shadow_impact": shadow_result(r.shadow_summary)} for r in my_releases],
+            "pending_rule_drafts": [{
+                "draft_id": d.draft_id, "obligation_definition_id": d.obligation_definition_id, "status": d.status,
+                "revision": d.revision, "change_class": d.change_class, "updated_at": d.updated_at,
+                "cites_requirement_version_ids": sorted({m.get("requirement_version_id") for m in d.source_mappings or []
+                                                         if isinstance(m, dict)} & mine_ids),
+                "shadow_impact": shadow_result(d.shadow_report)} for d in my_drafts],
+        })
+    return items

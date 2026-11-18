@@ -10,7 +10,8 @@ from sqlalchemy import select
 
 from ..engines import applicability as appl
 from ..engines import catalog, idempotency, rules
-from ..engines.facts import assert_fact, assertion_value, resolve_fact
+from ..engines.facts import (assert_fact, assertion_view, display_value, input_bundle_view,
+                             overlapping_current_revisions, resolve_fact)
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, DeterminationChallenge,
                       FactAssertion, FactConflict, FactDefinition, FactRequest, ObligationDefinition, RuleVersion, Subject)
 from ..platform import audit, current_watermark, emit, ensure_utc, next_record_seq, to_dict
@@ -43,8 +44,7 @@ RECORD_SEQ_MIN = -(2 ** 63)
 
 
 def _fact_row(db, a: FactAssertion, fd: FactDefinition) -> dict:
-    d = to_dict(a)
-    d["value"] = assertion_value(a) if fd.sensitivity not in ("RESTRICTED_PERSONAL", "LEGAL_PRIVILEGED") else "••• (redacted)"
+    d = assertion_view(a, fd)  # every typed value column redacted with `value`, not only `value` (facts.assertion_view)
     d["fact_key"] = fd.key
     d["fact_label"] = fd.label
     return d
@@ -64,7 +64,8 @@ def fact_profile(subject_id: str, valid_at: Instant | None = None,
                                   "message": f"known_seq is beyond the current record sequence {wm['record_seq']}"})
     valid_at = ensure_utc(valid_at) or datetime.now(timezone.utc)
     known = known_seq if known_seq is not None else wm["record_seq"]
-    fds = {f.fact_definition_id: f for f in ctx.db.execute(select(FactDefinition)).scalars()}
+    # Stable orders (fact key; conflicts by creation, then ID), never physical row order.
+    fds = {f.fact_definition_id: f for f in ctx.db.execute(select(FactDefinition).order_by(FactDefinition.key)).scalars()}
     rows = []
     for fd in fds.values():
         if fd.subject_type != s.subject_type:
@@ -75,10 +76,10 @@ def fact_profile(subject_id: str, valid_at: Instant | None = None,
                      "sensitivity": fd.sensitivity, "allowed_provenance": fd.allowed_provenance,
                      "manual_attestation_policy": fd.manual_attestation_policy, "expiry_days": fd.expiry_days,
                      "resolution": {k: v for k, v in r.items() if k != "value"} | (
-                         {"value": r["value"] if fd.sensitivity not in ("RESTRICTED_PERSONAL", "LEGAL_PRIVILEGED") else "••• (redacted)"}
-                         if r["known"] else {})})
+                         {"value": display_value(fd.sensitivity, r["value"])} if r["known"] else {})})
     conflicts = [to_dict(c) for c in ctx.db.execute(select(FactConflict).where(FactConflict.tenant_id == ctx.tenant,
-                                                                               FactConflict.subject_id == subject_id)).scalars()]
+                                                                               FactConflict.subject_id == subject_id)
+                                                    .order_by(FactConflict.created_at, FactConflict.conflict_id)).scalars()]
     return {"subject": to_dict(s), "perspective": {"valid_at": valid_at, "known_seq": known, "cell_id": wm["cell_id"],
                                                    "perspective": "CURRENT" if known_seq is None else "CUSTOM_BITEMPORAL"},
             "facts": rows, "conflicts": conflicts}
@@ -90,8 +91,57 @@ def fact_history(subject_id: str, ctx: Ctx = Depends(authorize(*READ, entity=SUB
     fds = {f.fact_definition_id: f for f in ctx.db.execute(select(FactDefinition)).scalars()}
     rows = ctx.db.execute(select(FactAssertion).where(FactAssertion.tenant_id == ctx.tenant,
                                                       FactAssertion.subject_id == s.subject_id)
-                          .order_by(FactAssertion.record_from_seq)).scalars().all()
+                          .order_by(FactAssertion.record_from_seq, FactAssertion.revision_id)).scalars().all()
     return [_fact_row(ctx.db, a, fds[a.fact_definition_id]) for a in rows]
+
+
+@router.get("/subjects/{subject_id}/facts/impact")
+def fact_change_impact(subject_id: str, fact_key: str | None = None, valid_from: Instant | None = None,
+                       valid_to: Instant | None = None, ctx: Ctx = Depends(authorize(*READ, entity=SUBJECT))):
+    """Impact preview of a proposed change of one fact over [valid_from, valid_to) (ZA-APP-001 §16 WF-APP-02, a region
+    of the fact profile and read under its authorization; dependents per ZA-TIM-001 §17): the current revisions such a
+    write would close and carve, and the obligation definitions, rule versions, recorded evaluations, current
+    determinations and obligations, and assurance snapshots that depend on the fact over that interval
+    (appl.fact_change_dependents). Dependencies only: nothing is evaluated, written or locked, no value is taken and no
+    outcome is predicted ("no predicted legal result shown unless shadow evaluation is explicitly run"; no fact-change
+    shadow evaluation is specified). The valid interval is required (ZA-TIM-001 §16: a historical question without a
+    valid time is refused, never defaulted) and is validated as a fact write validates it; the record watermark the
+    answer was read at is echoed (TIM-REQ-017). fact_key and valid_from are required, checked after the subject is
+    scoped, so another organisation's subject ID is answered 404 whatever else is sent (QA-REQ-019)."""
+    s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
+    missing = [n for n, v in (("fact_key", fact_key), ("valid_from", valid_from)) if v is None]
+    if missing:
+        raise HTTPException(422, f"Required: {', '.join(missing)} (the fact and the valid time of the proposed change)")
+    fd = ctx.db.execute(select(FactDefinition).where(FactDefinition.key == fact_key)).scalars().first()
+    if not fd:
+        raise HTTPException(404, "FactDefinition not found")
+    if fd.subject_type != s.subject_type:
+        raise HTTPException(422, f"{fd.key} attaches to {fd.subject_type}")
+    valid_from, valid_to = ensure_utc(valid_from), ensure_utc(valid_to)
+    if valid_to is not None and valid_to <= valid_from:
+        raise HTTPException(422, "Empty/negative valid range prohibited")
+    # Every record below is read as known at this one watermark, the one echoed (TIM-REQ-017): records first written
+    # after it, by a commit landing while this request runs, are not part of the answer.
+    wm = current_watermark(ctx.db)
+    known = wm["record_seq"]
+    revisions = overlapping_current_revisions(ctx.db, tenant_id=ctx.tenant, subject=s, fd=fd, valid_from=valid_from,
+                                              valid_to=valid_to, known_seq=known)
+    dependents = appl.fact_change_dependents(ctx.db, tenant_id=ctx.tenant, holder=s, fd=fd, valid_from=valid_from,
+                                             valid_to=valid_to, known_seq=known)
+    return {"perspective": {"perspective": "CURRENT", "known_seq": known, "cell_id": wm["cell_id"]},
+            "proposed_change": {"subject_id": s.subject_id, "fact_key": fd.key,
+                                "fact_definition_id": fd.fact_definition_id, "valid_from": valid_from,
+                                "valid_to": valid_to},
+            # Current at the watermark, so a closure recorded after it is not shown (as the dossier's _as_known).
+            "overlapping_revisions": [{**_fact_row(ctx.db, a, fd), "record_to_seq": None} for a in revisions],
+            "dependents": dependents,
+            "counts": {"overlapping_revisions": len(revisions), "scopes": len(dependents),
+                       "evaluations": sum(len(d["evaluations"]) for d in dependents),
+                       "determinations": sum(d["determination"] is not None for d in dependents),
+                       "obligations": sum(d["obligation"] is not None for d in dependents),
+                       "assurance_snapshots": sum(len(d["assurance_snapshots"]) for d in dependents)},
+            "note": "Dependencies only: nothing was evaluated or written and no outcome is predicted (ZA-APP-001 "
+                    "WF-APP-02: no predicted legal result unless a shadow evaluation is explicitly run)."}
 
 
 class FactIn(BaseModel):
@@ -151,9 +201,25 @@ class EvalIn(BaseModel):
 _LOOK_UP = object()
 
 
-def _eval_view(db, e: ApplicabilityEvaluation, det=_LOOK_UP, traces: dict | None = None) -> dict:
-    """`traces`: provenance already traced in this request, by rule version (a list shares a few rule versions)."""
+def _fact_sensitivities(db, evaluations) -> dict[str, str | None]:
+    """FactDefinition key -> sensitivity for every fact the evaluations' frozen bundles consumed (one query)."""
+    keys = {fi.get("fact_definition") for e in evaluations if isinstance(e.input_bundle, dict)
+            for fi in (e.input_bundle.get("fact_inputs") or []) if isinstance(fi, dict)} - {None}
+    if not keys:
+        return {}
+    return dict(db.execute(select(FactDefinition.key, FactDefinition.sensitivity)
+                           .where(FactDefinition.key.in_(keys))).all())
+
+
+def _eval_view(db, e: ApplicabilityEvaluation, det=_LOOK_UP, traces: dict | None = None,
+               sensitivities: dict | None = None) -> dict:
+    """`traces`: provenance already traced in this request, by rule version (a list shares a few rule versions).
+    `sensitivities`: FactDefinition key -> sensitivity already read for this request (a list reads them once)."""
     d = to_dict(e)
+    # The frozen bundle as a response may show it: a redacted fact's value hash is withheld (facts.input_bundle_view).
+    # A new structure; the stored bundle, which replay re-hashes below, is never modified.
+    d["input_bundle"] = input_bundle_view(e.input_bundle, _fact_sensitivities(db, [e]) if sensitivities is None
+                                          else sensitivities)
     # Which APP-001 §06 key definition the stored evaluation_key was made under (recomputed from the frozen bundle; a
     # record made before the full key is reported as such, never as if made under it).
     d["evaluation_key_profile"] = appl.evaluation_key_profile(e)
@@ -237,7 +303,9 @@ def list_evaluations(subject_id: str | None = None, ctx: Ctx = Depends(authorize
     q = select(ApplicabilityEvaluation).where(ApplicabilityEvaluation.tenant_id == ctx.tenant)
     if subject_id:
         q = q.where(ApplicabilityEvaluation.subject_id == subject_id)
-    evs = ctx.db.execute(q.order_by(ApplicabilityEvaluation.record_seq.desc()).limit(200)).scalars().all()
+    # Unique tie-break, so the 200-row cut and the order never depend on physical row order.
+    evs = ctx.db.execute(q.order_by(ApplicabilityEvaluation.record_seq.desc(), ApplicabilityEvaluation.evaluation_id)
+                         .limit(200)).scalars().all()
     # What the rows refer to, read once instead of per row: the subjects, obligation definitions and rule versions are
     # loaded into the session (and held here) so db.get() in _eval_view finds them without a query.
     refs = [*ctx.db.execute(select(Subject).where(Subject.subject_id.in_({e.subject_id for e in evs}))).scalars(),
@@ -246,7 +314,9 @@ def list_evaluations(subject_id: str | None = None, ctx: Ctx = Depends(authorize
             *ctx.db.execute(select(RuleVersion).where(RuleVersion.rule_version_id.in_({e.rule_version_id for e in evs}))).scalars()]
     dets = appl.current_determinations(ctx.db, ctx.tenant, {(e.subject_id, e.obligation_definition_id) for e in evs})
     traces: dict = {}
-    out = [_eval_view(ctx.db, e, dets.get((e.subject_id, e.obligation_definition_id)), traces) for e in evs]
+    sensitivities = _fact_sensitivities(ctx.db, evs)
+    out = [_eval_view(ctx.db, e, dets.get((e.subject_id, e.obligation_definition_id)), traces, sensitivities)
+           for e in evs]
     del refs
     return out
 
@@ -258,12 +328,14 @@ def get_evaluation(evaluation_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_REA
     d["determination_history"] = [to_dict(x) for x in ctx.db.execute(select(ApplicabilityDetermination).where(
         ApplicabilityDetermination.tenant_id == ctx.tenant, ApplicabilityDetermination.subject_id == e.subject_id,
         ApplicabilityDetermination.obligation_definition_id == e.obligation_definition_id)
-        .order_by(ApplicabilityDetermination.record_from_seq)).scalars()]
+        .order_by(ApplicabilityDetermination.record_from_seq, ApplicabilityDetermination.revision_id)).scalars()]
     d["challenges"] = [to_dict(c) for c in ctx.db.execute(select(DeterminationChallenge).where(
-        DeterminationChallenge.tenant_id == ctx.tenant, DeterminationChallenge.evaluation_id == evaluation_id)).scalars()]
+        DeterminationChallenge.tenant_id == ctx.tenant, DeterminationChallenge.evaluation_id == evaluation_id)
+        .order_by(DeterminationChallenge.created_at, DeterminationChallenge.challenge_id)).scalars()]
     d["attestations"] = [to_dict(a) for a in ctx.db.execute(select(AdoptionAttestation).where(
         AdoptionAttestation.tenant_id == ctx.tenant,
-        AdoptionAttestation.target_revision_id.in_([x["revision_id"] for x in d["determination_history"]] or ["-"]))).scalars()]
+        AdoptionAttestation.target_revision_id.in_([x["revision_id"] for x in d["determination_history"]] or ["-"]))
+        .order_by(AdoptionAttestation.record_seq, AdoptionAttestation.attestation_id)).scalars()]
     with appl.integrity_fail_closed(ctx.db, actor=ctx.actor, tenant_id=ctx.tenant):
         d["replay"] = _replay(ctx, e)
     # The exact RuleVersion this evaluation ran, traced to the requirement versions, provisions and source snapshots it
@@ -390,7 +462,9 @@ def _replay(ctx: Ctx, e: ApplicabilityEvaluation) -> dict:
 @router.get("/applicability/determinations")
 def determinations(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     rows = ctx.db.execute(select(ApplicabilityDetermination).where(ApplicabilityDetermination.tenant_id == ctx.tenant,
-                                                                   ApplicabilityDetermination.record_to_seq.is_(None))).scalars().all()
+                                                                   ApplicabilityDetermination.record_to_seq.is_(None))
+                          .order_by(ApplicabilityDetermination.record_from_seq,
+                                    ApplicabilityDetermination.revision_id)).scalars().all()
     out = []
     for r in rows:
         d = to_dict(r)
@@ -476,10 +550,10 @@ def challenge(lineage_id: str, body: ChallengeIn, ctx: Ctx = Depends(authorize("
     if not detail:
         raise HTTPException(422, {"error": "CHALLENGE_DETAIL_REQUIRED", "message": "Describe the challenge."})
 
-    def current():
-        return ctx.db.execute(select(ApplicabilityDetermination).where(
+    def current():  # the one current revision; two are refused, never one challenged by row order
+        return appl._one_current_determination(ctx.db.execute(select(ApplicabilityDetermination).where(
             ApplicabilityDetermination.tenant_id == ctx.tenant, ApplicabilityDetermination.lineage_id == lineage_id,
-            ApplicabilityDetermination.record_to_seq.is_(None)).execution_options(populate_existing=True)).scalars().first()
+            ApplicabilityDetermination.record_to_seq.is_(None)).execution_options(populate_existing=True)).scalars())
     cur = current()
     if not cur:
         raise HTTPException(404)
@@ -518,7 +592,7 @@ def challenge(lineage_id: str, body: ChallengeIn, ctx: Ctx = Depends(authorize("
 def fact_requests(ctx: Ctx = Depends(authorize(*READ))):
     out = []
     for fr in ctx.db.execute(select(FactRequest).where(FactRequest.tenant_id == ctx.tenant)
-                             .order_by(FactRequest.created_at.desc())).scalars():
+                             .order_by(FactRequest.created_at.desc(), FactRequest.request_id)).scalars():
         d = to_dict(fr)
         fd = ctx.db.get(FactDefinition, fr.fact_definition_id)
         d["fact_key"], d["fact_label"], d["data_type"], d["enum_domain"] = fd.key, fd.label, fd.data_type, fd.enum_domain

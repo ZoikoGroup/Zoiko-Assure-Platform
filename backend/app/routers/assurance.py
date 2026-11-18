@@ -7,11 +7,11 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from ..engines import assurance as asr
 from ..db import CELL_ID
-from ..engines import catalog, decision_history, governance, satisfaction, test_results
+from ..engines import catalog, decision_history, governance, satisfaction, selection, test_results
 from ..models import (AdoptionAttestation, ApplicabilityDetermination, ApplicabilityEvaluation, AssuranceSnapshot,
                       Compensation, RuleVersion,
                       CompensationEvent, ControlDefinition, ControlEvaluation, ControlImplementation, ControlTestPolicy,
@@ -25,9 +25,26 @@ router = APIRouter()
 
 
 def _find_obl(db, tenant, lineage) -> ObligationInstance | None:
-    return db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == tenant,
-                                                       ObligationInstance.lineage_id == lineage,
-                                                       ObligationInstance.record_to_seq.is_(None))).scalars().first()
+    """The current revision of one of this organisation's obligations (record_to_seq IS NULL; ZA-DAT-001 §14), None if
+    there is none. Every lifecycle change closes the prior revision in the transaction that records the next, under the
+    decision-scope lock, so a lineage has one current revision; with two, neither is chosen (selection.AmbiguousSelection):
+    which one answers decides the dossier shown and the legal entity authorization resolves to."""
+    return selection.one_or_none(db.execute(select(ObligationInstance).where(
+        ObligationInstance.tenant_id == tenant, ObligationInstance.lineage_id == lineage,
+        ObligationInstance.record_to_seq.is_(None))).scalars(),
+        record_type="ObligationInstance", selection="obligation_current", id_attr="revision_id")
+
+
+def _obl_as_of(db, tenant, lineage, as_of: int) -> ObligationInstance | None:
+    """The revision of one of this organisation's obligations that was current at record sequence ``as_of``: the one
+    whose record slice [record_from_seq, record_to_seq) contains it (ZA-TIM-001 half-open semantics; a revision closed at
+    K was replaced at K). None if the lineage was not yet recorded. Record slices of one lineage do not overlap, so two
+    revisions current at one sequence are refused, never one picked by recency (selection.AmbiguousSelection)."""
+    return selection.one_or_none(db.execute(select(ObligationInstance).where(
+        ObligationInstance.tenant_id == tenant, ObligationInstance.lineage_id == lineage,
+        ObligationInstance.record_from_seq <= as_of,
+        or_(ObligationInstance.record_to_seq.is_(None), ObligationInstance.record_to_seq > as_of))).scalars(),
+        record_type="ObligationInstance", selection="obligation_as_of", id_attr="revision_id")
 
 
 def _current_obl(db, tenant, lineage) -> ObligationInstance:
@@ -64,29 +81,62 @@ COMPENSATION = entity_of(Compensation, "comp_id", "compensation",
 EXCEPTION = entity_of(ExceptionRecord, "exception_id", "exception", entity=_exception_entity)
 
 
+# The register shows a snapshot without its segment trace and dependency manifest (read by the snapshot and dossier
+# views), so it never loads those two columns.
+_REGISTER_SNAPSHOT_COLUMNS = tuple(c for c in AssuranceSnapshot.__table__.columns
+                                   if c.key not in ("segments", "dependency_manifest"))
+
+
 @router.get("/obligations")
 def obligations(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
+    """The organisation's current obligation revisions. Each related table is read once for the whole register, not
+    once per obligation (one query per row for the definition, the subject, the latest snapshot and the approved
+    exceptions grew with the register); every row is built exactly as it was from per-row reads."""
+    db, tenant = ctx.db, ctx.tenant
+    current = (ObligationInstance.tenant_id == tenant, ObligationInstance.record_to_seq.is_(None))
+    # Record order (adoption/revision sequence), then revision ID: never physical row order.
+    rows = db.execute(select(ObligationInstance).where(*current)
+                      .order_by(ObligationInstance.record_from_seq, ObligationInstance.revision_id)).scalars().all()
+    if not rows:
+        return []
+    # The related rows of exactly these obligations, selected by the same predicate as the register itself.
+    definitions = {r.obligation_definition_id: r for r in db.execute(
+        select(ObligationDefinition.obligation_definition_id, ObligationDefinition.key, ObligationDefinition.title,
+               ObligationDefinition.schedule_kind)
+        .where(ObligationDefinition.obligation_definition_id.in_(
+            select(ObligationInstance.obligation_definition_id).where(*current))))}
+    subjects = {s.subject_id: s for s in db.execute(select(Subject).where(
+        Subject.subject_id.in_(select(ObligationInstance.subject_id).where(*current)))).scalars()}
+    # Each lineage's latest snapshot in the order the per-row read used (created_at, then snapshot ID, both descending),
+    # and the approved exceptions per target, over the organisation's rows. Every lineage of the organisation has a
+    # current revision, so these are the register's rows; a row of another target is never looked up. Neither read is
+    # joined to the obligation table: a correlated join, planned before a bulk load is analysed, re-read the obligation
+    # rows once per snapshot or exception. Scoped to the caller's organisation in the query itself, as every other read
+    # here, not only by row-level security (which the SQLite runtime does not have).
+    ranked = (select(*_REGISTER_SNAPSHOT_COLUMNS, func.row_number().over(
+        partition_by=AssuranceSnapshot.obligation_lineage_id,
+        order_by=(AssuranceSnapshot.created_at.desc(), AssuranceSnapshot.snapshot_id.desc())).label("latest_rank"))
+        .where(AssuranceSnapshot.tenant_id == tenant).subquery())
+    latest = {r.obligation_lineage_id: r for r in db.execute(select(ranked).where(ranked.c.latest_rank == 1))}
+    open_exceptions = dict(db.execute(
+        select(ExceptionRecord.target_id, func.count()).where(ExceptionRecord.tenant_id == tenant,
+                                                              ExceptionRecord.state == "APPROVED")
+        .group_by(ExceptionRecord.target_id)).all())
     out = []
-    for o in ctx.db.execute(select(ObligationInstance).where(ObligationInstance.tenant_id == ctx.tenant,
-                                                             ObligationInstance.record_to_seq.is_(None))).scalars():
+    for o in rows:
         d = to_dict(o)
-        od = ctx.db.get(ObligationDefinition, o.obligation_definition_id)
-        subject = ctx.db.get(Subject, o.subject_id)
+        od, subject, snap = (definitions.get(o.obligation_definition_id), subjects.get(o.subject_id),
+                             latest.get(o.lineage_id))
         # Referenced by ID only (no foreign key from tenant records to the catalogue): a definition or subject that
         # cannot be found is reported as missing, never a failure of the whole register.
         d["definition"] = ({"key": od.key, "title": od.title, "schedule_kind": od.schedule_kind} if od else
                            _missing("obligation_definition_id", o.obligation_definition_id, "key", "title", "schedule_kind"))
         d["subject"] = to_dict(subject) if subject else _missing("subject_id", o.subject_id, "display_name")
-        # Scoped to the caller's organisation in the query itself, as every other read here, not only by row-level
-        # security (which the SQLite runtime does not have).
-        snap = ctx.db.execute(select(AssuranceSnapshot).where(AssuranceSnapshot.tenant_id == ctx.tenant,
-                                                              AssuranceSnapshot.obligation_lineage_id == o.lineage_id)
-                              .order_by(AssuranceSnapshot.created_at.desc(), AssuranceSnapshot.snapshot_id.desc())
-                              ).scalars().first()
-        d["latest_snapshot"] = {k: v for k, v in to_dict(snap).items() if k not in ("segments", "dependency_manifest")} if snap else None
-        d["open_exceptions"] = ctx.db.query(ExceptionRecord).filter(ExceptionRecord.tenant_id == ctx.tenant,
-                                                                     ExceptionRecord.target_id == o.lineage_id,
-                                                                     ExceptionRecord.state == "APPROVED").count()
+        # Serialised by to_dict from an unattached snapshot holding the register's columns, as the full row was.
+        d["latest_snapshot"] = ({k: v for k, v in to_dict(AssuranceSnapshot(**{
+            c.key: snap._mapping[c.key] for c in _REGISTER_SNAPSHOT_COLUMNS})).items()
+            if k not in ("segments", "dependency_manifest")} if snap else None)
+        d["open_exceptions"] = open_exceptions.get(o.lineage_id, 0)
         out.append(d)
     return out
 
@@ -100,11 +150,7 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
         raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
                                   "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
     if as_of_record_seq is not None:
-        o = ctx.db.execute(select(ObligationInstance).where(
-            ObligationInstance.tenant_id == ctx.tenant, ObligationInstance.lineage_id == lineage,
-            ObligationInstance.record_from_seq <= as_of_record_seq,
-            or_(ObligationInstance.record_to_seq.is_(None), ObligationInstance.record_to_seq > as_of_record_seq))
-            .order_by(ObligationInstance.record_from_seq.desc())).scalars().first()
+        o = _obl_as_of(ctx.db, ctx.tenant, lineage, as_of_record_seq)
         if not o:
             raise HTTPException(404, "obligation not found as of requested record sequence")
     else:
@@ -135,7 +181,8 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
     if as_of_record_seq is not None:
         rev_q = rev_q.where(ObligationInstance.record_from_seq <= as_of_record_seq)
     as_known = lambda row: _as_known(to_dict(row), as_of_record_seq)  # noqa: E731
-    revisions = [as_known(r) for r in ctx.db.execute(rev_q.order_by(ObligationInstance.record_from_seq)).scalars()]
+    revisions = [as_known(r) for r in ctx.db.execute(rev_q.order_by(ObligationInstance.record_from_seq,
+                                                                    ObligationInstance.revision_id)).scalars()]
 
     snap_q = select(AssuranceSnapshot).where(AssuranceSnapshot.tenant_id == ctx.tenant,
                                              AssuranceSnapshot.obligation_lineage_id == lineage)
@@ -160,15 +207,18 @@ def dossier(lineage: str, as_of_record_seq: int | None = Query(default=None, ge=
     # in-place projections are never shown as historical state. The current perspective lists the rows as they are.
     def known(q, model):
         return q.where(model.record_seq <= as_of_record_seq) if as_of_record_seq is not None else q
+    # The orders GET /exceptions and GET /compensations use (newest valid_from first, then ID).
     exceptions = ctx.db.execute(known(select(ExceptionRecord).where(ExceptionRecord.tenant_id == ctx.tenant,
                                                                     ExceptionRecord.target_id == lineage),
-                                      ExceptionRecord)).scalars().all()
+                                      ExceptionRecord).order_by(ExceptionRecord.valid_from.desc(),
+                                                                ExceptionRecord.exception_id)).scalars().all()
     compensations = ctx.db.execute(known(select(Compensation).where(Compensation.tenant_id == ctx.tenant,
                                                                     Compensation.obligation_lineage_id == lineage),
-                                         Compensation)).scalars().all()
+                                         Compensation).order_by(Compensation.valid_from.desc(),
+                                                                Compensation.compensation_id)).scalars().all()
     occurrences = ctx.db.execute(known(select(ObligationOccurrence).where(
         ObligationOccurrence.tenant_id == ctx.tenant, ObligationOccurrence.obligation_lineage_id == lineage),
-        ObligationOccurrence).order_by(ObligationOccurrence.due_at)).scalars().all()
+        ObligationOccurrence).order_by(ObligationOccurrence.due_at, ObligationOccurrence.occurrence_id)).scalars().all()
     then = decision_history.governance_records_at(
         ctx.db, ctx.tenant, exceptions=exceptions, compensations=compensations, occurrences=occurrences,
         as_of=as_of_record_seq) if as_of_record_seq is not None else None
@@ -303,12 +353,7 @@ def expression_versions(lineage: str, as_of_record_seq: int | None = Query(defau
         raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
                                   "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
     if as_of_record_seq is not None:
-        o = ctx.db.execute(select(ObligationInstance).where(
-            ObligationInstance.tenant_id == ctx.tenant, ObligationInstance.lineage_id == lineage,
-            ObligationInstance.record_from_seq <= as_of_record_seq,
-            or_(ObligationInstance.record_to_seq.is_(None), ObligationInstance.record_to_seq > as_of_record_seq))
-            .order_by(ObligationInstance.record_from_seq.desc())).scalars().first()
-        if not o:
+        if not _obl_as_of(ctx.db, ctx.tenant, lineage, as_of_record_seq):
             raise HTTPException(404, "obligation not found as of requested record sequence")
     else:
         _current_obl(ctx.db, ctx.tenant, lineage)
@@ -491,7 +536,7 @@ def occurrence_events(occurrence_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_
         select(ObligationOccurrenceEvent).where(
             ObligationOccurrenceEvent.tenant_id == ctx.tenant,
             ObligationOccurrenceEvent.occurrence_id == occurrence_id,
-        ).order_by(ObligationOccurrenceEvent.record_seq.asc())
+        ).order_by(ObligationOccurrenceEvent.record_seq.asc(), ObligationOccurrenceEvent.event_id)
     ).scalars()]
 
 
@@ -500,7 +545,9 @@ def occurrence_events(occurrence_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_
 def controls(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     out = []
     now = datetime.now(timezone.utc)
-    cis = ctx.db.execute(select(ControlImplementation).where(ControlImplementation.tenant_id == ctx.tenant)).scalars().all()
+    cis = ctx.db.execute(select(ControlImplementation).where(ControlImplementation.tenant_id == ctx.tenant)
+                         .order_by(ControlImplementation.record_seq,
+                                   ControlImplementation.control_implementation_id)).scalars().all()
     # The definitions and subjects the rows refer to, read once and held here so db.get() below finds them in the
     # session instead of querying for every control.
     refs = [*ctx.db.execute(select(ControlDefinition).where(
@@ -688,7 +735,8 @@ class ExceptionIn(BaseModel):
 @router.get("/exceptions")
 def list_exceptions(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     return [to_dict(x) for x in ctx.db.execute(select(ExceptionRecord).where(ExceptionRecord.tenant_id == ctx.tenant)
-                                               .order_by(ExceptionRecord.valid_from.desc())).scalars()]
+                                               .order_by(ExceptionRecord.valid_from.desc(),
+                                                         ExceptionRecord.exception_id)).scalars()]
 
 
 @router.post("/exceptions")
@@ -731,7 +779,7 @@ def exception_events(exception_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_RE
         select(ExceptionEvent).where(
             ExceptionEvent.tenant_id == ctx.tenant,
             ExceptionEvent.exception_id == exception_id,
-        ).order_by(ExceptionEvent.record_seq.asc())
+        ).order_by(ExceptionEvent.record_seq.asc(), ExceptionEvent.event_id)
     ).scalars()]
 
 
@@ -767,7 +815,8 @@ def propose_compensation(body: CompIn, ctx: Ctx = Depends(authorize("request_exc
 @router.get("/compensations")
 def list_compensations(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     return [to_dict(c) for c in ctx.db.execute(select(Compensation).where(Compensation.tenant_id == ctx.tenant)
-                                               .order_by(Compensation.valid_from.desc())).scalars()]
+                                               .order_by(Compensation.valid_from.desc(),
+                                                         Compensation.compensation_id)).scalars()]
 
 
 @router.post("/compensations/{comp_id}/decide")
@@ -788,15 +837,17 @@ def compensation_events(comp_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ
         select(CompensationEvent).where(
             CompensationEvent.tenant_id == ctx.tenant,
             CompensationEvent.compensation_id == comp_id,
-        ).order_by(CompensationEvent.record_seq.asc())
+        ).order_by(CompensationEvent.record_seq.asc(), CompensationEvent.event_id)
     ).scalars()]
 
 
 # ------------------------------------------------------------------ issues
 @router.get("/issues")
 def issues(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
+    # Newest first, as before; issues created at the same instant are ordered by their unique issue_id, never by
+    # PostgreSQL's physical row order, which an UPDATE (a transition, an assignment) changes.
     return [to_dict(i) for i in ctx.db.execute(select(Issue).where(Issue.tenant_id == ctx.tenant)
-                                               .order_by(Issue.created_at.desc())).scalars()]
+                                               .order_by(Issue.created_at.desc(), Issue.issue_id)).scalars()]
 
 
 ISSUE_FLOW = {"OPEN": {"TRIAGED", "CANCELLED"}, "TRIAGED": {"IN_REMEDIATION", "CANCELLED"},
@@ -911,4 +962,7 @@ def accept_risk(body: RiskIn, ctx: Ctx = Depends(authorize("approve_exception", 
 
 @router.get("/risk-acceptances")
 def risks(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
-    return [to_dict(r) for r in ctx.db.execute(select(RiskAcceptance).where(RiskAcceptance.tenant_id == ctx.tenant)).scalars()]
+    # The same order as the sibling governance lists (/exceptions, /compensations): newest valid_from first, then ID.
+    return [to_dict(r) for r in ctx.db.execute(select(RiskAcceptance).where(RiskAcceptance.tenant_id == ctx.tenant)
+                                               .order_by(RiskAcceptance.valid_from.desc(),
+                                                         RiskAcceptance.risk_acceptance_id)).scalars()]
