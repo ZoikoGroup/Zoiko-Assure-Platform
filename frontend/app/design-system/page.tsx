@@ -238,7 +238,7 @@ function Typography({ hit }: { hit: Hit }) {
   const roles = TYPE_ROLES.filter((r) => hit(r.name, r.utility, r.usage, r.sample));
   return (
     <Panel title="Typography" icon={Type}
-      aside={<span className="type-caption text-fg-muted">Inter for interface text · JetBrains Mono for identifiers</span>}>
+      aside={<span className="type-caption text-fg-muted">IBM Plex Sans for interface text · IBM Plex Mono for identifiers</span>}>
       {roles.length === 0 ? <NoMatch /> : <ul className="divide-y divide-line">{roles.map((r) => <TypeRow key={r.utility} {...r} />)}</ul>}
     </Panel>
   );

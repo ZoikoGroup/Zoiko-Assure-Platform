@@ -4,7 +4,7 @@ import Link, { useLinkStatus } from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-import { Bell, Building, ChevronDown, Loader2, LogOut, Menu, Palette, PanelLeftClose, PanelLeftOpen, ShieldCheck, UserCog } from "lucide-react";
+import { Bell, Building, ChevronDown, Loader2, LogOut, Menu, Palette, PanelLeftClose, PanelLeftOpen, Search, ShieldCheck, UserCog } from "lucide-react";
 import { api } from "@/lib/api";
 import { personaOf, useAuth } from "@/lib/actor";
 import { roleLabel, rolesText, workContext } from "@/lib/roles";
@@ -14,7 +14,7 @@ import { PlatformFrame } from "./PlatformShell";
 import { ThemeToggle } from "./ThemeToggle";
 import {
   Breadcrumb, Drawer, Dropdown, DropdownItem, ErrorBox, Field, IconButton, Modal, PageTitleProvider, SearchInput, ToastProvider,
-  Tooltip, useAction, usePageTitle, useToast,
+  Tooltip, useAction, useEnterAnimation, usePageTitle, useToast,
 } from "./ui";
 
 const initials = (n?: string) => (n ?? "?").replace(/\(.*\)/, "").trim().split(/\s+/).slice(0, 2).map((x) => x[0]).join("").toUpperCase();
@@ -55,6 +55,9 @@ function Frame({ children }: { children: React.ReactNode }) {
   const [synthetic, setSynthetic] = useState(false);
   const [work, setWork] = useState<OpenWork | null>(null);
   const { title } = usePageTitle();
+  // A new page fades in place (no remount, so nothing about the page's own state changes).
+  const mainRef = useRef<HTMLElement>(null);
+  useEnterAnimation(mainRef, [path]);
 
   // Each screen gets its own document title (WCAG 2.4.2): the page heading, with its section for detail records, or the
   // navigation label until the heading is set. The root metadata title stays the fallback. Organisation users' screens
@@ -99,20 +102,21 @@ function Frame({ children }: { children: React.ReactNode }) {
     <SyntheticCtx.Provider value={setSynthetic}>
       <div className={`min-h-screen ${org ? "bg-slate-100 dark:bg-canvas" : ""}`}>
         <a href="#main" className="sr-only z-[80] rounded-md bg-navy-700 px-3 py-2 text-white focus:not-sr-only focus:fixed focus:left-3 focus:top-3">Skip to content</a>
+        {/* In the dark theme the sidebar takes the darkest navy, so it sits with the dark canvas instead of above it. */}
         <aside aria-label="Primary navigation" data-theme={org ? "light" : undefined}
-          className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r transition-[width] duration-200 lg:flex
-            ${org ? "border-navy-950 bg-navy-900" : "border-slate-200 bg-white"} ${collapsed ? "w-16" : org ? "w-[220px]" : "w-[232px]"}`}>
+          className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r transition-[width] duration-200 ease-standard lg:flex
+            ${org ? "border-navy-950 bg-navy-900 dark:border-white/[0.06] dark:bg-navy-950" : "border-slate-200 bg-white"} ${collapsed ? "w-16" : org ? "w-[240px]" : "w-[232px]"}`}>
           {org ? <OrgSidebar narrow={collapsed} path={path} onToggle={toggle} entities={work?.entities} />
             : <SidebarBody narrow={collapsed} path={path} onToggle={toggle} />}
         </aside>
-        <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[260px]">
-          <div data-theme={org ? "light" : undefined} className={`-m-4 flex h-[calc(100vh-49px)] flex-col ${org ? "bg-navy-900" : ""}`}>
+        <Drawer open={mobile} onClose={() => setMobile(false)} title="Navigation" side="left" width="max-w-[272px]">
+          <div data-theme={org ? "light" : undefined} className={`-m-4 flex h-[calc(100vh-49px)] flex-col ${org ? "bg-navy-900 dark:bg-navy-950" : ""}`}>
             {org ? <OrgSidebar narrow={false} path={path} entities={work?.entities} /> : <SidebarBody narrow={false} path={path} showContext />}
           </div>
         </Drawer>
-        <div className={`flex min-h-screen flex-col transition-[padding] duration-200 ${collapsed ? "lg:pl-16" : org ? "lg:pl-[220px]" : "lg:pl-[232px]"}`}>
+        <div className={`flex min-h-screen flex-col transition-[padding] duration-200 ease-standard ${collapsed ? "lg:pl-16" : org ? "lg:pl-[240px]" : "lg:pl-[232px]"}`}>
           <Header path={path} org={org} synthetic={synthetic} alerts={work} onMenu={() => setMobile(true)} />
-          <main id="main" key={me.actor_id} className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-5 sm:px-6">{children}</main>
+          <main ref={mainRef} id="main" key={me.actor_id} className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-6 sm:px-6 lg:px-8">{children}</main>
         </div>
       </div>
     </SyntheticCtx.Provider>
@@ -183,14 +187,15 @@ function WorkContext() {
 
 /** A sidebar item's icon, swapped for a spinner while that item's navigation is pending, so the click is acknowledged
  *  at once even when the next page takes a moment (prefetched routes in a production build skip the pending state). */
-export function NavIcon({ icon: Icon, active, dark = false }: { icon: LucideIcon; active: boolean; dark?: boolean }) {
+export function NavIcon({ icon: Icon, active, dark = false, activeClassName, idleClassName }:
+  { icon: LucideIcon; active: boolean; dark?: boolean; activeClassName?: string; idleClassName?: string }) {
   const { pending } = useLinkStatus();
   return pending ? (
     <>
-      <Loader2 size={16} aria-hidden className={`${dark ? "text-teal-300" : "text-navy-600"} motion-safe:animate-spin`} />
+      <Loader2 size={16} aria-hidden className={`shrink-0 ${activeClassName ?? (dark ? "text-teal-300" : "text-navy-600")} motion-safe:animate-spin`} />
       <span className="sr-only">Loading</span>
     </>
-  ) : <Icon size={16} aria-hidden className={active ? (dark ? "text-teal-300" : "text-navy-700") : (dark ? "text-slate-400" : "text-slate-500")} />;
+  ) : <Icon size={16} aria-hidden className={`shrink-0 ${active ? activeClassName ?? (dark ? "text-teal-300" : "text-navy-700") : idleClassName ?? (dark ? "text-slate-400" : "text-slate-500")}`} />;
 }
 
 /** The organisation sidebar's labels have no icons, so a pending navigation shows a spinner after the label instead. */
@@ -209,9 +214,9 @@ function AccountContext() {
   const { me } = useAuth();
   const c = workContext(me);
   return (
-    <div className="border-b border-slate-100 px-3 py-2 text-[12px]">
-      <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{c.kind === "organisation" ? "Member of organisation" : c.label}</div>
-      <div className="font-medium text-slate-800">{c.name}</div>
+    <div className="border-b border-slate-200 px-3 py-2.5 text-[12px]">
+      <div className="text-[11px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-500">{c.kind === "organisation" ? "Member of organisation" : c.label}</div>
+      <div className="mt-0.5 font-medium leading-5 text-slate-800">{c.name}</div>
       {c.kind !== "organisation" && <div className="text-[11px] text-slate-500">Not a member of any customer organisation</div>}
     </div>
   );
@@ -283,6 +288,8 @@ function SidebarBody({ narrow, path, onToggle, showContext }: { narrow: boolean;
 }
 
 export const ORG_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300";
+/** Focus ring on the organisation sidebar's navy: white, as the sidebar's text is (ORG_FOCUS stays the Super Admin's). */
+const ORG_NAV_FOCUS = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/75";
 
 /** The Organization Workspace sidebar: dark navy, grouped as orgNav (components/nav.ts). Every destination is an entry
  *  of its own; screens that were sub-entries are tabs of their consolidated page. The entry a page belongs to (record
@@ -299,62 +306,74 @@ function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; pat
   const scopeTitle = `Organization ${me?.tenant_name ?? ""}. The server authorizes every request against your roles and this organization's boundary; ${
     unreadable ? "your roles do not include reading its legal entities." : scope ? `it returned ${entities} legal ${entities === 1 ? "entity" : "entities"}.` : "entities are loading."}`;
 
+  // Every entry carries its icon; collapsed, the icon alone with the label as a tooltip. The open entry is a lighter
+  // row with white text and a slim brand-orange marker on the sidebar's edge (the brand's controlled accent).
   const link = (href: string, label: string, icon: LucideIcon) => {
     const here = href === current;
     const el = (
       <Link href={href} aria-current={here ? "page" : undefined} aria-label={narrow ? label : undefined}
-        className={`flex items-center rounded-md transition-colors ${ORG_FOCUS} ${narrow ? "h-9 w-10 justify-center" : "h-9 gap-2 px-3 text-[14px]"}
-          ${here ? "bg-teal-400/15 font-medium text-teal-300" : "text-slate-200 hover:bg-white/[0.06] hover:text-white"}`}>
-        {narrow ? <NavIcon icon={icon} active={here} dark /> : <><span className="truncate">{label}</span><NavPending /></>}
+        className={`group relative flex items-center rounded-md transition-colors duration-150 ${ORG_NAV_FOCUS} ${narrow ? "h-9 w-10 justify-center" : "h-9 gap-3 px-3 text-[14px] leading-5"}
+          ${here ? "bg-white/[0.09] font-medium text-white" : "text-slate-300 hover:bg-white/[0.05] hover:text-white"}`}>
+        {here && <span aria-hidden className="absolute -left-3 inset-y-1.5 w-[3px] rounded-r-full bg-brand-400" />}
+        <NavIcon icon={icon} active={here} dark activeClassName="text-white" idleClassName="text-slate-400 transition-colors duration-150 group-hover:text-slate-200" />
+        {!narrow && <span className="za-fade-in truncate">{label}</span>}
       </Link>
     );
     return narrow ? <Tooltip content={label} side="right">{el}</Tooltip> : el;
   };
+  const toggleButton = onToggle && (
+    <button type="button" onClick={onToggle} aria-label={narrow ? "Expand sidebar" : "Collapse sidebar"} title={narrow ? "Expand sidebar" : "Collapse sidebar"}
+      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors duration-150 hover:bg-white/10 hover:text-white ${ORG_NAV_FOCUS}`}>
+      {narrow ? <PanelLeftOpen size={16} aria-hidden /> : <PanelLeftClose size={16} aria-hidden />}
+    </button>
+  );
 
   return (
     <>
-      <div className={`shrink-0 ${narrow ? "flex flex-col items-center gap-2 pt-4" : "px-[18px] pt-6"}`}>
-        <div className={narrow ? "contents" : "flex items-start justify-between gap-2"}>
-          <Link href="/" aria-label="Overview" className={`rounded ${ORG_FOCUS}`}><Logo mark={narrow} width={110} onDark /></Link>
-          {onToggle && (
-            <button type="button" onClick={onToggle} aria-label={narrow ? "Expand sidebar" : "Collapse sidebar"} title={narrow ? "Expand sidebar" : "Collapse sidebar"}
-              className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-white ${narrow ? "" : "-mr-2 -mt-1"} ${ORG_FOCUS}`}>
-              {narrow ? <PanelLeftOpen size={16} aria-hidden /> : <PanelLeftClose size={16} aria-hidden />}
-            </button>
-          )}
+      {narrow ? (
+        <div className="flex shrink-0 flex-col items-center gap-2 pb-1 pt-4">
+          <Link href="/" aria-label="Overview" className={`rounded ${ORG_NAV_FOCUS}`}><Logo mark width={110} onDark /></Link>
+          {toggleButton}
         </div>
-        {!narrow && (
-          <div className="mt-3">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.04em] text-slate-200">Organization workspace</div>
-            <div className="mt-1.5 text-[9px] font-medium uppercase tracking-[0.08em] text-slate-400">Governance • Assurance</div>
+      ) : (
+        <div className="shrink-0 px-5 pb-1">
+          <div className="flex h-16 items-center justify-between gap-2">
+            <Link href="/" aria-label="Overview" className={`rounded ${ORG_NAV_FOCUS}`}><Logo width={110} onDark /></Link>
+            <span className="-mr-2">{toggleButton}</span>
           </div>
-        )}
-      </div>
+          <p className="za-fade-in -mt-1 text-[12px] font-medium leading-4 text-slate-400">Organization workspace</p>
+        </div>
+      )}
 
-      <nav ref={navRef} className={`flex-1 overflow-y-auto overflow-x-hidden pb-4 ${narrow ? "no-scrollbar px-3 pt-2" : "scroll-thin px-[11px] pt-3"}`}>
+      <nav ref={navRef} className={`flex-1 overflow-y-auto overflow-x-hidden px-3 pb-4 ${narrow ? "no-scrollbar pt-2" : "scroll-thin pt-1"}`}>
         {orgNav(me?.permissions).map((g, gi) => {
           const headingId = `org-nav-group-${gi}`;
           return (
-            <div key={g.group} role="group" aria-labelledby={narrow ? undefined : headingId} aria-label={narrow ? g.group : undefined} className={narrow ? "" : "pt-6 first:pt-3"}>
-              {narrow ? (gi > 0 && <div className="mx-1 my-2 border-t border-white/10" />) : (
-                <div id={headingId} className="pb-2 text-[11px] font-semibold uppercase leading-4 tracking-widest text-slate-400">{g.group}</div>
+            <div key={g.group} role="group" aria-labelledby={narrow ? undefined : headingId} aria-label={narrow ? g.group : undefined} className={narrow ? "" : "pt-5"}>
+              {narrow ? (gi > 0 && <div className="mx-1 my-2.5 border-t border-white/10" />) : (
+                <div id={headingId} className="za-fade-in px-3 pb-1.5 text-[11px] font-semibold uppercase leading-4 tracking-[0.08em] text-slate-400">{g.group}</div>
               )}
-              {g.items.map((item) => <div key={item.href} className="mb-px">{link(item.href, item.label, item.icon)}</div>)}
+              <div className="space-y-0.5">
+                {g.items.map((item) => <div key={item.href}>{link(item.href, item.label, item.icon)}</div>)}
+              </div>
             </div>
           );
         })}
       </nav>
 
-      <div className={`shrink-0 border-t border-white/10 ${narrow ? "flex justify-center py-3" : "px-[18px] py-3.5"}`}>
+      <div className={`shrink-0 border-t border-white/10 ${narrow ? "flex justify-center py-3" : "px-3 py-3"}`}>
         {narrow ? (
-          <span title={scopeTitle} className="flex h-8 w-8 items-center justify-center rounded-md bg-white/[0.06] text-slate-300">
+          <span title={scopeTitle} className="flex h-9 w-9 items-center justify-center rounded-md bg-white/[0.06] text-slate-300">
             <Building size={15} aria-hidden /><span className="sr-only">{scopeTitle}</span>
           </span>
         ) : (
-          <div title={scopeTitle} className="min-w-0">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">Entity scope</div>
-            <div className="mt-1 truncate text-[12px] font-medium text-slate-100">{me?.tenant_name}</div>
-            <div className="mt-0.5 text-[12px] text-slate-300">{scope ?? "Checking entity scope…"}</div>
+          <div title={scopeTitle} className="za-fade-in flex min-w-0 items-start gap-3 px-2 py-1">
+            <span aria-hidden className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-white/[0.07] text-slate-300"><Building size={15} /></span>
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-400">Entity scope</div>
+              <div className="mt-0.5 break-words text-[13px] font-medium leading-5 text-slate-100">{me?.tenant_name}</div>
+              <div className="text-[12px] leading-4 text-slate-400">{scope ?? "Checking entity scope…"}</div>
+            </div>
           </div>
         )}
       </div>
@@ -362,19 +381,19 @@ function OrgSidebar({ narrow, path, onToggle, entities }: { narrow: boolean; pat
   );
 }
 
-/** Organisation header breadcrumb ("ZOIKO ASSURE / ORGANIZATION"), also used by the Super Admin header. Below xl only
+/** Organisation header breadcrumb ("Zoiko Assure / Organization"), also used by the Super Admin header. Below xl only
  *  the current page is shown. */
 export function OrgBreadcrumb({ items }: { items: { label: string; href?: string }[] }) {
   return (
     <nav aria-label="Breadcrumb" className="min-w-0">
-      <ol className="flex min-w-0 items-center gap-1.5 text-[13px] font-semibold uppercase tracking-[0.03em] text-slate-600">
+      <ol className="flex min-w-0 items-center gap-2 text-[13px] leading-5 text-slate-500">
         {items.map((c, i) => {
           const last = i === items.length - 1;
           return (
-            <li key={`${c.label}-${i}`} className={`min-w-0 items-center gap-1.5 ${last ? "flex" : "hidden shrink-0 xl:flex"}`}>
-              {i > 0 && <span aria-hidden className={`text-slate-400 ${last ? "hidden xl:inline" : ""}`}>/</span>}
-              {last ? <span aria-current="page" className="truncate">{c.label}</span>
-                : c.href ? <Link href={c.href} className="rounded hover:text-navy-700">{c.label}</Link>
+            <li key={`${c.label}-${i}`} className={`min-w-0 items-center gap-2 ${last ? "flex" : "hidden shrink-0 xl:flex"}`}>
+              {i > 0 && <span aria-hidden className={`text-slate-300 ${last ? "hidden xl:inline" : ""}`}>/</span>}
+              {last ? <span aria-current="page" className="truncate font-medium text-slate-900">{c.label}</span>
+                : c.href ? <Link href={c.href} className="rounded transition-colors hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400">{c.label}</Link>
                 : <span>{c.label}</span>}
             </li>
           );
@@ -456,10 +475,10 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
     if (e.key === "Escape") setQ("");
   };
   const hitList = hits.length > 0 && (
-    <ul aria-label="Matching pages" className="absolute right-0 z-40 mt-1 w-72 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg">
+    <ul aria-label="Matching pages" className="za-pop-in absolute right-0 z-40 mt-2 w-80 origin-top-right overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
       {hits.map(({ href, label, group, tab }) => (
         <li key={href}>
-          <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-2 px-3 py-1.5 text-[13px] text-slate-700 hover:bg-slate-50">
+          <Link href={href} onClick={() => setQ("")} className="flex items-center justify-between gap-3 px-3 py-2 text-[13px] leading-5 text-slate-700 transition-colors duration-100 hover:bg-slate-50 hover:text-slate-900 focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400">
             {tab ? <span className="min-w-0">{label}<span className="text-slate-500"> › {tab}</span></span> : label}<span className="shrink-0 text-[11px] text-slate-500">{group}</span>
           </Link>
         </li>
@@ -468,7 +487,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
   );
   const alertItems = (close: () => void) => (
     <>
-      <div className="border-b border-slate-100 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Needs attention</div>
+      <div className="border-b border-slate-200 px-3 py-2.5 text-[11px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-500">Needs attention</div>
       {!me?.tenant_id ? <p className="px-3 py-3 text-[13px] text-slate-500">Notifications cover customer-organisation work, so Zoiko staff accounts have none.</p>
         : !alerts ? <p className="px-3 py-3 text-[13px] text-slate-500">No notifications.</p>
         : pending === 0 ? <p className="px-3 py-3 text-[13px] text-slate-500">Nothing open right now.</p> : (
@@ -479,13 +498,13 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
         )}
     </>
   );
-  const dot = pending > 0 && <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-brand-500" aria-hidden />;
+  const dot = pending > 0 && <span className={`absolute h-2 w-2 rounded-full bg-brand-500 ring-2 ring-white ${org ? "right-2 top-2" : "right-1 top-1"}`} aria-hidden />;
   const themeToggle = <ThemeToggle className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-slate-200 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400" />;
   const accountMenu = (
     <Dropdown label="Account menu" menuClassName="w-72"
-      buttonClassName="flex items-center gap-2 rounded-md py-1 pl-1 pr-1.5 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
+      buttonClassName="flex items-center gap-2 rounded-md py-1 pl-1 pr-1.5 transition-colors duration-150 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 aria-expanded:bg-slate-100"
       button={<>
-        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-navy-700 text-[11px] font-semibold text-white">{initials(me?.display_name)}</span>
+        <span className={`flex items-center justify-center rounded-full bg-navy-700 font-semibold text-white ${org ? "h-8 w-8 text-[12px]" : "h-7 w-7 text-[11px]"}`}>{initials(me?.display_name)}</span>
         <span className={`hidden text-left ${org ? "2xl:block" : "sm:block"}`}>
           <span className="block max-w-[160px] truncate text-[12px] font-medium text-slate-900">{shortName(me?.display_name)}</span>
           <span className="block max-w-[160px] truncate text-[11px] text-slate-500">{me?.roles[0] ? roleLabel(me.roles[0]) : ""}</span>
@@ -494,9 +513,9 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
       </>}>
       {(close) => (
         <>
-          <div className="border-b border-slate-100 px-3 py-2.5">
-            <div className="text-[13px] font-medium text-slate-900">{me?.display_name}</div>
-            <div className="text-[12px] text-slate-500">{me?.email}</div>
+          <div className="border-b border-slate-200 px-3 py-3">
+            <div className="text-[13px] font-medium leading-5 text-slate-900">{me?.display_name}</div>
+            <div className="text-[12px] leading-4 text-slate-500">{me?.email}</div>
             <ul className="mt-1.5 space-y-0.5" aria-label="Your roles">
               {me?.roles.map((r) => <li key={r} className="flex items-center justify-between gap-2 text-[12px] text-slate-700">{roleLabel(r)}<span className="mono text-[11px] text-slate-500">{r}</span></li>)}
             </ul>
@@ -504,7 +523,7 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
           <AccountContext />
           <DropdownItem icon={UserCog} href="/admin/users" onClick={close}>My access & permissions</DropdownItem>
           <DropdownItem icon={Palette} href="/design-system" onClick={close}>Design system &amp; UI kit</DropdownItem>
-          <div className="my-1 border-t border-slate-100" />
+          <div className="my-1 border-t border-slate-200" />
           <DropdownItem icon={LogOut} danger onClick={logout}>Sign out</DropdownItem>
         </>
       )}
@@ -521,30 +540,38 @@ function Header({ path, org, synthetic, alerts, onMenu }: { path: string; org: b
         Synthetic<span className="hidden lg:inline">&nbsp;demo data</span>
       </span>
     );
+    // Header controls share one size (36px) and one quiet treatment: icon, hover well, focus ring.
+    const control = "relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors duration-150 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 aria-expanded:bg-slate-100 aria-expanded:text-slate-900";
+    const kbdCls = "rounded border border-slate-200 bg-slate-50 px-1.5 font-sans text-[11px] font-medium leading-[18px] text-slate-500";
     return (
-      <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4 sm:px-6">
-        <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="lg:hidden" />
+      <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4 sm:px-6 lg:px-8">
+        <IconButton label="Open navigation" icon={Menu} onClick={onMenu} className="-ml-1 lg:hidden" />
         <div className="min-w-0 flex-1 overflow-x-clip">
           <div className="flex min-w-0 items-center gap-3"><OrgBreadcrumb items={orgCrumbs} />{badge("hidden md:inline-flex")}</div>
           <div className="mt-0.5 flex items-center gap-2 md:hidden">{badge("inline-flex")}</div>
         </div>
 
-        <div className="flex min-w-0 items-center gap-1 sm:gap-2">
-          <div className="relative hidden shrink-0 md:block">
+        <div className="flex min-w-0 items-center gap-1">
+          <div className="relative mr-1 hidden shrink-0 md:block">
+            <Search size={15} aria-hidden className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
             <input ref={searchRef} type="search" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onSearchKey}
               placeholder="Search authorized pages" aria-label="Search authorized pages" aria-keyshortcuts="/ Control+K Meta+K"
-              className={`w-52 rounded-md border border-transparent bg-transparent py-1.5 pl-2.5 pr-2.5 text-[14px] text-slate-900 transition-colors placeholder:text-slate-500 hover:border-slate-200 focus:border-navy-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-navy-100 xl:w-72 ${q ? "" : "xl:pr-16"}`} />
-            {!q && <kbd aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 font-sans text-[13px] text-slate-500 xl:block">/ {mac ? "⌘K" : "Ctrl K"}</kbd>}
+              className={`h-9 w-56 rounded-md border border-line-control bg-white pl-9 pr-3 text-[13px] text-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-[border-color,box-shadow] duration-150 placeholder:text-slate-500 hover:border-slate-500 focus:border-navy-500 focus:outline-none focus:ring-2 focus:ring-navy-100 xl:w-72 ${q ? "" : "xl:pr-[5.5rem]"}`} />
+            {!q && (
+              <span aria-hidden className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 items-center gap-1 xl:flex">
+                <kbd className={kbdCls}>/</kbd><kbd className={kbdCls}>{mac ? "⌘K" : "Ctrl K"}</kbd>
+              </span>
+            )}
             {hitList}
           </div>
 
           <Dropdown label={pending ? `Alerts, ${pending} open item(s)` : "Alerts"} menuClassName="w-72"
-            buttonClassName="relative inline-flex h-8 min-w-8 items-center justify-center rounded-md px-2 text-[14px] font-medium text-slate-800 hover:bg-slate-100 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
-            button={<><Bell size={16} aria-hidden className="sm:hidden" /><span className="hidden sm:inline">Alerts</span>{dot}</>}>
+            buttonClassName={control} button={<><Bell size={17} aria-hidden />{dot}</>}>
             {alertItems}
           </Dropdown>
 
-          {themeToggle}
+          <ThemeToggle className={control} iconSize={17} />
+          <span aria-hidden className="mx-1.5 hidden h-6 w-px bg-slate-200 sm:block" />
           {accountMenu}
         </div>
         {pw && <ChangePassword onClose={() => setPw(false)} />}

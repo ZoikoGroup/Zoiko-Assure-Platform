@@ -5,7 +5,7 @@ import { describeDetail, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { roleLabel, useCan } from "@/lib/roles";
 import Link from "next/link";
-import { A, Badge, Card, ErrorBox, LiveRegion, Notice, PageHeader, PermissionNote, Table } from "@/components/ui";
+import { A, Badge, Card, ErrorBox, LiveRegion, METRIC_GROUP, Notice, PageHeader, PermissionNote, Table } from "@/components/ui";
 import { AssertModal } from "@/components/AssertModal";
 
 /* "My Work & Approvals": the decisions waiting on someone in this organisation (determinations to adopt, exception
@@ -26,7 +26,7 @@ export default function FactRequests() {
       <PermissionNote perms={["manage_facts"]} actions={{ manage_facts: "Provide facts" }} />
       <ErrorBox error={error || dets.error || excs.error} />
       <LiveRegion>{msg && <div className="mb-4"><Notice tone="good">{msg}</Notice></div>}</LiveRegion>
-      <ul aria-label="Approvals waiting" className="mb-4 grid gap-3 sm:grid-cols-3">
+      <ul aria-label="Approvals waiting" className={`mb-6 ${METRIC_GROUP} sm:grid-cols-3`}>
         <WorkTile label="Determinations to adopt" href="/applicability" perm="attest" can={can}
           value={dets.data?.filter((d) => ["PROPOSED", "IN_REVIEW"].includes(d.state) && d.outcome !== "UNCERTAIN").length}
           hint="Attest or challenge applicability" failed={!!dets.error} />
@@ -74,12 +74,14 @@ function WorkTile({ label, value, hint, href, perm, can, failed }:
   { label: string; value?: number; hint: string; href: string; perm: string; can: (p: string) => boolean; failed: boolean }) {
   const mine = can(perm);
   return (
-    <li>
-      <Link href={href} className="card flex h-full flex-col p-3.5 transition-colors hover:border-navy-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400">
-        <span className="text-xs font-medium text-slate-600">{label}</span>
-        <span className="mt-1 text-[22px] font-semibold leading-7 tabular-nums text-slate-900">{failed ? "—" : value ?? "…"}</span>
-        <span className="mt-1 text-[11px] leading-4 text-slate-500">{failed ? "Unavailable" : hint}</span>
-        <span className={`mt-1.5 text-[11px] font-medium ${mine ? "text-emerald-700" : "text-slate-500"}`}>{mine ? "You can act on these" : "View only for your role"}</span>
+    <li className="bg-white">
+      <Link href={href} className="flex h-full flex-col px-4 py-3.5 transition-colors duration-150 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400 sm:px-5">
+        <span className="text-[13px] font-medium leading-5 text-slate-600">{label}</span>
+        <span className="mt-1.5 text-[24px] font-semibold leading-8 tracking-[-0.01em] tabular-nums text-slate-900">{failed ? "—" : value ?? "…"}</span>
+        <span className="mt-1 text-[12px] leading-4 text-slate-500">{failed ? "Unavailable" : hint}</span>
+        <span className={`mt-2 inline-flex items-center gap-1.5 text-[12px] font-medium leading-4 ${mine ? "text-emerald-700" : "text-slate-500"}`}>
+          <span aria-hidden className={`h-1.5 w-1.5 rounded-full ${mine ? "bg-emerald-500" : "bg-slate-400"}`} />{mine ? "You can act on these" : "View only for your role"}
+        </span>
       </Link>
     </li>
   );

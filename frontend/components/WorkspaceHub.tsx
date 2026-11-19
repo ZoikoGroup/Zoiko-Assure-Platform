@@ -7,7 +7,7 @@ import { Lock } from "lucide-react";
 import { personaOf, useAuth } from "@/lib/actor";
 import { rolesText } from "@/lib/roles";
 import { offeredTabs, openableScreens, orgEntry, orgTabOf, tabHref, type OrgNavItem, type OrgTab } from "./nav";
-import { EmptyState, PageHeader, PageSection } from "./ui";
+import { EmptyState, PageHeader, PageSection, TAB_CLASS } from "./ui";
 
 /* A consolidated organisation page (components/nav.ts, an organisation sidebar entry with `tabs`): one heading, a row of
    tabs, and the selected tab's screen. Each tab is an existing screen component, unchanged, so its reads, actions,
@@ -32,7 +32,7 @@ export function WorkspaceHub({ href, panels }: { href: string; panels: Record<st
       <PageHeader title={item.label} documentTitle={open ? `${tab.label} · ${item.label}` : item.label} />
       {offered.length > 0 && <HubTabs item={item} tabs={offered} current={open ? tab : undefined} />}
       {Panel ? (
-        <PageSection key={tab.id} label={tab.label}><Panel /></PageSection>
+        <div className="za-fade-in" key={tab.id}><PageSection label={tab.label}><Panel /></PageSection></div>
       ) : (
         <div className="card">
           <EmptyState icon={Lock} title={`${named && !open ? named.label : item.label} isn't available to your roles`}
@@ -55,15 +55,13 @@ function HubTabs({ item, tabs, current }: { item: OrgNavItem; tabs: OrgTab[]; cu
     if (el.offsetLeft < row.scrollLeft || el.offsetLeft + el.offsetWidth > row.scrollLeft + row.clientWidth) row.scrollLeft = el.offsetLeft - 16;
   }, [current]);
   return (
-    <nav aria-label={`${item.label} sections`} className="mb-4">
+    <nav aria-label={`${item.label} sections`} className="mb-6">
       <ul ref={list} className="scroll-thin -mx-4 flex gap-6 overflow-x-auto px-4 shadow-[inset_0_-1px_0_var(--color-slate-200)] sm:mx-0 sm:px-0">
         {tabs.map((t) => {
           const on = t === current;
           return (
             <li key={t.id} className="shrink-0">
-              <Link href={tabHref(item, t, tabs)} scroll={false} aria-current={on ? "page" : undefined}
-                className={`inline-flex h-10 items-center whitespace-nowrap border-b-2 text-[14px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400
-                  ${on ? "border-navy-700 text-navy-800" : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-800"}`}>
+              <Link href={tabHref(item, t, tabs)} scroll={false} aria-current={on ? "page" : undefined} className={TAB_CLASS(on, false)}>
                 {t.label}
               </Link>
             </li>

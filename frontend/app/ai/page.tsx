@@ -36,11 +36,14 @@ export default function AI() {
             <Card key={s.subject_id} title={s.display_name} subtitle={v ? `${kindLabel(v.asset_kind)} · ${v.version_label} · ${v.provider} / ${v.model} · ${v.environment}` : "No version"}
               actions={<><button className="btn-ghost" disabled={!can("manage_ai")} title={why("manage_ai")} onClick={() => setVer(s)}>New version</button><button className="btn-ghost" disabled={!can("grant_authority")} title={why("grant_authority")} onClick={() => setGrant(s)}>Grant authority</button>
                 <A href={`/entities/${s.subject_id}`}>Facts →</A></>}>
-              <div className="grid gap-4 xl:grid-cols-3">
+              {/* Tracks may shrink below their content (minmax(0, 1fr), min-w-0): long identifiers wrap and tables scroll
+                  inside their own box, so a phone never scrolls the page sideways. From xl the details and the grants
+                  share the width and the policy bundle takes the row below, so both tables have room for their columns. */}
+              <div className="grid grid-cols-1 gap-x-6 gap-y-5 xl:grid-cols-2 [&>*]:min-w-0">
                 <div>
-                  <div className="label">Purpose</div><p className="text-sm">{v?.purpose ?? "—"}</p>
+                  <div className="label">Purpose</div><p className="break-words text-sm">{v?.purpose ?? "—"}</p>
                   <div className="label mt-3">AgBOM</div>
-                  {v?.agbom?.length ? <ul className="mt-1 space-y-0.5">{v.agbom.map((c: any, i: number) => <li key={i} className="mono text-[11px]">{typeof c === "string" ? c : `${c.type ?? c.kind ?? "component"}: ${c.name ?? JSON.stringify(c)}${c.version ? `@${c.version}` : ""}`}</li>)}</ul> : <p className="text-xs text-slate-500">Empty</p>}
+                  {v?.agbom?.length ? <ul className="mt-1 space-y-0.5">{v.agbom.map((c: any, i: number) => <li key={i} className="mono break-all text-[11px]">{typeof c === "string" ? c : `${c.type ?? c.kind ?? "component"}: ${c.name ?? JSON.stringify(c)}${c.version ? `@${c.version}` : ""}`}</li>)}</ul> : <p className="text-xs text-slate-500">Empty</p>}
                   <div className="label mt-3">Applicability</div>
                   {s.evaluations.length > 0 && <AssetApplicability asset={s} />}
                   {s.obligations.length > 0 && <div className="label mt-3">Obligations</div>}
@@ -57,7 +60,7 @@ export default function AI() {
                     ))}
                   </Table>
                 </div>
-                <PolicyBundle asset={s} />
+                <div className="xl:col-span-2"><PolicyBundle asset={s} /></div>
               </div>
               {s.receipts.length > 0 && (
                 <details className="mt-4"><summary className="cursor-pointer text-sm font-medium text-navy-700">Decision receipts ({s.receipts.length})</summary>
