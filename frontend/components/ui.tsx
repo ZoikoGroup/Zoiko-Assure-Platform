@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import { cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { ButtonHTMLAttributes, InputHTMLAttributes, KeyboardEvent as ReactKeyboardEvent, ReactNode, RefObject, SelectHTMLAttributes } from "react";
+import type {
+  ButtonHTMLAttributes, DependencyList, HTMLAttributes, InputHTMLAttributes, KeyboardEvent as ReactKeyboardEvent, ReactNode, RefObject, SelectHTMLAttributes,
+} from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Building2, CheckCircle2, ChevronRight, CircleDashed, Flag, HelpCircle, Inbox, Info, Loader2,
@@ -69,9 +71,9 @@ export function StatusPill({ code, tone, label, title }: { code?: string | null;
   const unknown = resolved === "unknown";
   return (
     <span title={title ?? (unknown ? `Unrecognised code “${code}”: shown as received, because this version of the interface has no meaning for it.` : code ?? "")}
-      className={`inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ring-inset ${t.cls}`}>
-      <Icon size={12} aria-hidden className="shrink-0" />
-      <span className="mono tracking-tight">{label ?? code ?? "—"}</span>
+      className={`inline-flex h-5 items-center gap-1 whitespace-nowrap rounded-[5px] px-1.5 text-[11px] font-semibold leading-4 tracking-[0.02em] ring-1 ring-inset ${t.cls}`}>
+      <Icon size={12} aria-hidden className={`shrink-0 ${t.iconCls}`} />
+      <span>{label ?? code ?? "—"}</span>
       {unknown && <span className="sr-only"> (unrecognised code)</span>}
     </span>
   );
@@ -153,7 +155,7 @@ export function Field({ label, htmlFor, hint, children, className = "" }: { labe
     <div className={className}>
       <label className="label" htmlFor={htmlFor}>{label}</label>
       {children}
-      {hint && <p id={htmlFor ? `${htmlFor}-hint` : undefined} className="mt-1 text-[11px] text-slate-500">{hint}</p>}
+      {hint && <p id={htmlFor ? `${htmlFor}-hint` : undefined} className="mt-1.5 text-[12px] leading-4 text-slate-500">{hint}</p>}
     </div>
   );
 }
@@ -216,38 +218,56 @@ export function PeriodSelector({ from, to, onChange, fromLabel = "Period from", 
 /* ================================================================ layout primitives */
 export function Card({ title, actions, children, className = "", subtitle, footer, bodyClassName = "p-4" }:
   { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; subtitle?: ReactNode; footer?: ReactNode; bodyClassName?: string }) {
+  // The default body is marked so that a table it holds can run from edge to edge of the card (app/globals.css).
   return (
     <section className={`card ${className}`}>
       {(title || actions) && (
-        <header className="flex flex-wrap items-start justify-between gap-2 border-b border-slate-200 px-4 py-3">
+        <header className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-slate-200 px-4 py-3.5">
           <div className="min-w-0">
-            {title && <h2 className="text-[13px] font-semibold text-slate-900">{title}</h2>}
-            {subtitle && <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>}
+            {title && <h2 className="text-[14px] font-semibold leading-5 text-slate-900">{title}</h2>}
+            {subtitle && <p className="mt-0.5 text-[13px] leading-5 text-slate-500">{subtitle}</p>}
           </div>
           {actions && <div className="flex flex-wrap items-center gap-2 text-[13px]">{actions}</div>}
         </header>
       )}
-      <div className={bodyClassName}>{children}</div>
-      {footer && <footer className="border-t border-slate-100 px-4 py-2.5 text-[11px] text-slate-500">{footer}</footer>}
+      <div className={bodyClassName} data-card-body={bodyClassName === "p-4" ? "" : undefined}>{children}</div>
+      {footer && <footer className="border-t border-slate-200 px-4 py-2.5 text-[12px] leading-5 text-slate-500">{footer}</footer>}
     </section>
+  );
+}
+
+/* Summary figures shown together sit in one strip divided by hairlines (MetricGroup) instead of a row of separate cards.
+   A MetricCard on its own keeps its card. The strip's columns are set by the caller (grid-cols-*); choose counts that
+   fill every row, since an empty cell would show the divider colour. */
+const MetricGroupCtx = createContext(false);
+export const METRIC_GROUP = "grid gap-px overflow-hidden rounded-xl border border-slate-200 bg-slate-200 shadow-[0_1px_3px_rgba(15,23,42,0.06)]";
+
+export function MetricGroup({ as: Tag = "div", className = "", children, ...rest }:
+  HTMLAttributes<HTMLElement> & { as?: "div" | "section" | "ul" }) {
+  return (
+    <Tag {...rest} className={`${METRIC_GROUP} ${className}`}>
+      <MetricGroupCtx.Provider value>{children}</MetricGroupCtx.Provider>
+    </Tag>
   );
 }
 
 export function MetricCard({ label, value, hint, code, tone, href }:
   { label: string; value: ReactNode; hint?: ReactNode; code?: string; tone?: Tone; href?: string }) {
+  const grouped = useContext(MetricGroupCtx);
   const show = code || tone;
   const { Icon, iconCls } = toneIcon(code, tone);
+  const surface = grouped ? "bg-white" : `card ${href ? "hover:border-slate-300 hover:shadow-[0_2px_8px_rgba(15,23,42,0.08)]" : ""}`;
   const body = (
-    <div className={`card flex h-full flex-col p-3.5 ${href ? "transition-colors hover:border-navy-300" : ""}`}>
+    <div className={`${surface} flex h-full flex-col px-4 py-3.5 ${href ? `transition-[background-color,border-color,box-shadow] duration-150 ${grouped ? "hover:bg-slate-50" : ""}` : ""}`}>
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-slate-600">{label}</span>
+        <span className="text-[13px] font-medium leading-5 text-slate-600">{label}</span>
         {show && <Icon size={15} aria-hidden className={iconCls} />}
       </div>
-      <div className="mt-1 text-[22px] font-semibold leading-7 tabular-nums text-slate-900">{value}</div>
-      {hint && <div className="mt-1 text-[11px] leading-4 text-slate-500">{hint}</div>}
+      <div className="mt-1.5 text-[24px] font-semibold leading-8 tracking-[-0.01em] tabular-nums text-slate-900">{value}</div>
+      {hint && <div className="mt-1 text-[12px] leading-4 text-slate-500">{hint}</div>}
     </div>
   );
-  return href ? <Link href={href} className="block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400">{body}</Link> : body;
+  return href ? <Link href={href} className={`block h-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 ${grouped ? "focus-visible:ring-inset" : "rounded-xl"}`}>{body}</Link> : body;
 }
 
 export function KV({ items, cols = 2 }: { items: [ReactNode, ReactNode][]; cols?: number }) {
@@ -255,8 +275,8 @@ export function KV({ items, cols = 2 }: { items: [ReactNode, ReactNode][]; cols?
     <dl className={`grid gap-x-6 gap-y-3 ${cols === 3 ? "sm:grid-cols-3" : cols === 4 ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-2"}`}>
       {items.map(([k, v], i) => (
         <div key={i} className="min-w-0">
-          <dt className="text-[11px] font-medium text-slate-500">{k}</dt>
-          <dd className="mt-0.5 break-words text-[13px] text-slate-900">{v ?? "—"}</dd>
+          <dt className="text-[12px] font-medium leading-4 text-slate-500">{k}</dt>
+          <dd className="mt-1 break-words text-[13px] leading-5 text-slate-900">{v ?? "—"}</dd>
         </div>
       ))}
     </dl>
@@ -313,11 +333,12 @@ export function PageHeader({ title, subtitle, actions, spec, kicker, help, docum
   const { setTitle } = usePageTitle();
   const page = section ? null : documentTitle ?? title;
   useEffect(() => { if (page === null) return; setTitle(page); return () => setTitle(""); }, [page, setTitle]);
+  // Text on the page canvas is slate-600 or darker: slate-500 on the organisation canvas (slate-100) is below 4.5:1.
   if (section) {
     return (subtitle || help || spec || actions) ? (
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          {subtitle && <p className="max-w-3xl text-[13px] leading-5 text-slate-500">{subtitle}</p>}
+          {subtitle && <p className="max-w-3xl text-[14px] leading-6 text-slate-600">{subtitle}</p>}
           {(help || spec) && <PageHelp spec={spec} label={`About ${section.label}`}>{help}</PageHelp>}
         </div>
         {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
@@ -325,15 +346,15 @@ export function PageHeader({ title, subtitle, actions, spec, kicker, help, docum
     ) : null;
   }
   return (
-    <div className="mb-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="mb-6">
+      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
         <div className="min-w-0">
-          {kicker && <div data-za="page-context" className="mb-1 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">{kicker}</div>}
-          <h1 className="text-xl font-semibold tracking-tight text-slate-900">{title}</h1>
-          {subtitle && <p className="mt-1 max-w-3xl text-[13px] leading-5 text-slate-500">{subtitle}</p>}
+          {kicker && <div data-za="page-context" className="mb-1.5 text-[12px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-600">{kicker}</div>}
+          <h1 className="text-[24px] font-semibold leading-8 tracking-[-0.015em] text-slate-900">{title}</h1>
+          {subtitle && <p className="mt-1 max-w-3xl text-[14px] leading-6 text-slate-600">{subtitle}</p>}
           {(help || spec) && <PageHelp spec={spec}>{help}</PageHelp>}
         </div>
-        {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+        {actions && <div className="flex flex-wrap items-center gap-2 sm:pt-0.5">{actions}</div>}
       </div>
     </div>
   );
@@ -342,12 +363,12 @@ export function PageHeader({ title, subtitle, actions, spec, kicker, help, docum
 /** "About this page": contextual explanation kept one click away instead of in front of the working area. */
 export function PageHelp({ children, spec, label = "About this page" }: { children?: ReactNode; spec?: string; label?: string }) {
   return (
-    <details className="group mt-1.5 max-w-3xl text-[13px]">
-      <summary className="inline-flex cursor-pointer list-none items-center gap-1 rounded text-[12px] font-medium text-navy-700 hover:text-navy-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 [&::-webkit-details-marker]:hidden">
-        <HelpCircle size={13} aria-hidden />{label}
-        <ChevronRight size={12} aria-hidden className="transition-transform group-open:rotate-90" />
+    <details className="group mt-2 max-w-3xl text-[13px]">
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1.5 rounded text-[13px] font-medium text-navy-700 transition-colors hover:text-navy-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 [&::-webkit-details-marker]:hidden">
+        <HelpCircle size={14} aria-hidden />{label}
+        <ChevronRight size={13} aria-hidden className="transition-transform duration-150 group-open:rotate-90" />
       </summary>
-      <div className="mt-1.5 space-y-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 leading-5 text-slate-600">
+      <div className="za-pop-in mt-2 space-y-1.5 rounded-lg border border-slate-200 bg-white px-4 py-3 leading-5 text-slate-600 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         {children}
         {spec && <p className="text-[11px] text-slate-500">Specification: <span className="mono">{spec}</span></p>}
       </div>
@@ -374,16 +395,22 @@ export function useRovingTabs(tabs: string[], onChange: (t: string) => void, isD
   return { refs, onKeyDown };
 }
 
+/** Underline tabs, shared with the consolidated pages' tabs (components/WorkspaceHub.tsx). `overlap`: the underline
+ *  sits on the tab list's own bottom border (a list whose baseline is drawn inside it passes false). */
+export const TAB_CLASS = (on: boolean, overlap = true) =>
+  `${overlap ? "-mb-px " : ""}inline-flex h-10 items-center whitespace-nowrap border-b-2 text-[14px] font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400 ${
+    on ? "border-navy-700 text-navy-800" : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-800"}`;
+
 export function Tabs({ id, tabs, value, onChange }: { id?: string; tabs: string[]; value: string; onChange: (t: string) => void }) {
   const { refs, onKeyDown } = useRovingTabs(tabs, onChange);
   return (
-    <div role="tablist" className="mb-4 flex flex-wrap gap-4 border-b border-slate-200">
+    <div role="tablist" className="mb-5 flex flex-wrap gap-x-6 border-b border-slate-200">
       {tabs.map((t, i) => (
         <button key={t} ref={(el) => { refs.current[i] = el; }} role="tab" type="button" aria-selected={value === t} tabIndex={value === t ? 0 : -1}
           id={id ? tabId(id, t) : undefined} aria-controls={id && value === t ? `${id}-panel` : undefined}
           onClick={() => onChange(t)}
           onKeyDown={onKeyDown(i)}
-          className={`-mb-px border-b-2 pb-2 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 ${value === t ? "border-navy-700 text-navy-800" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
+          className={TAB_CLASS(value === t)}>
           {t}
         </button>
       ))}
@@ -391,9 +418,25 @@ export function Tabs({ id, tabs, value, onChange }: { id?: string; tabs: string[
   );
 }
 
+/** A short fade on `ref`'s element when `deps` change after the first render: content replaced in place (another tab,
+ *  another page) is acknowledged without remounting anything, so no component state is lost. Opacity only, so the
+ *  element never becomes a containing block for fixed-position dialogs inside it. Off for reduced motion. */
+export function useEnterAnimation(ref: RefObject<HTMLElement | null>, deps: DependencyList) {
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }
+    const el = ref.current;
+    if (!el?.animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    el.animate([{ opacity: 0.25 }, { opacity: 1 }], { duration: 180, easing: "cubic-bezier(0.2, 0, 0, 1)" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+}
+
 /** The selected tab's content. Focusable so keyboard users can move from the tab list straight into the panel. */
 export function TabPanel({ id, value, children }: { id: string; value: string; children: ReactNode }) {
-  return <div role="tabpanel" id={`${id}-panel`} aria-labelledby={tabId(id, value)} tabIndex={0}>{children}</div>;
+  const panel = useRef<HTMLDivElement>(null);
+  useEnterAnimation(panel, [value]);
+  return <div ref={panel} role="tabpanel" id={`${id}-panel`} aria-labelledby={tabId(id, value)} tabIndex={0}>{children}</div>;
 }
 
 /* ================================================================ tables */
@@ -402,10 +445,10 @@ export function TabPanel({ id, value, children }: { id: string; value: string; c
 export function Table({ head, children, empty, loading, emptyTitle = "Nothing here yet", emptyDescription, emptyAction }:
   { head: string[]; children: ReactNode; empty?: boolean; loading?: boolean; emptyTitle?: string; emptyDescription?: ReactNode; emptyAction?: ReactNode }) {
   return (
-    <div className="scroll-thin overflow-x-auto">
+    <div data-za-table className="scroll-thin overflow-x-auto">
       <table className="min-w-full border-separate border-spacing-0">
         <thead><tr>{head.map((h, i) => <th key={`${h}-${i}`} className="th border-b border-slate-200">{h}</th>)}</tr></thead>
-        <tbody className="[&>tr:hover]:bg-slate-50/70 [&>tr>td]:border-b [&>tr>td]:border-slate-100">{children}</tbody>
+        <tbody className="[&>tr]:transition-colors [&>tr]:duration-150 [&>tr:hover]:bg-slate-50/70 [&>tr>td]:border-b [&>tr>td]:border-slate-100">{children}</tbody>
       </table>
       {loading ? <LoadingSkeleton rows={4} /> : empty && <EmptyState title={emptyTitle} description={emptyDescription} action={emptyAction} compact />}
     </div>
@@ -437,7 +480,7 @@ export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
   { columns: Column<T>[]; rows: T[]; rowKey: (r: T) => string; empty?: ReactNode; defaultSort?: SortState }) {
   const { sorted, sort, toggle } = useSortedRows(rows, columns, defaultSort);
   return (
-    <div className="scroll-thin overflow-x-auto">
+    <div data-za-table className="scroll-thin overflow-x-auto">
       <table className="min-w-full border-separate border-spacing-0">
         <thead>
           <tr>
@@ -447,7 +490,7 @@ export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
                 <th key={c.key} scope="col" className={`th border-b border-slate-200 ${c.className ?? ""}`}
                   aria-sort={active ? (sort!.dir === "asc" ? "ascending" : "descending") : undefined}>
                   {c.sortValue ? (
-                    <button type="button" className="inline-flex items-center gap-1 uppercase hover:text-slate-800"
+                    <button type="button" className="inline-flex items-center gap-1 rounded uppercase tracking-[inherit] transition-colors hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400"
                       onClick={() => toggle(c.key)}>
                       {c.header}
                       {active ? (sort!.dir === "asc" ? <ArrowUp size={11} aria-hidden /> : <ArrowDown size={11} aria-hidden />) : <ArrowUpDown size={11} aria-hidden className="opacity-40" />}
@@ -460,7 +503,7 @@ export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
         </thead>
         <tbody>
           {sorted.map((r) => (
-            <tr key={rowKey(r)} className="hover:bg-slate-50/70">
+            <tr key={rowKey(r)} className="transition-colors duration-150 hover:bg-slate-50/70">
               {columns.map((c) => <td key={c.key} className={`td border-b border-slate-100 ${c.className ?? ""}`}>{c.render(r)}</td>)}
             </tr>
           ))}
@@ -475,11 +518,13 @@ export function DataTable<T>({ columns, rows, rowKey, empty, defaultSort }:
 export function EmptyState({ title, description, icon: Icon = Inbox, action, compact }:
   { title: string; description?: ReactNode; icon?: LucideIcon; action?: ReactNode; compact?: boolean }) {
   return (
-    <div className={`flex flex-col items-center justify-center text-center ${compact ? "px-4 py-6" : "px-6 py-12"}`}>
-      <Icon size={compact ? 18 : 22} aria-hidden className="text-slate-400" />
-      <p className="mt-2 text-[13px] font-medium text-slate-700">{title}</p>
-      {description && <p className="mt-1 max-w-sm text-xs text-slate-500">{description}</p>}
-      {action && <div className="mt-3">{action}</div>}
+    <div className={`flex flex-col items-center justify-center text-center ${compact ? "px-4 py-8" : "px-6 py-14"}`}>
+      <span aria-hidden className={`flex items-center justify-center rounded-full bg-slate-100 text-slate-500 ${compact ? "h-9 w-9" : "h-11 w-11"}`}>
+        <Icon size={compact ? 17 : 20} />
+      </span>
+      <p className="mt-3 text-[14px] font-medium leading-5 text-slate-800">{title}</p>
+      {description && <p className="mt-1 max-w-md text-[13px] leading-5 text-slate-500">{description}</p>}
+      {action && <div className="mt-4">{action}</div>}
     </div>
   );
 }
@@ -500,9 +545,9 @@ export function Loading({ show }: { show: boolean }) {
 export function ErrorState({ error, title = "Something went wrong" }: { error: unknown; title?: string }) {
   if (!error) return null;
   return (
-    <div role="alert" className="mb-3 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[13px] text-red-800">
-      <AlertCircle size={15} aria-hidden className="mt-0.5 shrink-0 text-red-600" />
-      <div>
+    <div role="alert" className="mb-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-[13px] leading-5 text-red-800">
+      <AlertCircle size={16} aria-hidden className="mt-0.5 shrink-0 text-red-600" />
+      <div className="min-w-0">
         <span className="sr-only">{title}: </span>{errText(error)}
         {error instanceof ApiError && error.reference && (
           <div className="mt-0.5 text-[12px]">{error.reference.label}: <span className="mono select-all break-all">{error.reference.value}</span></div>
@@ -532,8 +577,8 @@ export function PermissionNote({ perms, actions, className = "mb-4" }:
   const missing = perms.map((p) => (Array.isArray(p) ? p : [p])).filter((any) => !any.some((p) => me?.permissions?.includes(p)));
   if (!me || !missing.length) return null;
   return (
-    <div role="note" className={`${className} flex items-start gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[12px] leading-5 text-slate-700`}>
-      <Lock size={14} aria-hidden className="mt-0.5 shrink-0 text-slate-500" />
+    <div role="note" className={`${className} flex items-start gap-2.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-[13px] leading-5 text-slate-700`}>
+      <Lock size={15} aria-hidden className="mt-0.5 shrink-0 text-slate-500" />
       <div className="min-w-0">
         <span className="font-medium text-slate-800">Some actions here aren&apos;t available to your role</span> ({rolesText(me) || "none"}).
         <ul className="mt-0.5 space-y-0.5">
@@ -553,12 +598,14 @@ export function PermissionNote({ perms, actions, className = "mb-4" }:
   );
 }
 
+/** Status colours match the badges: info is navy, warning amber, success emerald (errors are ErrorState's red). */
 export function Notice({ children, tone = "info" }: { children: ReactNode; tone?: "info" | "warn" | "good" }) {
-  const c = tone === "warn" ? "border-amber-200 bg-amber-50 text-amber-900" : tone === "good" ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-slate-200 bg-slate-50 text-slate-700";
+  const c = tone === "warn" ? "border-amber-200 bg-amber-50 text-amber-900" : tone === "good" ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-navy-100 bg-navy-50 text-navy-950";
+  const ic = tone === "warn" ? "text-amber-600" : tone === "good" ? "text-emerald-600" : "text-navy-600";
   const Icon = tone === "warn" ? AlertCircle : tone === "good" ? CheckCircle2 : Info;
   return (
-    <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-[13px] ${c}`}>
-      <Icon size={15} aria-hidden className="mt-0.5 shrink-0 opacity-80" />
+    <div className={`flex items-start gap-2.5 rounded-lg border px-3.5 py-2.5 text-[13px] leading-5 ${c}`}>
+      <Icon size={16} aria-hidden className={`mt-0.5 shrink-0 ${ic}`} />
       <div className="min-w-0">{children}</div>
     </div>
   );
@@ -607,7 +654,7 @@ export function A({ href, children }: { href: string; children: ReactNode }) {
  *  bubble is padding, so the pointer can move onto it without it closing. It never takes focus. `bubbleClassName`
  *  replaces the bubble's look (the design-system Tooltip themes it); `describe` points a single child element at the
  *  bubble with aria-describedby, for triggers whose name does not already say what the tooltip says. */
-export function Tooltip({ content, children, side = "top", bubbleClassName = "whitespace-nowrap rounded bg-slate-900 px-2 py-1 text-[11px] font-medium text-white shadow", describe = false }:
+export function Tooltip({ content, children, side = "top", bubbleClassName = "whitespace-nowrap rounded-md bg-slate-900 px-2 py-1 text-[12px] font-medium leading-4 text-white shadow-md", describe = false }:
   { content: ReactNode; children: ReactNode; side?: "top" | "right" | "bottom"; bubbleClassName?: string; describe?: boolean }) {
   const [open, setOpen] = useState(false);
   const tipId = useId();
@@ -624,7 +671,7 @@ export function Tooltip({ content, children, side = "top", bubbleClassName = "wh
   return (
     <span className="relative inline-flex" onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)} onFocus={() => setOpen(true)} onBlur={() => setOpen(false)}>
       {trigger}
-      <span role="tooltip" id={tipId} className={`absolute z-50 ${open ? "block" : "hidden"} ${pos}`}>
+      <span role="tooltip" id={tipId} className={`absolute z-50 ${open ? "za-fade-in block" : "hidden"} ${pos}`}>
         <span className={`block ${bubbleClassName}`}>{content}</span>
       </span>
     </span>
@@ -677,14 +724,14 @@ export function Modal({ open, onClose, title, children, size = "md" }: { open: b
   if (!open) return null;
   const w = size === "sm" ? "max-w-md" : size === "lg" ? "max-w-4xl" : "max-w-2xl";
   return (
-    <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4 pt-[10vh] dark:bg-scrim" onMouseDown={onClose}>
+    <div className="za-overlay-in fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4 pt-[10vh] dark:bg-scrim" onMouseDown={onClose}>
       <div ref={panel} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
-        className={`w-full ${w} rounded-lg border border-slate-200 bg-white shadow-xl focus:outline-none`} onMouseDown={(e) => e.stopPropagation()}>
-        <header className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-          <h3 id={titleId} className="text-sm font-semibold text-slate-900">{title}</h3>
+        className={`za-dialog-in w-full ${w} rounded-xl border border-slate-200 bg-white shadow-xl focus:outline-none`} onMouseDown={(e) => e.stopPropagation()}>
+        <header className="flex items-center justify-between gap-3 border-b border-slate-200 py-3.5 pl-5 pr-3">
+          <h3 id={titleId} className="text-[15px] font-semibold leading-6 text-slate-900">{title}</h3>
           <IconButton label="Close" icon={X} onClick={onClose} />
         </header>
-        <div className="p-4" data-dialog-body>{children}</div>
+        <div className="p-5" data-dialog-body>{children}</div>
       </div>
     </div>
   );
@@ -697,11 +744,11 @@ export function Drawer({ open, onClose, title, children, side = "right", width =
   useDialog(open, onClose, panel);
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/30 dark:bg-scrim" onMouseDown={onClose}>
+    <div className="za-overlay-in fixed inset-0 z-50 bg-slate-900/30 dark:bg-scrim" onMouseDown={onClose}>
       <div ref={panel} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onMouseDown={(e) => e.stopPropagation()}
-        className={`absolute inset-y-0 ${side === "left" ? "left-0 border-r" : "right-0 border-l"} flex w-full ${width} flex-col border-slate-200 bg-white shadow-xl focus:outline-none`}>
+        className={`absolute inset-y-0 ${side === "left" ? "za-drawer-left left-0 border-r" : "za-drawer-right right-0 border-l"} flex w-full ${width} flex-col border-slate-200 bg-white shadow-xl focus:outline-none`}>
         <header className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3">
-          <h3 id={titleId} className="text-sm font-semibold text-slate-900">{title}</h3>
+          <h3 id={titleId} className="text-[15px] font-semibold leading-5 text-slate-900">{title}</h3>
           <IconButton label="Close" icon={X} onClick={onClose} />
         </header>
         <div className="scroll-thin flex-1 overflow-y-auto p-4" data-dialog-body>{children}</div>
@@ -767,7 +814,7 @@ export function Dropdown({ button, label, children, align = "right", buttonClass
     <div ref={root} className="relative">
       <button ref={btn} type="button" aria-label={label} aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen(!open)} className={buttonClassName}>{button}</button>
       {open && (
-        <div id={panelId} className={`absolute z-40 mt-1.5 overflow-hidden rounded-md border border-slate-200 bg-white py-1 shadow-lg ${align === "right" ? "right-0" : "left-0"} ${menuClassName}`}>
+        <div id={panelId} className={`za-pop-in absolute z-40 mt-2 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg ${align === "right" ? "right-0 origin-top-right" : "left-0 origin-top-left"} ${menuClassName}`}>
           {typeof children === "function" ? children(close) : children}
         </div>
       )}
@@ -776,8 +823,8 @@ export function Dropdown({ button, label, children, align = "right", buttonClass
 }
 
 export function DropdownItem({ icon: Icon, children, onClick, href, danger }: { icon?: LucideIcon; children: ReactNode; onClick?: () => void; href?: string; danger?: boolean }) {
-  const cls = `flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400 ${danger ? "text-red-700 hover:bg-red-50" : "text-slate-700 hover:bg-slate-50"}`;
-  const inner = <>{Icon && <Icon size={15} aria-hidden className={danger ? "" : "text-slate-400"} />}{children}</>;
+  const cls = `flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] leading-5 transition-colors duration-100 focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-navy-400 ${danger ? "text-red-700 hover:bg-red-50" : "text-slate-700 hover:bg-slate-50 hover:text-slate-900"}`;
+  const inner = <>{Icon && <Icon size={15} aria-hidden className={danger ? "" : "text-slate-500"} />}{children}</>;
   return href ? <Link href={href} onClick={onClick} className={cls}>{inner}</Link> : <button type="button" onClick={onClick} className={cls}>{inner}</button>;
 }
 
@@ -809,10 +856,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       <div aria-live="polite" className="fixed bottom-4 right-4 z-[70] flex w-80 flex-col gap-2">
         {items.map((t) => {
           const c = t.tone === "good" ? "border-emerald-200" : t.tone === "warn" ? "border-amber-200" : t.tone === "bad" ? "border-red-200" : "border-slate-200";
+          const ic = t.tone === "good" ? "text-emerald-600" : t.tone === "warn" ? "text-amber-600" : t.tone === "bad" ? "text-red-600" : "text-navy-600";
           const Icon = t.tone === "good" ? CheckCircle2 : t.tone === "bad" ? XCircle : t.tone === "warn" ? AlertCircle : Info;
           return (
-            <div key={t.id} className={`flex items-start gap-2 rounded-md border bg-white px-3 py-2.5 text-[13px] text-slate-800 shadow-lg ${c}`}>
-              <Icon size={15} aria-hidden className="mt-0.5 shrink-0 text-slate-500" />{t.text}
+            <div key={t.id} className={`za-toast-in flex items-start gap-2.5 rounded-lg border bg-white px-3.5 py-3 text-[13px] leading-5 text-slate-800 shadow-lg ${c}`}>
+              <Icon size={16} aria-hidden className={`mt-0.5 shrink-0 ${ic}`} />{t.text}
             </div>
           );
         })}

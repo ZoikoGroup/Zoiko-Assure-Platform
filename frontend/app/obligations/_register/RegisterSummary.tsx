@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { MetricCard } from "@/components/ui";
+import { MetricCard, MetricGroup } from "@/components/ui";
 import type { RegisterFigures } from "./model";
 
 /** What the cards can show: figures, a load still running, or a list that could not be read. A failed read is never
@@ -19,7 +19,7 @@ export function RegisterSummary({ status }: { status: SummaryStatus }) {
     : n;
   const hint = (text: string) => (status.kind === "unavailable" ? "Unavailable" : status.kind === "loading" ? "Loading…" : text);
   return (
-    <section aria-label="Register summary" aria-busy={status.kind === "loading"} className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <MetricGroup as="section" aria-label="Register summary" aria-busy={status.kind === "loading"} className="mb-5 grid-cols-2 lg:grid-cols-4">
       <MetricCard label="Total obligations" value={value(f?.total)}
         hint={hint("Current records in this organisation's register")} />
       <MetricCard label="Adopted" code="ADOPTED" value={value(f?.adopted)}
@@ -28,6 +28,6 @@ export function RegisterSummary({ status }: { status: SummaryStatus }) {
         hint={hint("Latest frozen snapshot is REQUIRES_REVIEW")} />
       <MetricCard label="Approved exceptions" tone="exception" value={value(f?.approvedExceptions)}
         hint={hint(f ? (f.approvedExceptions == null ? "Not reported for every obligation" : `On ${plural(f.obligationsWithExceptions, "obligation")}; never change a state`) : "")} />
-    </section>
+    </MetricGroup>
   );
 }

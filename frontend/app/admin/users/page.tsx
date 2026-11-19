@@ -82,9 +82,9 @@ function Directory() {
         onSubmit={(e) => { e.preventDefault(); setQ(text.trim()); }}>
         <SearchInput aria-label="Name or email" placeholder="Name or email" maxLength={100} value={text} onChange={(e) => setText(e.target.value)}
           className="min-w-[220px] flex-1" />
-        <Select aria-label="Principal type" value={type} onChange={(e) => setType(e.target.value)} options={PRINCIPAL_TYPES} />
-        <Select aria-label="Role" value={role} onChange={(e) => setRole(e.target.value)}
-          options={[{ value: "", label: "Any role" }, ...ROLE_CODES.map((r) => ({ value: r, label: roleLabel(r) }))]} />
+        <div className="w-full sm:w-52"><Select aria-label="Principal type" value={type} onChange={(e) => setType(e.target.value)} options={PRINCIPAL_TYPES} /></div>
+        <div className="w-full sm:w-60"><Select aria-label="Role" value={role} onChange={(e) => setRole(e.target.value)}
+          options={[{ value: "", label: "Any role" }, ...ROLE_CODES.map((r) => ({ value: r, label: roleLabel(r) }))]} /></div>
         <button type="submit" className="btn-ghost">Search</button>
         {filtered && <button type="button" className="btn-ghost" onClick={() => { setText(""); setQ(""); setType(""); setRole(""); }}>Clear</button>}
       </form>

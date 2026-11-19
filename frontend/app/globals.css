@@ -34,12 +34,16 @@
   /* Page background. Light enough that slate-500 secondary text on it meets WCAG AA (4.55:1; #f6f7f9 gave 4.45:1). */
   --color-canvas: #f8fafc;
 
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* IBM Plex: one superfamily for interface text and for identifiers, codes and digests. */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Motion: one easing for every transition and entrance (decelerating, no overshoot). */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
 }
 
 html, body { background: var(--color-canvas); color: var(--za-app-fg); }
-body { font-family: var(--font-sans); font-size: 14px; -webkit-font-smoothing: antialiased; }
+body { font-family: var(--font-sans); font-size: 14px; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; }
 
 ::selection { background: var(--color-navy-100); }
 :focus-visible { outline: 2px solid var(--color-navy-500); outline-offset: 2px; }
@@ -49,24 +53,76 @@ body { font-family: var(--font-sans); font-size: 14px; -webkit-font-smoothing: a
 .no-scrollbar { scrollbar-width: none; }
 .no-scrollbar::-webkit-scrollbar { display: none; }
 
-/* Component primitives as v4 utilities, so single-purpose utilities (e.g. py-1, w-full) can still override them. */
-@utility card { @apply rounded-lg border border-slate-200 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)]; }
-@utility btn { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[13px] font-medium leading-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50; }
-@utility btn-primary { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[13px] font-medium leading-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 bg-navy-700 text-white hover:bg-navy-800; }
-@utility btn-accent { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[13px] font-medium leading-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 bg-brand-700 text-white hover:bg-brand-800; }
-@utility btn-ghost { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[13px] font-medium leading-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 hover:text-slate-900; }
-@utility btn-danger { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[13px] font-medium leading-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 border border-red-200 bg-white text-red-700 hover:bg-red-50; }
-@utility input { @apply w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-[13px] leading-5 text-slate-900 placeholder:text-slate-500 focus:border-navy-500 focus:outline-none focus:ring-2 focus:ring-navy-100 disabled:bg-slate-50 disabled:text-slate-500; }
-@utility label { @apply mb-1 block text-xs font-medium text-slate-600; }
-@utility th { @apply bg-slate-50 px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500; }
-@utility td { @apply px-3 py-2 align-top text-[13px] text-slate-800; }
+/* Component primitives as v4 utilities, so single-purpose utilities (e.g. py-1, w-full) can still override them.
+   Every button variant has a 1px border (transparent where it has no visible one), so primary, secondary and danger
+   buttons share one height (34px) and line up with form fields. */
+@utility card { @apply rounded-xl border border-slate-200 bg-white shadow-[0_1px_3px_rgba(15,23,42,0.06)]; }
+@utility btn { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-transparent px-3 py-1.5 text-[13px] font-medium leading-5 transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50; }
+@utility btn-primary { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-transparent px-3 py-1.5 text-[13px] font-medium leading-5 transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 bg-navy-700 text-white shadow-[0_1px_2px_rgba(15,23,42,0.12)] hover:bg-navy-800 active:bg-navy-900; }
+@utility btn-accent { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-transparent px-3 py-1.5 text-[13px] font-medium leading-5 transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 bg-brand-700 text-white shadow-[0_1px_2px_rgba(15,23,42,0.12)] hover:bg-brand-800; }
+@utility btn-ghost { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-3 py-1.5 text-[13px] font-medium leading-5 transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 border-slate-300 bg-white text-slate-700 shadow-[0_1px_2px_rgba(15,23,42,0.05)] hover:border-slate-400 hover:bg-slate-50 hover:text-slate-900; }
+@utility btn-danger { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-3 py-1.5 text-[13px] font-medium leading-5 transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-navy-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 border-red-200 bg-white text-red-700 shadow-[0_1px_2px_rgba(15,23,42,0.05)] hover:border-red-300 hover:bg-red-50; }
+/* Form controls: the boundary is --za-line-control (at least 3:1 against the surface, WCAG 1.4.11), as the design-system
+   controls draw it. A field marked aria-invalid shows it in its border too. Single selects get one drawn chevron in
+   place of each browser's own. */
+@utility input {
+  @apply w-full rounded-md border border-line-control bg-white px-2.5 py-1.5 text-[13px] leading-5 text-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-[border-color,box-shadow] duration-150 ease-standard placeholder:text-slate-500 hover:border-slate-500 focus:border-navy-500 focus:outline-none focus:ring-2 focus:ring-navy-100 disabled:bg-slate-50 disabled:text-slate-500 aria-[invalid=true]:border-red-600;
+  &:is(select):not([multiple]) {
+    appearance: none;
+    padding-right: 2rem;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23768292' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.5rem center;
+    background-size: 16px 16px;
+  }
+}
+@utility label { @apply mb-1.5 block text-[12px] font-medium leading-4 text-slate-700; }
+/* Table cells. The outer columns are indented as far as card content (1rem), so a table that fills a card lines up
+   with the card's heading. */
+@utility th {
+  @apply bg-slate-50 px-3 py-2.5 text-left text-[11px] font-semibold uppercase leading-4 tracking-[0.06em] text-slate-500;
+  &:first-child { padding-left: 1rem; }
+  &:last-child { padding-right: 1rem; }
+}
+@utility td {
+  @apply px-3 py-2.5 align-top text-[13px] leading-5 text-slate-800;
+  &:first-child { padding-left: 1rem; }
+  &:last-child { padding-right: 1rem; }
+}
 @utility mono { font-family: var(--font-mono); }
+
+/* A table that a card body (components/ui.tsx Card, default padding) holds runs from edge to edge of the card: its
+   header band meets the card's heading or top edge, its rows the card's sides, and the last row has no rule of its own
+   above the card's border. */
+[data-card-body] > [data-za-table] { margin-inline: -1rem; }
+[data-card-body] > [data-za-table]:first-child { margin-top: -1rem; }
+[data-card-body] > [data-za-table]:last-child { margin-bottom: -1rem; }
+[data-card-body]:first-child > [data-za-table]:first-child { border-top-left-radius: calc(0.75rem - 1px); border-top-right-radius: calc(0.75rem - 1px); }
+[data-card-body]:last-child > [data-za-table]:last-child { border-bottom-left-radius: calc(0.75rem - 1px); border-bottom-right-radius: calc(0.75rem - 1px); }
+[data-card-body] > [data-za-table]:last-child > table > tbody > tr:last-child > td { border-bottom-color: transparent; }
 
 /* Loading placeholder: a calm pulse, disabled for reduced motion. */
 @keyframes za-pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 .skeleton { background: var(--za-skeleton); border-radius: 4px; animation: za-pulse-soft 1.6s ease-in-out infinite; }
 
+/* Entrances. Short, decelerating and without overshoot: overlays fade, menus and dialogs settle from a few pixels away,
+   drawers slide in from their edge. Closing is immediate. All of them are off for reduced motion. */
+@keyframes za-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes za-pop-in { from { opacity: 0; transform: translateY(-4px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes za-dialog-in { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: none; } }
+@keyframes za-drawer-right { from { opacity: 0.4; transform: translateX(24px); } to { opacity: 1; transform: none; } }
+@keyframes za-drawer-left { from { opacity: 0.4; transform: translateX(-24px); } to { opacity: 1; transform: none; } }
+@keyframes za-rise-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.za-fade-in { animation: za-fade-in 160ms var(--ease-standard) both; }
+.za-overlay-in { animation: za-fade-in 180ms ease-out both; }
+.za-pop-in { animation: za-pop-in 140ms var(--ease-standard) both; }
+.za-dialog-in { animation: za-dialog-in 200ms var(--ease-standard) both; }
+.za-drawer-right { animation: za-drawer-right 220ms var(--ease-standard) both; }
+.za-drawer-left { animation: za-drawer-left 220ms var(--ease-standard) both; }
+.za-toast-in { animation: za-rise-in 200ms var(--ease-standard) both; }
+
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
+  .za-fade-in, .za-overlay-in, .za-pop-in, .za-dialog-in, .za-drawer-right, .za-drawer-left, .za-toast-in { animation: none; }
   * { scroll-behavior: auto !important; transition-duration: 0ms !important; }
 }
