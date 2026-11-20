@@ -5,7 +5,7 @@ import Link from "next/link";
 import type { Me } from "@/lib/actor";
 import { fmtDate, fmtRange } from "@/lib/format";
 import { Badge, KV } from "@/components/ui";
-import { PANEL, codeWords, plural, sentence, snapshotPeriods, stateOf, type Reads } from "./types";
+import { CODE, LINK, PANEL, PANEL_TITLE, codeWords, countriesOf, entitiesOf, plural, sentence, snapshotPeriods, stateOf, type Reads } from "./types";
 
 /* A. Organisation information. The organisation record (GET /org/tenant: status, contracting region, isolation tier,
    registration date) is read only for the roles it is served to; everyone who sees the Overview gets the name and
@@ -21,9 +21,9 @@ export function OrganisationCard({ r, me, opens }: { r: Reads; me: Me | null; op
   const t = r.org.data?.tenant;
   const d = r.dash.data;
   // The same legal entities either way: the organisation record's when it is read, otherwise the dashboard's.
-  const entities = r.org.data?.entities ?? d?.by_entity;
+  const entities = entitiesOf(r);
   const regions = new Map((r.org.data?.cells ?? []).map((c) => [c.cell_id, c.region]));
-  const countries = entities ? [...new Set(entities.map((e) => e.country))].sort() : [];
+  const countries = countriesOf(entities);
   const homes = entities ? [...new Set(entities.map((e) => e.home_cell_id))].sort() : [];
   const entityWait = org === "loading" || (dash === "loading" && !r.org.data);
   const fromEntities = (v: ReactNode) => (entities ? v : entityWait ? pending : muted("Unavailable"));
@@ -40,7 +40,7 @@ export function OrganisationCard({ r, me, opens }: { r: Reads; me: Me | null; op
     ] as [ReactNode, ReactNode][] : []),
     ["Legal entities", fromEntities(<>
       {plural(entities?.length ?? 0, "entity", "entities")}
-      {opens("/entities") && <>{" · "}<Link href="/entities" className="font-semibold text-teal-700 hover:underline">View</Link></>}
+      {opens("/entities") && <>{" · "}<Link href="/entities" className={LINK}>View</Link></>}
     </>)],
     ["Jurisdictions", fromEntities(countries.length ? countries.join(", ") : "—")],
     ["Home cells", fromEntities(homes.length ? homes.map((h) => (regions.get(h) ? `${h} · ${regions.get(h)}` : h)).join(", ") : "—")],
@@ -63,12 +63,13 @@ export function OrganisationCard({ r, me, opens }: { r: Reads; me: Me | null; op
     : null;
 
   return (
-    <section aria-labelledby="org-h" className={`${PANEL} mb-6 px-5 pb-5 pt-4 sm:px-6`}>
+    <section aria-labelledby="org-h" className={`${PANEL} px-5 pb-5 pt-5 sm:px-6`}>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h2 id="org-h" className="text-[18px] font-semibold leading-7 text-slate-900">Organisation profile</h2>
-        {t ? <Badge code={t.status} title={`Organisation status: ${t.status}`} /> : org === "loading" ? pending : null}
+        <h2 id="org-h" className={PANEL_TITLE}>Organisation profile</h2>
+        {t ? <span className={CODE}><Badge code={t.status} title={`Organisation status: ${t.status}`} /></span> : org === "loading" ? pending : null}
       </div>
-      <KV cols={4} items={items} />
+      {/* Three columns: the profile sits in the page's two-thirds column on desktops. */}
+      <KV cols={3} items={items} />
       {note && <p className="mt-3 text-[12px] text-slate-500">{note}</p>}
     </section>
   );

@@ -4,7 +4,7 @@ import Link from "next/link";
 import { AlertCircle, History, Lock } from "lucide-react";
 import { fmtDate, short } from "@/lib/format";
 import { EmptyState, LoadingSkeleton } from "@/components/ui";
-import { PANEL, describeAggregate, describeEvent, stateOf, type Dashboard, type Read, type RecentEvent } from "./types";
+import { LINK, PANEL, PANEL_TITLE, describeAggregate, describeEvent, stateOf, type Dashboard, type Read, type RecentEvent } from "./types";
 
 /* D. Recent activity: the organisation's latest recorded events (GET /dashboard `recent_events`, the eight newest
    outbox events), newest first. Each is described from its recorded event type and names the record it concerns;
@@ -18,12 +18,13 @@ const DETAIL: Record<string, (id: string) => string> = {
   Subject: (id) => `/entities/${encodeURIComponent(id)}`,
 };
 
-export function RecentActivity({ dash, opens }: { dash: Read<Dashboard>; opens: (href: string) => boolean }) {
+/** `className` places the panel in the page's layout (e.g. growing to end level with the column beside it). */
+export function RecentActivity({ dash, opens, className = "" }: { dash: Read<Dashboard>; opens: (href: string) => boolean; className?: string }) {
   const s = stateOf(dash);
   const events = dash.data?.recent_events ?? [];
   return (
-    <section aria-labelledby="activity-h" className={`${PANEL} px-5 pb-4 pt-5 sm:px-6`}>
-      <h2 id="activity-h" className="text-[18px] font-semibold leading-7 text-slate-900">Recent activity</h2>
+    <section aria-labelledby="activity-h" className={`${PANEL} px-5 pb-4 pt-5 sm:px-6 ${className}`}>
+      <h2 id="activity-h" className={PANEL_TITLE}>Recent activity</h2>
       <p className="mt-0.5 text-[12px] text-slate-500">The latest changes recorded for your organisation, newest first.</p>
       {s === "loading" ? <LoadingSkeleton rows={4} className="px-0" />
         : s === "denied" ? <EmptyState compact icon={Lock} title="Not available to your role" description="Your roles are not served your organisation's recorded events." />
@@ -37,7 +38,7 @@ export function RecentActivity({ dash, opens }: { dash: Read<Dashboard>; opens: 
       {s === "ready" && (
         <p className="mt-2 text-[12px] leading-5 text-slate-500">
           These events do not record who acted.
-          {opens("/ledger") && <>{" "}The <Link href="/ledger" className="font-semibold text-teal-700 hover:underline">Audit Trail</Link> lists recorded actions with their actor.</>}
+          {opens("/ledger") && <>{" "}The <Link href="/ledger" className={LINK}>Audit Trail</Link> lists recorded actions with their actor.</>}
         </p>
       )}
     </section>
@@ -54,7 +55,7 @@ function EventRow({ e, opens }: { e: RecentEvent; opens: (href: string) => boole
         <p className="mt-0.5 break-words text-[12px] text-slate-500">
           <span className="mono break-all">{e.event_type}</span>{" · "}
           {href && opens(href)
-            ? <Link href={href} title={`${describeAggregate(e.aggregate_type)} ${e.aggregate_id}`} className="font-medium text-teal-700 hover:underline">{item}</Link>
+            ? <Link href={href} title={`${describeAggregate(e.aggregate_type)} ${e.aggregate_id}`} className={`${LINK} font-medium`}>{item}</Link>
             : <span title={`${describeAggregate(e.aggregate_type)} ${e.aggregate_id}`}>{item}</span>}
         </p>
       </div>

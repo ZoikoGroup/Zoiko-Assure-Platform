@@ -8,15 +8,18 @@ import { fmtDate } from "@/lib/format";
 import { roleLabel } from "@/lib/roles";
 import { Badge, EmptyState, LoadingSkeleton, Notice } from "@/components/ui";
 import {
-  PANEL, codeWords, evidenceGaps, isPast, joinWords, list, plural, sentence, stateOf,
+  CODE, LINK, PANEL, PANEL_TITLE, codeWords, evidenceGaps, isPast, joinWords, list, plural, sentence, stateOf,
   type Open, type Read, type Reads,
 } from "./types";
 
-/* C. Outstanding work: what needs someone now, straight from the organisation's records. Each row says what it is,
-   its recorded state and due date where the record has one, and opens the screen where it is worked. Obligation
-   occurrences are a count: the organisation-wide view records no per-occurrence list (each obligation's page does). */
+/* C. Needs attention (the outstanding work): what needs someone now, straight from the organisation's records. Each
+   row says what it is, its recorded state and due date where the record has one, and opens the screen where it is
+   worked. Obligation occurrences are a count: the organisation-wide view records no per-occurrence list (each
+   obligation's page does). A state already said in the row's words (a control's, or the pending approval every listed
+   exception and compensation awaits) is not repeated as a badge. */
 
-/** `due`: undefined when the kind of record has no due date, null when this record has none. */
+/** `due`: undefined when the kind of record has no due date, null when this record has none. `state`: a recorded state
+ *  the row's words do not already give, shown as a badge. */
 type WorkItem = {
   key: string; level: "high" | "medium"; what: string; detail: string;
   state?: string; due?: string | null; overdue?: boolean; href: string;
@@ -45,7 +48,7 @@ function workItems(r: Reads, open: Open, now: number): WorkItem[] {
     items.push(s === null
       ? { key: `ctl-${c.control_implementation_id}`, level: "high", what: name, detail: `Configuration error: cannot be evaluated · ${c.subject}`, href }
       : { key: `ctl-${c.control_implementation_id}`, level: s === "FAILING" ? "high" : "medium", what: name,
-          detail: `${CONTROL_TEXT[s] ?? "Not operating"} · ${c.subject}`, state: s, href });
+          detail: `${CONTROL_TEXT[s] ?? "Not operating"} · ${c.subject}`, state: CONTROL_TEXT[s] ? undefined : s, href });
   }
   if (open.issues) {
     for (const i of open.issues) {
@@ -60,12 +63,12 @@ function workItems(r: Reads, open: Open, now: number): WorkItem[] {
   }
   for (const x of open.exceptions ?? []) {
     items.push({ key: `exc-${x.exception_id}`, level: "medium", what: `Exception request: ${x.reason}`,
-      detail: `${sentence(codeWords(x.target_type))} · requested for ${fmtDate(x.valid_from)} → ${fmtDate(x.valid_to)}`,
-      state: x.state, href: "/governance" });
+      detail: `Awaiting approval · ${sentence(codeWords(x.target_type))} · requested for ${fmtDate(x.valid_from)} → ${fmtDate(x.valid_to)}`,
+      href: "/governance" });
   }
   for (const c of open.compensations ?? []) {
     items.push({ key: `cmp-${c.compensation_id}`, level: "medium", what: `Compensating control proposed for ${c.primary_control_key}`,
-      detail: `${c.equivalence_rationale} · from ${fmtDate(c.valid_from)}`, state: c.status, href: "/governance" });
+      detail: `Awaiting approval · ${c.equivalence_rationale} · from ${fmtDate(c.valid_from)}`, href: "/governance" });
   }
   if (det && det.PROPOSED + det.IN_REVIEW) {
     items.push({ key: "det", level: "medium", what: `${plural(det.PROPOSED + det.IN_REVIEW, "decision")} awaiting attestation`,
@@ -109,8 +112,10 @@ const SOURCES: [keyof Reads, string][] = [
   ["anomalies", "IPE anomalies"],
 ];
 
-export function OutstandingWork({ r, open, now, opens, onRetry }:
-  { r: Reads; open: Open; now: number; opens: (href: string) => boolean; onRetry: () => void }) {
+/** `className` places the panel in the page's grid; the panel fills the height it is given (beside a taller column it
+ *  ends level with it). */
+export function OutstandingWork({ r, open, now, opens, onRetry, className = "" }:
+  { r: Reads; open: Open; now: number; opens: (href: string) => boolean; onRetry: () => void; className?: string }) {
   const [all, setAll] = useState(false);
   const states = SOURCES.map(([k, label]) => [label, stateOf(r[k] as Read<unknown>)] as const);
   const loading = states.some(([, s]) => s === "loading");
@@ -120,11 +125,9 @@ export function OutstandingWork({ r, open, now, opens, onRetry }:
   const shown = all ? items : items.slice(0, SHOWN);
 
   return (
-    <section aria-labelledby="work-h" className={`${PANEL} flex flex-col px-5 pb-4 pt-5 sm:px-6`}>
-      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-        <h2 id="work-h" className="text-[18px] font-semibold leading-7 text-slate-900">Outstanding work</h2>
-        {!loading && items.length > 0 && <span className="text-[12px] text-slate-500">{plural(items.length, "item")}</span>}
-      </div>
+    <section aria-labelledby="work-h" className={`${PANEL} flex min-w-0 flex-col px-5 pb-4 pt-5 sm:px-6 ${className}`}>
+      {/* The total is in "Show all" when the list is cut short. */}
+      <h2 id="work-h" className={PANEL_TITLE}>Needs attention</h2>
       {loading ? <LoadingSkeleton rows={4} className="px-0" /> : (
         <>
           {(failed.length > 0 || denied.length > 0) && (
@@ -151,7 +154,7 @@ export function OutstandingWork({ r, open, now, opens, onRetry }:
               {items.length > SHOWN && (
                 <div className="pt-3">
                   <button type="button" aria-expanded={all} aria-controls="work-list" onClick={() => setAll(!all)}
-                    className="rounded text-[13px] font-semibold text-teal-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600">
+                    className={`${LINK} text-[13px]`}>
                     {all ? "Show fewer" : `Show all ${items.length}`}
                   </button>
                 </div>
@@ -178,29 +181,31 @@ function Due({ due, overdue }: { due?: string | null; overdue: boolean }) {
 function WorkRow({ item, now, link }: { item: WorkItem; now: number; link: boolean }) {
   const overdue = !!item.overdue || isPast(item.due, now);
   const hasMeta = !!item.state || item.due !== undefined || overdue;
-  const meta: ReactNode = <>{item.state && <Badge code={item.state} />}<Due due={item.due} overdue={overdue} /></>;
+  const meta: ReactNode = <>{item.state && <span className={CODE}><Badge code={item.state} /></span>}<Due due={item.due} overdue={overdue} /></>;
+  // The level, the record and the chevron share one centre line; a record's state and due date sit on one line before
+  // the chevron from sm up (so every row keeps the same height) and under its description on phones.
   const body = (
     <>
-      <span className={`mt-0.5 inline-flex w-14 shrink-0 justify-center rounded px-1.5 text-[11px] font-semibold leading-[18px] ${item.level === "high" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-800"}`}>
+      <span className={`inline-flex w-14 shrink-0 justify-center rounded px-1.5 text-[11px] font-semibold leading-[18px] ${item.level === "high" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-800"}`}>
         {item.level === "high" ? "High" : "Medium"}
       </span>
       <span className="min-w-0 flex-1">
-        <span className={`block truncate text-[14px] font-semibold text-slate-900 ${link ? "group-hover:text-teal-800" : ""}`}>{item.what}</span>
+        <span className={`block truncate text-[14px] font-semibold text-slate-900 ${link ? "transition-colors duration-150 group-hover:text-teal-800" : ""}`}>{item.what}</span>
         <span className="block truncate text-[12px] text-slate-500">{item.detail}</span>
         {hasMeta && <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 sm:hidden">{meta}</span>}
       </span>
-      {hasMeta && <span className="hidden shrink-0 flex-col items-end gap-1 sm:flex">{meta}</span>}
-      {link && <ChevronRight size={16} aria-hidden className="mt-0.5 shrink-0 text-slate-400 group-hover:text-teal-700" />}
+      {hasMeta && <span className="hidden shrink-0 items-center gap-2 sm:flex">{meta}</span>}
+      {link && <ChevronRight size={16} aria-hidden className="shrink-0 text-slate-400 transition-[color,transform] duration-150 group-hover:translate-x-0.5 group-hover:text-teal-700" />}
     </>
   );
   return (
     <li>
       {link ? (
         <Link href={item.href} title={item.what}
-          className="group flex items-start gap-3 rounded py-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
+          className="group flex items-center gap-3 rounded py-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
           {body}
         </Link>
-      ) : <div title={item.what} className="flex items-start gap-3 py-3">{body}</div>}
+      ) : <div title={item.what} className="flex items-center gap-3 py-3">{body}</div>}
     </li>
   );
 }

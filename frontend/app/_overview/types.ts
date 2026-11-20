@@ -120,6 +120,12 @@ export function openRecords(r: Reads) {
 }
 export type Open = ReturnType<typeof openRecords>;
 
+/** The organisation's legal entities: the organisation record's when it is read, otherwise the dashboard's (the same
+ *  entities either way). Undefined while neither is read. */
+export const entitiesOf = (r: Reads) => r.org.data?.entities ?? r.dash.data?.by_entity;
+/** The jurisdictions (entity countries) those entities are registered in, once each. */
+export const countriesOf = (entities?: { country: string }[]) => (entities ? [...new Set(entities.map((e) => e.country))].sort() : []);
+
 /** Evidence conditions other than CURRENT, with records in them. Erasure is a governed act, not a gap. */
 export const evidenceGaps = (d: Dashboard) =>
   Object.entries(d.evidence_conditions).filter(([k, v]) => v > 0 && k !== "CURRENT" && k !== "ERASED");
@@ -172,3 +178,11 @@ export function monthLabel(m: string) {
 
 /** The Overview's panel surface (the application kit's card: white surface, slate hairline, both themes). */
 export const PANEL = "rounded-xl border border-slate-200 bg-white shadow-[0_1px_3px_rgba(15,23,42,0.06)]";
+/** A panel's heading. */
+export const PANEL_TITLE = "text-[18px] font-semibold leading-7 text-slate-900";
+/** Wraps a status pill (or the element holding one) so its code reads as the Overview's reference design shows codes:
+ *  monospaced, medium weight, tight tracking. The face is inherited; weight and tracking override the pill's own on its
+ *  outer span only. Applied here rather than in the shared kit, whose pills stay sans everywhere else. */
+export const CODE = "font-mono [&>span]:font-medium [&>span]:tracking-tight";
+/** An inline link in the Overview's accent, with the same hover and keyboard focus everywhere on the page. */
+export const LINK = "rounded font-semibold text-teal-700 underline-offset-2 transition-colors duration-150 hover:text-teal-800 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600";
