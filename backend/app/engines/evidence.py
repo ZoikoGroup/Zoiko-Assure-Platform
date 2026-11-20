@@ -264,8 +264,14 @@ def verify_chain(db: Session, tenant_id: str) -> dict:
 def _integrity_incident(db, tenant_id, title, ref_id):
     emit(db, event_type="evidence.integrity_failed", aggregate_type="Integrity", aggregate_id=ref_id,
          tenant_id=tenant_id, payload={"title": title})
-    db.add(Issue(tenant_id=tenant_id, title=title, issue_type="INTEGRITY_INCIDENT", severity="CRITICAL", priority="P0",
-                 source_ref_type="Integrity", source_ref_id=ref_id, dedupe_key=f"integrity:{ref_id}:{title}"))
+    iss = Issue(tenant_id=tenant_id, title=title, issue_type="INTEGRITY_INCIDENT", severity="CRITICAL", priority="P0",
+                source_ref_type="Integrity", source_ref_id=ref_id, dedupe_key=f"integrity:{ref_id}:{title}")
+    db.add(iss)
+    db.flush()  # assigns the issue ID and its initial state, which the CREATED event records
+    # Its creation record, as every other issue producer writes it (governance.record_issue_created), raised by the
+    # system; the reason is the helper's default, this incident's own description (the title).
+    from .governance import record_issue_created
+    record_issue_created(db, issue=iss, actor_id="system")
 
 
 # ---------------------------------------------------------------- Merkle checkpointing

@@ -5,10 +5,10 @@ import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { useActorNames } from "@/lib/people";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ConfirmDialog, ErrorBox, ExceptionBadge, Modal, Notice, PageHeader, PermissionNote, ReasonField, Table, TabPanel, Tabs, useAction } from "@/components/ui";
+import { closureKind, type Issue, type IssueAction } from "@/lib/issues";
+import { A, Badge, Card, ConfirmDialog, ErrorBox, ExceptionBadge, Modal, Notice, PageHeader, PermissionNote, ReasonField, Table, TabPanel, Tabs, useAction, useToast } from "@/components/ui";
 import { CompensationSoDNote } from "@/components/CompensationSoD";
-
-const NEXT: Record<string, string[]> = { OPEN: ["TRIAGED", "CANCELLED"], TRIAGED: ["IN_REMEDIATION", "CANCELLED"], IN_REMEDIATION: ["PENDING_VERIFICATION"], PENDING_VERIFICATION: ["CLOSED", "IN_REMEDIATION"] };
+import { AssignOwnerDialog, IssueActionButtons, IssueDrawer, TransitionDialog, VerifiedCloseDialog, severityCode } from "@/components/issues/IssueLifecycle";
 
 export default function Governance() {
   const [tab, setTab] = useState("Exceptions");
@@ -19,7 +19,7 @@ export default function Governance() {
         subtitle="Exceptions, compensating controls, issues and risk acceptances."
         help="Governance treatments are recorded beside assurance state and never rewrite it. Approval needs an authorised human, and an exception cannot be approved by the person who requested it. New exceptions and compensating controls are requested from an obligation's dossier." />
       <PermissionNote perms={["approve_exception", "approve_compensation", "manage_issues"]}
-        actions={{ approve_exception: "Decide exceptions and risk acceptances", approve_compensation: "Decide compensating controls", manage_issues: "Move issues through remediation" }} />
+        actions={{ approve_exception: "Decide exceptions and risk acceptances", approve_compensation: "Decide compensating controls", manage_issues: "Assign, move and close issues" }} />
       <Tabs id={tabsId} tabs={["Exceptions", "Compensations", "Issues", "Risk acceptances"]} value={tab} onChange={setTab} />
       <TabPanel id={tabsId} value={tab}>
         {tab === "Exceptions" && <Exceptions />}
@@ -129,45 +129,62 @@ function Compensations() {
   );
 }
 
+/* Issues (WF-STA-04; ZA-STA-001 §17): assignment, the workflow moves, verified closure and the recorded history, each
+   through its backend route (components/issues/IssueLifecycle.tsx). What is shown always comes from the backend: a
+   successful request shows the issue it returned and re-reads the list and history; a refused one re-reads them too,
+   so no state the backend no longer holds stays on screen. */
 function Issues() {
-  const { data, error, reload } = useApi<any[]>("/issues");
+  const { data, error, reload, setData } = useApi<Issue[]>("/issues");
   const { can, why } = useCan();
-  const [cancelFor, setCancelFor] = useState<any>(null);
-  const [moveFor, setMoveFor] = useState<{ i: any; state: string } | null>(null);
-  const send = async (id: string, state: string, reason: string | null) => {
-    await api(`/issues/${id}/transition`, { method: "POST", json: { state, reason } }); reload();
+  const name = useActorNames();
+  const toast = useToast();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [pending, setPending] = useState<{ action: IssueAction; issue: Issue } | null>(null);
+  const [version, setVersion] = useState(0);  // bumped after every request, so open history and candidate reads refresh
+  const allowed = can("manage_issues");
+  const find = (id: string) => data?.find((i) => i.issue_id === id);
+  const refresh = () => { reload(); setVersion((v) => v + 1); };
+  const done = (result: Issue, message: string) => {
+    setData((rows) => rows?.map((r) => (r.issue_id === result.issue_id ? result : r)) ?? rows);
+    setPending(null);
+    refresh();
+    toast(message, "good");
   };
-  const move = (i: any, state: string) => (state === "CANCELLED" ? setCancelFor(i) : setMoveFor({ i, state }));
+  const act = (issue: Issue) => (action: IssueAction) => setPending({ action, issue });
+  const buttons = (i: Issue) => <IssueActionButtons issue={i} allowed={allowed} deniedWhy={why("manage_issues")} onAction={act(i)} />;
+  const opened = openId ? find(openId) ?? null : null;
+  // A dialog follows the issue as last read from the backend; the row it was opened from only stands in if the list is gone.
+  const target = pending ? find(pending.issue.issue_id) ?? pending.issue : null;
+  const verified = target ? ["SNAPSHOT", "EVALUATION"].includes(closureKind(target.issue_type)) : false;
+  const common = target ? { issue: target, name, onClose: () => setPending(null), onDone: done, onFailed: refresh } : null;
   return (
     <Card subtitle="Closing an issue never changes assurance state. A new evaluation has to prove the remediation.">
       <ErrorBox error={error} />
-      <Table head={["Issue", "Type", "Severity", "Priority", "State", "Source", "Created", "Move to"]} empty={data?.length === 0} loading={!data && !error}>
+      <Table head={["Issue", "Type", "Severity", "Priority", "State", "Owner", "Source", "Created", "Actions"]} empty={data?.length === 0} loading={!data && !error}>
         {data?.map((i) => (
           <tr key={i.issue_id}>
-            <td className="td font-medium">{i.title}</td><td className="td mono text-xs">{i.issue_type}</td>
-            <td className="td"><Badge code={i.severity === "CRITICAL" || i.severity === "HIGH" ? "FAIL" : "WARN"} label={i.severity} /></td>
+            <td className="td">
+              <button type="button" className="text-left font-medium text-navy-700 underline-offset-2 hover:text-navy-900 hover:underline" aria-haspopup="dialog"
+                title="Open details and history" onClick={() => setOpenId(i.issue_id)}>{i.title}</button>
+            </td>
+            <td className="td mono text-xs">{i.issue_type}</td>
+            <td className="td"><Badge code={severityCode(i.severity)} label={i.severity} /></td>
             <td className="td">{i.priority}</td><td className="td"><Badge code={i.state} /></td>
+            <td className="td text-xs">{i.owner_actor_id ? name(i.owner_actor_id) : <span className="text-slate-500">Not assigned</span>}</td>
             <td className="td mono text-[11px]">{i.source_ref_type} {i.source_ref_id?.slice(0, 8)}</td>
             <td className="td text-xs">{fmtDate(i.created_at)}</td>
-            <td className="td whitespace-nowrap">{(NEXT[i.state] || []).map((s) => <button key={s} className="btn-ghost" disabled={!can("manage_issues")} title={why("manage_issues")} onClick={() => move(i, s)}>{s}</button>)}</td>
+            <td className="td">{buttons(i)}</td>
           </tr>
         ))}
       </Table>
-      {moveFor && (
-        <ConfirmDialog title={`Move issue to ${moveFor.state}`} confirm={`Move to ${moveFor.state}`} busyLabel="Moving…"
-          onConfirm={() => send(moveFor.i.issue_id, moveFor.state, null)} onClose={() => setMoveFor(null)}>
-          <p><span className="font-medium">{moveFor.i.title}</span> · <Badge code={moveFor.i.state} /> → <Badge code={moveFor.state} /></p>
-          <p>{moveFor.state === "CLOSED"
-            ? "Closing is final: a closed issue cannot be moved to another state. Closing does not change assurance state; a new evaluation has to prove the remediation."
-            : "Moving an issue does not change assurance state."} The transition is recorded in the audit trail.</p>
-        </ConfirmDialog>
+      {openId && (
+        <IssueDrawer issue={opened} listError={error} version={version} name={name} onClose={() => setOpenId(null)}
+          actions={opened ? buttons(opened) : null} />
       )}
-      {cancelFor && (
-        <ReasonDialog title="Cancel issue" label="Cancellation reason" required confirm="Cancel issue" dismiss="Keep issue"
-          onSubmit={(reason) => send(cancelFor.issue_id, "CANCELLED", reason)} onClose={() => setCancelFor(null)}>
-          <p><span className="font-medium">{cancelFor.title}</span> · currently <Badge code={cancelFor.state} /></p>
-          <p>The issue moves to CANCELLED. This cannot be undone. Cancelling an issue never changes assurance state. The reason is recorded in the audit trail.</p>
-        </ReasonDialog>
+      {pending && common && (
+        pending.action.kind === "assign" ? <AssignOwnerDialog {...common} />
+          : pending.action.kind === "close" && verified ? <VerifiedCloseDialog {...common} version={version} />
+          : <TransitionDialog {...common} action={pending.action} />
       )}
     </Card>
   );

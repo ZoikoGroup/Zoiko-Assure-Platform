@@ -103,14 +103,58 @@ def source_ref(s: RegulatorySource | None) -> dict | None:
             "publication_date": s.publication_date, "effective_date": s.effective_date, "record_seq": s.record_seq}
 
 
+def text_displayable(s: RegulatorySource) -> bool:
+    """Whether the source's rights permit showing its text (FR-REG-005): the rule GET /catalog/sources applies."""
+    return s.rights_class != "REFERENCE_ONLY"
+
+
 def source_view(s: RegulatorySource) -> dict:
     """The full source record, with text withheld where the rights record does not permit display (FR-REG-005)."""
     d = to_dict(s)
-    if s.rights_class == "REFERENCE_ONLY":  # the same rule GET /catalog/sources applies
+    if not text_displayable(s):
         d["raw_text"] = None
         d["display_note"] = "Text withheld under rights record; locator and fingerprint retained."
     d["fingerprint_intact"] = fingerprint_intact(s)
     return d
+
+
+def snapshot_diff(db, s: RegulatorySource) -> dict:
+    """WF-01 "view diff" (ZA-PRD-001 §13): one source snapshot against the snapshot before it of the same source (same
+    authority, jurisdiction and authoritative locator, in record order: source_versions, the chain the change inbox
+    names as previous_source_id). Read-only; derived from the two stored snapshots only.
+
+    ``text_diff`` is the line-level difference of the stored texts (lines keep their terminators, so the texts differ
+    exactly when a hunk exists): each hunk names the half-open [start, end) line ranges on both sides and their lines,
+    verbatim; equal runs are left out. It is given only when both texts are stored, both may be displayed under their
+    rights (text_displayable, FR-REG-005) and both still match their fingerprints (fingerprint_intact): otherwise it is
+    null and nothing of either text is shown (fail closed), and each side's flags say why. A first snapshot has no
+    previous one, so both are null."""
+    import difflib
+    chain = source_versions(db, s)
+    pos = next(i for i, x in enumerate(chain) if x.source_id == s.source_id)
+    prev = chain[pos - 1] if pos else None
+
+    def side(x: RegulatorySource) -> dict:
+        return {**source_ref(x), "snapshot_number": chain.index(x) + 1, "fetched_at": x.fetched_at,
+                "text_stored": x.raw_text is not None, "text_displayable": text_displayable(x)}
+    out = {"source": side(s), "previous": side(prev) if prev else None, "snapshot_count": len(chain),
+           "fingerprint_changed": None if prev is None else prev.fingerprint != s.fingerprint, "text_diff": None}
+    if prev is None:
+        out["note"] = "First snapshot of this source: there is no previous snapshot to compare with."
+        return out
+    blocked = [x for x in (prev, s) if x.raw_text is None or not text_displayable(x) or not fingerprint_intact(x)]
+    if blocked:
+        out["note"] = ("No text difference is shown: a snapshot's text is not stored, its rights do not permit display, "
+                       "or it no longer matches its fingerprint (see each side's flags).")
+        return out
+    a, b = prev.raw_text.splitlines(keepends=True), s.raw_text.splitlines(keepends=True)
+    out["text_diff"] = {
+        "previous_line_count": len(a), "current_line_count": len(b),
+        "hunks": [{"op": tag, "previous": {"start": i1, "end": i2, "lines": a[i1:i2]},
+                   "current": {"start": j1, "end": j2, "lines": b[j1:j2]}}
+                  for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+                  if tag != "equal"]}
+    return out
 
 
 def find_duplicate_snapshot(db, *, authority: str, jurisdiction: str, locator: str,

@@ -4,10 +4,10 @@ from __future__ import annotations
 import importlib.util
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 
 from ..db import BASE_DIR
@@ -221,23 +221,67 @@ def bind(evidence_id: str, body: BindIn, ctx: Ctx = Depends(authorize("submit_ev
 
 
 class ConflictIn(BaseModel):
+    """ZA-EVD-001 §13 "Create EvidenceConflict object referencing evidence IDs": the member evidence set (members stay
+    immutable) and what conflicts. A set that references nothing, or names one artifact twice, is not a conflict between
+    evidence items; a required description of only whitespace explains nothing. How many members a conflict needs, and
+    whether they may span legal entities, is not decided here (no controlled rule)."""
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
-    member_evidence_ids: list[str]
+    member_evidence_ids: list[str] = Field(min_length=1)
     description: str
+
+    @model_validator(mode="after")
+    def _members_and_description(self):
+        repeated = sorted({e for e in self.member_evidence_ids if self.member_evidence_ids.count(e) > 1})
+        if repeated:
+            raise ValueError(f"member_evidence_ids lists {repeated} more than once; members are distinct evidence items")
+        if not self.description.strip():
+            raise ValueError("description is required")
+        return self
+
+
+# Idempotency-Key operation class of POST /evidence-conflicts (engines/idempotency.py; platform_idempotency_record).
+OPEN_CONFLICT_OPERATION = "evidence_conflict.open"
 
 
 @router.post("/evidence-conflicts")
-def open_conflict(body: ConflictIn, ctx: Ctx = Depends(authorize("submit_evidence"))):
+def open_conflict(body: ConflictIn, ctx: Ctx = Depends(authorize("submit_evidence")),
+                  idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    """Open an evidence conflict. With an ``Idempotency-Key`` (ZA-API-001 §08; EVD-REQ-038 lifecycle events idempotent
+    under retries) a retry returns the conflict the first request opened and writes nothing; the same key with another
+    request is 409 idempotency_conflict (engines/idempotency.py, as for POST /test-runs)."""
+    from ..engines import idempotency
     for e in body.member_evidence_ids:
         ctx.scoped(ctx.db.get(EvidenceArtifact, e), "evidence")
-    c, _ = governance.open_evidence_conflict(ctx.db, tenant_id=ctx.tenant, actor_id=ctx.actor.actor_id,
+    request = {"member_evidence_ids": body.member_evidence_ids, "description": body.description}
+    done = idempotency.replay(ctx.db, tenant_id=ctx.tenant, operation=OPEN_CONFLICT_OPERATION, key=idempotency_key,
+                              request=request)
+    if done is not None:
+        return to_dict(ctx.scoped(ctx.db.get(EvidenceConflict, done), "conflict"))
+    c, _ = governance.open_evidence_conflict(ctx.db, tenant_id=ctx.tenant, actor_id=ctx.actor.actor_id, actor=ctx.actor,
                                              member_evidence_ids=body.member_evidence_ids, description=body.description)
+    idempotency.remember(ctx.db, tenant_id=ctx.tenant, operation=OPEN_CONFLICT_OPERATION, key=idempotency_key,
+                         request=request, result_ref=c.conflict_id)
     ctx.db.commit()
     return to_dict(c)
 
 
+class ConflictResolveIn(BaseModel):
+    """The disposition of a conflict and nothing else: resolution records why (EVD §13 "Append resolution/disposition
+    event"). It does not select an authoritative source or a successor (no such policy is implemented), so those fields
+    are refused rather than accepted and dropped, as they were when this route shared the supersession model ReasonIn."""
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
+    reason: str
+
+    @model_validator(mode="after")
+    def _reason(self):
+        if not self.reason.strip():
+            raise ValueError("reason is required")
+        return self
+
+
 @router.post("/evidence-conflicts/{conflict_id}/resolve")
-def resolve_conflict(conflict_id: str, body: ReasonIn, ctx: Ctx = Depends(authorize("assurance_review", human=True))):
+def resolve_conflict(conflict_id: str, body: ConflictResolveIn,
+                     ctx: Ctx = Depends(authorize("assurance_review", human=True))):
     """Governed disposition of a source conflict (ZA-EVD-001: resolution is appended, history preserved).
     The conflict row's status still changes in place until the record-time revision model (audit F3) lands; the audit
     event below keeps who resolved it, when, from which state and why."""
@@ -251,17 +295,21 @@ def resolve_conflict(conflict_id: str, body: ReasonIn, ctx: Ctx = Depends(author
 @router.get("/evidence-conflicts/{conflict_id}/events")
 def conflict_events(conflict_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     ctx.scoped(ctx.db.get(EvidenceConflict, conflict_id), "conflict")
+    # Record sequence, then event ID for ties, as every governance event history (exceptions, compensations, issues).
     return [governance.event_view(e) for e in ctx.db.execute(
         select(EvidenceConflictEvent).where(
             EvidenceConflictEvent.tenant_id == ctx.tenant,
             EvidenceConflictEvent.conflict_id == conflict_id,
-        ).order_by(EvidenceConflictEvent.record_seq.asc())
+        ).order_by(EvidenceConflictEvent.record_seq.asc(), EvidenceConflictEvent.event_id)
     ).scalars()]
 
 
 @router.get("/evidence-conflicts")
 def conflicts(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
-    return [to_dict(c) for c in ctx.db.execute(select(EvidenceConflict).where(EvidenceConflict.tenant_id == ctx.tenant)).scalars()]
+    # Creation order, then conflict ID: the order the assurance engine reads conflicts in (_EvidenceKnowledge), never
+    # PostgreSQL's physical row order, which a resolution (an UPDATE) changes.
+    return [to_dict(c) for c in ctx.db.execute(select(EvidenceConflict).where(EvidenceConflict.tenant_id == ctx.tenant)
+                                               .order_by(EvidenceConflict.created_at, EvidenceConflict.conflict_id)).scalars()]
 
 
 # ------------------------------------------------------------------ ledger / checkpoints (WF-EVD-03)

@@ -18,7 +18,7 @@ import secrets
 import pytest
 from sqlalchemy import select, text
 
-from conftest import H
+from conftest import H, shadow_report_for
 from test_authorization import db_fingerprint
 
 TAG = secrets.token_hex(3).upper()
@@ -174,7 +174,7 @@ def _as_if_verified_before_the_fix(did):
     with AdminSession() as db:
         d = db.get(RuleDraft, did)
         d.status, d.peer_reviewer_id, d.legal_reviewer_id = "VERIFIED", PEER, LEGAL
-        d.shadow_report = {"buckets": {}, "completed_at": "2026-11-07T00:00:00+00:00"}
+        d.shadow_report = shadow_report_for(db, d)
         db.commit()
 
 

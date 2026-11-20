@@ -123,6 +123,35 @@ def expression_problems(node, path: str = "$", count: list | None = None) -> lis
     return out
 
 
+def repeated_peer_problems(node, path: str = "$") -> list[str]:
+    """K_OF_N children that name the same control more than once. STA §07 K_OF_N: "At least K children must be
+    SATISFIED", with a "rationale proving children are valid peers"; a control listed twice is one peer, so counting it
+    twice lets a single control satisfy K >= 2 (a false SATISFIED). Authoring already refuses such a version
+    (satisfaction.metadata_problems DUPLICATE_CONTROL_LEAF, "peers must be distinct"); this applies the same rule to
+    versions stored without it, at evaluation. ALL / ANY are not affected: a repeated child cannot change their result."""
+    if not isinstance(node, dict):
+        return []
+    out = []
+    kids = node.get("children") if isinstance(node.get("children"), list) else []
+    if node.get("node_type") == "K_OF_N" and _repeated_peers(kids):
+        out.append(f"{path}: {_repeated_peers_message(kids)}")
+    for i, c in enumerate(kids):
+        out += repeated_peer_problems(c, f"{path}.children[{i}]")
+    for part in ("primary", "compensating"):
+        out += repeated_peer_problems(node.get(part), f"{path}.{part}")
+    return out
+
+
+def _repeated_peers(kids: list) -> list:
+    """Control keys named by more than one CONTROL child of one node (the DUPLICATE_CONTROL_LEAF comparison)."""
+    keys = [c.get("control_key") for c in kids if isinstance(c, dict) and c.get("node_type") == "CONTROL"]
+    return sorted({k for k in keys if keys.count(k) > 1}, key=str)
+
+
+def _repeated_peers_message(kids: list) -> str:
+    return f"K_OF_N lists {_repeated_peers(kids)} more than once; peers must be distinct (ZA-STA-001 §07)"
+
+
 SAT, UNSAT, UNK, REV = "SATISFIED", "UNSATISFIED", "UNKNOWN", "REVIEW"
 LEAF_MAP = {"OPERATING": SAT, "FAILING": UNSAT, "NOT_EVALUATED": UNK, "DEGRADED": UNK, "REQUIRES_REVIEW": REV}
 SEGMENT_STATE = {SAT: "PROVEN", UNSAT: "FAILING", UNK: "NOT_PROVEN", REV: "REQUIRES_REVIEW"}
@@ -297,9 +326,27 @@ def _evidence_admissible(db, run: TestRun, td: TestDefinition, policy: ControlTe
     return ("UNKNOWN" if reasons else "OK"), sorted(set(reasons)), rows
 
 
+EMPTY_CONTROL_WINDOW = "The control window must be a non-empty half-open interval"
+
+
+def require_control_window(a: datetime, b: datetime) -> None:
+    """A control state is derived for an explicit, non-empty valid-time window (STA §04; TIM §16). An empty or inverted
+    window holds no proof: the coverage check would find it "covered" by nothing and every required test without a
+    failure would read as passed, a vacuous OPERATING (STA-REQ-006). It is invalid input (STA §18 "Missing required
+    temporal context returns validation error rather than guessing"), refused before any state is derived or stored,
+    with the 422 GET /controls/{id}/state already gives."""
+    if b <= a:
+        raise HTTPException(422, EMPTY_CONTROL_WINDOW)
+
+
 def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: datetime, cutoff_seq: int,
-                     persist: bool = True) -> dict:
+                     persist: bool = True, emit_event: bool = False) -> dict:
+    """``emit_event``: write the control.evaluated outbox event for a newly stored evaluation (ZA-EVT-001 §17
+    "Immutable ControlEvaluation completed"), after its issue hook so the lock order stays issue-raising lock ->
+    record sequence. Never written when no evaluation is stored (no state derived for the window, a preview, or an
+    identical stored evaluation reused)."""
     a, b = ensure_utc(a), ensure_utc(b)
+    require_control_window(a, b)
     if ci.record_seq > cutoff_seq or not _in(ci.valid_from, ci.valid_to, a, b):
         return {"state": "NOT_EVALUATED", "reason_codes": ["CONTROL_NOT_IMPLEMENTED"], "tests": [],
                 "precedence_rule": "3:NOT_EVALUATED", "evaluation_id": None}
@@ -383,11 +430,7 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
         # before historical reads excluded later evidence events, or altered since, must never lend its ID to a
         # different state (STA §19 deduplication "identical ... input digest"; STA-REQ-019/020). A new immutable
         # evaluation is stored instead and the earlier one is left as it is.
-        existing = next((e for e in db.execute(
-            select(ControlEvaluation).where(ControlEvaluation.tenant_id == ci.tenant_id,
-                                            ControlEvaluation.dependency_digest == dep_digest)
-            .order_by(ControlEvaluation.created_at, ControlEvaluation.evaluation_id)).scalars()
-            if _records_result(e, ci, policy, state, reasons, rule, a, b, cutoff_seq)), None)
+        existing = authoritative_evaluation(db, ci, policy, state, reasons, rule, a, b, cutoff_seq, dep_digest)
         if existing:
             out["evaluation_id"] = existing.evaluation_id
         else:
@@ -404,6 +447,52 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
             # not new, so retries raise nothing; previews (persist=False) store nothing and raise nothing.
             from . import governance
             governance.raise_control_issue(db, ci=ci, evaluation=ce)
+            if emit_event:
+                record_control_evaluated(db, ci, ce)
+    return out
+
+
+def record_control_evaluated(db: Session, ci: ControlImplementation, ce: ControlEvaluation) -> None:
+    """The control.evaluated outbox event of one newly stored ControlEvaluation, in its transaction (DAT-REQ-014): the
+    ZA-EVT-001 §20 IMMUTABLE_RESULT profile (result/evaluation ID, subject/scope, exact semantic versions, outcome,
+    input digest) with the ZA-STA-001 §18 minimum payload (tenant/entity, subject/control revision, window, record
+    cutoff, evaluation ID, state, reason codes)."""
+    emit(db, event_type="control.evaluated", aggregate_type="ControlEvaluation", aggregate_id=ce.evaluation_id,
+         tenant_id=ci.tenant_id, entity_id=ci.entity_id,
+         payload={"evaluation_id": ce.evaluation_id, "control_implementation_id": ci.control_implementation_id,
+                  "subject_id": ci.subject_id, "policy_version_id": ce.policy_version_id,
+                  "window": [ce.window_from, ce.window_to], "record_cutoff_seq": ce.record_cutoff_seq,
+                  "state": ce.state, "reason_codes": list(ce.reason_codes or []),
+                  "evaluator_version": ce.evaluator_version, "dependency_digest": ce.dependency_digest})
+
+
+def authoritative_evaluation(db: Session, ci: ControlImplementation, policy: ControlTestPolicy, state, reasons, rule,
+                             a: datetime, b: datetime, cutoff: int, dep_digest: str) -> ControlEvaluation | None:
+    """The stored immutable evaluation that is this derivation (STA §19 deduplication: same input digest, evaluator,
+    policy version and temporal context, recording the same result): the earliest such row, or None. Concurrent
+    requests can store twins; the earliest is always the one named."""
+    return next((e for e in db.execute(
+        select(ControlEvaluation).where(ControlEvaluation.tenant_id == ci.tenant_id,
+                                        ControlEvaluation.dependency_digest == dep_digest)
+        .order_by(ControlEvaluation.created_at, ControlEvaluation.evaluation_id)).scalars()
+        if _records_result(e, ci, policy, state, reasons, rule, a, b, cutoff)), None)
+
+
+def control_state_at(db: Session, ci: ControlImplementation, a: datetime, b: datetime, cutoff: int) -> dict:
+    """The control's operating state for the valid window [a, b) as known at record sequence ``cutoff``: ZA-STA-001 §18
+    "GET /controls/{id}/state: Current/historical control state", FR-CTL-005 (period-queryable, reproducible from stored
+    test/evidence revisions). The same derivation as evaluate_control, with nothing stored and no issue raised; records
+    first recorded after ``cutoff`` are not read (TIM §11 correction join). ``evaluation_id`` names the stored immutable
+    evaluation with exactly these inputs and this result (STA-REQ-028: reference the authoritative evaluation), or is
+    None when none is stored; a stored row carries no record time of its own, so the link says that an identical
+    evaluation exists, not when it was stored."""
+    out = evaluate_control(db, ci, a, b, cutoff, persist=False)
+    out["evaluation_id"] = None
+    if out.get("dependency_digest"):
+        policy = db.get(ControlTestPolicy, out["policy_version_id"])
+        stored = authoritative_evaluation(db, ci, policy, out["state"], out["reason_codes"], out["precedence_rule"],
+                                          ensure_utc(a), ensure_utc(b), cutoff, out["dependency_digest"])
+        out["evaluation_id"] = stored.evaluation_id if stored else None
     return out
 
 
@@ -551,6 +640,9 @@ def eval_expression(node: dict, leaf_fn, comp_fn, occ_fn) -> dict:
     if not isinstance(kids, list):
         raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", f"{nt} node has no children list",
                                           node_id=node.get("node_id"))
+    if nt == "K_OF_N" and _repeated_peers(kids):  # before any child is evaluated: no leaf state from an invalid node
+        raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", _repeated_peers_message(kids),
+                                          node_id=node.get("node_id"))
     traces = [eval_expression(k, leaf_fn, comp_fn, occ_fn) for k in kids]
     vals = [t["result"] for t in traces if t["result"] != "NOT_BINDING"]
     if not vals:  # an empty ALL/ANY/K_OF_N proves nothing; never vacuous truth (STA §09, §16)
@@ -673,9 +765,21 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                 raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_HASH_MISMATCH",
                                                   "the stored expression no longer matches its recorded hash",
                                                   expression_version_id=e.expression_version_id, version=e.version)
-            problems = expression_problems(e.ast)
+            problems = expression_problems(e.ast) or repeated_peer_problems(e.ast)
             if problems:
                 raise AssuranceConfigurationError("SATISFACTION_EXPRESSION_INVALID", "; ".join(problems[:5]),
+                                                  expression_version_id=e.expression_version_id, version=e.version)
+            # A CONTROL leaf must name a catalogue control definition (STA §07 "control selector resolved before
+            # evaluation"; the authoring rule UNKNOWN_CONTROL_DEFINITION). One that names none can never be resolved:
+            # a configuration error (STA §18), never a NOT_EVALUATED leaf standing in for it, as an exact binding
+            # that no longer holds already is (CONTROL_MAPPING_INVALID below).
+            keys = _control_keys(e.ast)
+            known = set(db.execute(select(ControlDefinition.key).where(ControlDefinition.key.in_(sorted(keys) or ["-"])))
+                        .scalars())
+            unknown = sorted(keys - known)
+            if unknown:
+                raise AssuranceConfigurationError("CONTROL_MAPPING_INVALID",
+                                                  f"{unknown} is not a catalogue control definition",
                                                   expression_version_id=e.expression_version_id, version=e.version)
             checked.add(e.expression_version_id)
         return e
@@ -1158,7 +1262,10 @@ def _issue_hooks(db, tenant_id, snap: AssuranceSnapshot, odef: ObligationDefinit
     db.add(iss)
     db.flush()
     from . import governance
-    governance.record_issue_created(db, issue=iss, actor_id="system", reason=f"Proof gap: {snap.state}")
+    # The reason names this rule's own condition (OBLIGATION_ISSUE_RULES: "Obligation FAILING", "Proof gap", "Assurance
+    # requires review") with the snapshot state. It was "Proof gap: <state>" for every rule, which described a FAILING or
+    # REQUIRES_REVIEW obligation as a proof gap; a proof gap keeps exactly the reason it had.
+    governance.record_issue_created(db, issue=iss, actor_id="system", reason=f"{title}: {snap.state}")
     if snap.state == "NOT_PROVEN":
         emit(db, event_type="assurance.proof_gap_detected", aggregate_type="AssuranceSnapshot",
              aggregate_id=snap.snapshot_id, tenant_id=tenant_id, payload={"reason_codes": snap.reason_codes})

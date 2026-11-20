@@ -170,6 +170,40 @@ def source_versions(source_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))
             "snapshots": out}
 
 
+@router.get("/sources/{source_id}/diff")
+def source_diff(source_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
+    """WF-01 Regulatory Change Inbox "view diff" (ZA-PRD-001 §13): this source snapshot against the previous snapshot of
+    the same source (cat.snapshot_diff: rights-gated, integrity-checked line difference of the stored texts), and the
+    requirement versions grounded in each of the two snapshots, by requirement key (a requirement's stable identity
+    within its instrument). Provisions are counted, not paired: a provision has no identity that carries across
+    requirement versions in the stored model, so which provision "became" which is not derived. Read-only; the same
+    readers as the source record itself (GET /catalog/sources/{id}), which already shows each text the diff can show."""
+    db = ctx.db
+    s = db.get(RegulatorySource, source_id)
+    if s is None:
+        raise HTTPException(404, "source not found")
+    out = cat.snapshot_diff(db, s)
+    sides = {"current": source_id, **({"previous": out["previous"]["source_id"]} if out["previous"] else {})}
+    rvs = db.execute(select(RequirementVersion).where(RequirementVersion.source_id.in_(list(sides.values())))
+                     .order_by(RequirementVersion.requirement_key, RequirementVersion.record_seq,
+                               RequirementVersion.requirement_version_id)).scalars().all()
+    numbers = cat.version_numbers(db, rvs)
+    held = _instruments(db, rvs)
+    counts = dict(db.execute(select(Provision.requirement_version_id, func.count()).where(
+        Provision.requirement_version_id.in_([r.requirement_version_id for r in rvs] or ["-"]))
+        .group_by(Provision.requirement_version_id)).all())
+    grouped: dict[str, dict] = {}
+    for rv in rvs:
+        entry = grouped.setdefault(rv.requirement_key, {"requirement_key": rv.requirement_key, "previous": [],
+                                                        "current": []})
+        side = "current" if rv.source_id == source_id else "previous"
+        entry[side].append({**cat.requirement_ref(db, rv, numbers=numbers),
+                            "provision_count": counts.get(rv.requirement_version_id, 0)})
+    del held
+    out["requirements"] = [grouped[k] for k in sorted(grouped)]
+    return out
+
+
 @router.get("/sources/{source_id}/trace")
 def source_trace(source_id: str, ctx: Ctx = Depends(authorize(*CATALOG_READ))):
     """Forward traceability: this snapshot -> requirement versions -> provisions -> obligation definitions -> rules."""

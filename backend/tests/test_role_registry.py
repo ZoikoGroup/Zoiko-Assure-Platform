@@ -117,6 +117,40 @@ def _ids(client):
         ids["package_id"] = r.json()["package_id"]
     else:
         ids["package_id"] = pkg.package_id
+    with AdminSession() as db:
+        ids["control_evaluation_id"] = db.execute(text(
+            "SELECT evaluation_id FROM assurance_control_evaluation WHERE tenant_id = :t "
+            "ORDER BY created_at, evaluation_id LIMIT 1"), {"t": TENANT}).scalar()
+    if ids["control_evaluation_id"] is None:  # a stored ControlEvaluation of tenant A (GET /control-evaluations/{id})
+        r = client.post(f"/api/controls/{ids['ci_id']}/evaluate", headers=cco,
+                        json={"window_from": "2026-07-01T00:00:00Z", "window_to": "2026-10-01T00:00:00Z"})
+        assert r.status_code == 200 and r.json().get("evaluation_id"), r.text
+        ids["control_evaluation_id"] = r.json()["evaluation_id"]
+    with AdminSession() as db:  # GET /test-runs/{test_run_id}: a stored TestRun of tenant A
+        ids["test_run_id"] = db.execute(text(
+            "SELECT test_run_id FROM assurance_test_run WHERE tenant_id = :t "
+            "ORDER BY record_seq, test_run_id LIMIT 1"), {"t": TENANT}).scalar()
+    if ids["test_run_id"] is None:
+        td = client.get(f"/api/controls/{ids['ci_id']}", headers=cco).json()["tests"][0]["test_definition_id"]
+        r = client.post("/api/test-runs", headers=H("actor-owner"), json={
+            "test_definition_id": td, "occurred_at": "2026-07-01T01:00:00Z", "window_from": "2026-07-01T00:00:00Z",
+            "window_to": "2026-08-01T00:00:00Z", "result": "PASS", "source_system": "stage 4 read probe"})
+        assert r.status_code == 200, r.text
+        ids["test_run_id"] = r.json()["test_run_id"]
+    requests = client.get("/api/fact-requests", headers=cco).json()  # GET /fact-requests/{request_id}
+    if requests:
+        ids["request_id"] = requests[-1]["request_id"]
+    else:
+        from app.models import FactDefinition, FactRequest
+        with AdminSession() as db:
+            fd = db.execute(select(FactDefinition).where(FactDefinition.subject_type == "LEGAL_ENTITY")
+                            .order_by(FactDefinition.key)).scalars().first()
+            fr = FactRequest(tenant_id=TENANT, subject_id="subj-entity-eu", fact_definition_id=fd.fact_definition_id,
+                             reason_code="MISSING_REQUIRED_FACT", owner_role=fd.owner_role,
+                             due_at=datetime.now(timezone.utc), linked_evaluation_ids=[])
+            db.add(fr)
+            db.commit()
+            ids["request_id"] = fr.request_id
     conflict = client.post("/api/evidence-conflicts", headers=H("actor-owner"),
                            json={"member_evidence_ids": [ids["evidence_id"]], "description": "stage 4 read probe"})
     assert conflict.status_code == 200, conflict.text

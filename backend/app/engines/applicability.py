@@ -509,9 +509,16 @@ def _flag_review(db, cur, ev, seq, actor_id, reason):
         valid_from=cur.valid_from, record_from_seq=seq, actor_id=actor_id)
     cur.record_to_seq = seq
     db.add(rev)
-    db.add(Issue(tenant_id=cur.tenant_id, title="Adopted determination requires review", issue_type="DETERMINATION_REVIEW",
-                 severity="HIGH", priority="P1", source_ref_type="ApplicabilityEvaluation", source_ref_id=ev.evaluation_id,
-                 dedupe_key=f"detreview:{cur.lineage_id}:{ev.evaluation_id}"))
+    iss = Issue(tenant_id=cur.tenant_id, title="Adopted determination requires review", issue_type="DETERMINATION_REVIEW",
+                severity="HIGH", priority="P1", source_ref_type="ApplicabilityEvaluation", source_ref_id=ev.evaluation_id,
+                dedupe_key=f"detreview:{cur.lineage_id}:{ev.evaluation_id}")
+    db.add(iss)
+    db.flush()  # assigns the issue ID and its initial state, which the CREATED event records
+    # Its creation record, as every other issue producer writes it (governance.record_issue_created: the CREATED event,
+    # the issue.create audit record and the outbox event, in this transaction): raised by the system, with the review
+    # reason this flag recorded on the determination as its reason. Without it the issue had no history to reconstruct.
+    from .governance import record_issue_created
+    record_issue_created(db, issue=iss, actor_id="system", reason=rev.review_reason)
 
 
 def _fact_requests(db: Session, ev, subject, odef):
@@ -814,16 +821,21 @@ def fact_impact_plan(db: Session, *, tenant_id: str, holder: Subject, fd: FactDe
                                                      Subject.entity_id == holder.entity_id,
                                                      Subject.subject_id != holder.subject_id)
                                .order_by(Subject.subject_id)).scalars().all()
-    plan = []
-    for s in subjects:
-        for od in db.execute(select(ObligationDefinition).where(ObligationDefinition.subject_type == s.subject_type)
-                             .order_by(ObligationDefinition.key, ObligationDefinition.obligation_definition_id)).scalars():
-            versions = db.execute(select(RuleVersion).where(RuleVersion.obligation_definition_id == od.obligation_definition_id,
-                                                            RuleVersion.status == "PUBLISHED")
-                                  .order_by(RuleVersion.version.desc())).scalars().all()
-            if any(fd.key in v.required_facts for v in versions):
-                plan.append((s, od))
-    return plan
+    # Two reads, whatever the number of subjects: the definitions of the subjects' types, and the required facts of
+    # their published versions (only that column: a version's AST and golden vectors are not needed). The plan is the
+    # one reading them per subject and definition gave, in the same order (subjects as listed; definitions by key, ID),
+    # so the scopes lock_fact_impact locks, and their order, are unchanged.
+    by_type: dict[str, list[ObligationDefinition]] = {}
+    for od in db.execute(select(ObligationDefinition).where(
+            ObligationDefinition.subject_type.in_(sorted({s.subject_type for s in subjects})))
+            .order_by(ObligationDefinition.key, ObligationDefinition.obligation_definition_id)).scalars():
+        by_type.setdefault(od.subject_type, []).append(od)
+    ids = [od.obligation_definition_id for ods in by_type.values() for od in ods]
+    needs = {od_id for od_id, required in db.execute(select(RuleVersion.obligation_definition_id,
+                                                            RuleVersion.required_facts).where(
+        RuleVersion.obligation_definition_id.in_(ids or ["-"]), RuleVersion.status == "PUBLISHED"))
+        if fd.key in required}
+    return [(s, od) for s in subjects for od in by_type.get(s.subject_type, []) if od.obligation_definition_id in needs]
 
 
 def lock_fact_impact(db: Session, tenant_id: str, plan: list[tuple]) -> None:
@@ -868,7 +880,12 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
 def _consumed(ev: ApplicabilityEvaluation, fact_key: str) -> dict | None:
     """How the evaluation's frozen bundle consumed `fact_key`: the exact assertion revision, or the unknown reason; None
     when the bundle does not name the fact. No value and no value hash (facts.input_bundle_view)."""
-    b = ev.input_bundle if isinstance(ev.input_bundle, dict) else {}
+    return _consumed_in(ev.input_bundle, fact_key)
+
+
+def _consumed_in(bundle, fact_key: str) -> dict | None:
+    """_consumed for a frozen bundle as stored."""
+    b = bundle if isinstance(bundle, dict) else {}
     for f in b.get("fact_inputs") or []:
         if isinstance(f, dict) and f.get("fact_definition") == fact_key:
             return {"fact_assertion_revision_id": f.get("fact_assertion_revision_id"),
@@ -879,12 +896,34 @@ def _consumed(ev: ApplicabilityEvaluation, fact_key: str) -> dict | None:
     return None
 
 
-def _snapshot_record_seqs(db: Session, tenant_id: str, snapshot_ids: list[str]) -> dict[str, int]:
+def _bundle_may_name(db: Session, fact_key: str):
+    """SQL condition: the evaluation's frozen bundle names `fact_key` in fact_inputs or unknown_facts. A prefilter only,
+    so evaluations of other facts are neither fetched nor parsed here; _consumed_in still decides. It never excludes a
+    bundle _consumed_in would accept: on PostgreSQL, JSON containment of {"fact_inputs": [{"fact_definition": key}]}
+    (or unknown_facts) holds exactly when such an object element exists; on SQLite, json_each lists the elements and
+    only object elements are read (any other element is skipped, never an error)."""
+    import json
+    from sqlalchemy import String, bindparam, cast, literal, text
+    if db.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import JSONB
+        b = cast(ApplicabilityEvaluation.input_bundle, JSONB)
+        return or_(*(b.op("@>")(cast(literal(json.dumps({part: [{"fact_definition": fact_key}]}), String), JSONB))
+                     for part in ("fact_inputs", "unknown_facts")))
+    # Parenthesised as one condition: text() is not grouped, and a bare OR next to the statement's other AND terms
+    # would let a matching bundle of any organisation, subject or record time through.
+    return text("(" + " OR ".join(
+        f"EXISTS (SELECT 1 FROM json_each(applicability_evaluation.input_bundle, '$.{part}') AS je "
+        f"WHERE CASE WHEN je.type = 'object' THEN json_extract(je.value, '$.fact_definition') END = :consumed_fact)"
+        for part in ("fact_inputs", "unknown_facts")) + ")").bindparams(bindparam("consumed_fact", fact_key))
+
+
+def _snapshot_record_seqs(db: Session, tenant_id: str, snapshot_ids) -> dict[str, int]:
     """The record sequence at which each snapshot was persisted: that of its assurance.snapshot_created event, written
     in the snapshot's own transaction (asr.compute_snapshot; DAT-REQ-014). The rule of the dossier's historical read
-    (routers/assurance._snapshot_record_seqs); a snapshot without one is absent from the result."""
+    (routers/assurance._snapshot_record_seqs); a snapshot without one is absent from the result. `snapshot_ids`: a list
+    or a SELECT of snapshot IDs (one statement either way)."""
     from ..models import OutboxEvent
-    if not snapshot_ids:
+    if isinstance(snapshot_ids, list) and not snapshot_ids:
         return {}
     out: dict[str, int] = {}
     for sid, seq in db.execute(select(OutboxEvent.aggregate_id, OutboxEvent.record_seq).where(
@@ -898,6 +937,12 @@ def _within(point: datetime, valid_from: datetime, valid_to: datetime | None) ->
     """point in the half-open valid interval [valid_from, valid_to) (TIM-REQ-002; None = open-ended)."""
     point = ensure_utc(point)
     return not point < valid_from and (valid_to is None or point < valid_to)
+
+
+# Identifiers fact_change_dependents has already read are passed to a later statement as a list while there are at
+# most this many (an index lookup per value), and as the equivalent subquery beyond that, so no statement carries an
+# unbounded number of parameters. Either form selects the same rows.
+IN_LIST_LIMIT = 900
 
 
 def fact_change_dependents(db: Session, *, tenant_id: str, holder: Subject, fd: FactDefinition, valid_from: datetime,
@@ -933,57 +978,106 @@ def fact_change_dependents(db: Session, *, tenant_id: str, holder: Subject, fd: 
       obligation           the scope's obligation revision current at K, with whether its valid period overlaps the
                            change;
       assurance_snapshots  snapshots recorded by K of the scope's obligation lineages known at K whose period overlaps
-                           the change."""
+                           the change.
+
+    Reads: a fixed number of statements whatever the number of subjects, scopes or evaluations (one per record class,
+    each restricted in SQL by organisation, subjects, definitions, record time and valid time). Every SQL restriction is
+    one the rules above already impose, and each is checked again in Python where it was decided before (bundle
+    consumption, effective time, period overlap), so the answer is the one reading each scope separately gave. Only the
+    columns the answer shows are read: no evaluation trace, no rule AST or golden vectors, no snapshot segments or
+    manifest, and no frozen bundle of an evaluation that does not consume the fact."""
     valid_from, valid_to = ensure_utc(valid_from), ensure_utc(valid_to)
     plan = fact_impact_plan(db, tenant_id=tenant_id, holder=holder, fd=fd)
     subjects = {holder.subject_id: holder, **{s.subject_id: s for s, _ in plan}}
-    if holder.subject_type == "LEGAL_ENTITY":
+    entity_wide = holder.subject_type == "LEGAL_ENTITY"
+    if entity_wide:
         subjects.update({s.subject_id: s for s in db.execute(select(Subject).where(
             Subject.tenant_id == tenant_id, Subject.entity_id == holder.entity_id)).scalars()})
-    evaluations: dict[tuple[str, str], list[ApplicabilityEvaluation]] = {}
-    for ev in db.execute(select(ApplicabilityEvaluation).where(
-            ApplicabilityEvaluation.tenant_id == tenant_id, ApplicabilityEvaluation.subject_id.in_(list(subjects)),
-            ApplicabilityEvaluation.record_seq <= known_seq)
-            .order_by(ApplicabilityEvaluation.record_seq, ApplicabilityEvaluation.evaluation_id)).scalars():
-        if _consumed(ev, fd.key) is not None and _within(ev.effective_at, valid_from, valid_to):
-            evaluations.setdefault((ev.subject_id, ev.obligation_definition_id), []).append(ev)
+
+    def of_subjects(column):
+        # The subjects above, in SQL: a subquery for a legal entity, so no statement carries one parameter per subject.
+        if not entity_wide:
+            return column.in_(list(subjects))
+        return or_(column == holder.subject_id, column.in_(select(Subject.subject_id).where(
+            Subject.tenant_id == tenant_id, Subject.entity_id == holder.entity_id)))
+
+    E = ApplicabilityEvaluation
+    in_window = [E.effective_at >= valid_from] + ([E.effective_at < valid_to] if valid_to is not None else [])
+    evaluations: dict[tuple[str, str], list[tuple]] = {}
+    for e in db.execute(select(E.evaluation_id, E.subject_id, E.obligation_definition_id, E.effective_at,
+                               E.record_cutoff_seq, E.record_seq, E.rule_version_id, E.evaluator_build, E.trigger,
+                               E.outcome, E.input_bundle).where(
+            E.tenant_id == tenant_id, of_subjects(E.subject_id), E.record_seq <= known_seq, *in_window,
+            _bundle_may_name(db, fd.key)).order_by(E.record_seq, E.evaluation_id)):
+        consumed = _consumed_in(e.input_bundle, fd.key)
+        if consumed is not None and _within(e.effective_at, valid_from, valid_to):
+            evaluations.setdefault((e.subject_id, e.obligation_definition_id), []).append((e, consumed))
     odefs = {od.obligation_definition_id: od for _, od in plan}
     missing = {od_id for _, od_id in evaluations} - set(odefs)
     if missing:
         odefs.update({od.obligation_definition_id: od for od in db.execute(select(ObligationDefinition).where(
             ObligationDefinition.obligation_definition_id.in_(list(missing)))).scalars()})
-    needing: dict[str, list[RuleVersion]] = {}
-    for od_id in odefs:
-        needing[od_id] = [v for v in db.execute(select(RuleVersion).where(
-            RuleVersion.obligation_definition_id == od_id, RuleVersion.status == "PUBLISHED",
-            RuleVersion.record_seq <= known_seq)
-            .order_by(RuleVersion.version.desc(), RuleVersion.rule_version_id)).scalars()
-            if fd.key in (v.required_facts or [])]
+    needing: dict[str, list] = {od_id: [] for od_id in odefs}
+    for v in db.execute(select(RuleVersion.obligation_definition_id, RuleVersion.rule_version_id, RuleVersion.version,
+                               RuleVersion.valid_from, RuleVersion.valid_to, RuleVersion.required_facts).where(
+            RuleVersion.obligation_definition_id.in_(list(odefs) or ["-"]), RuleVersion.status == "PUBLISHED",
+            RuleVersion.record_seq <= known_seq).order_by(RuleVersion.version.desc(), RuleVersion.rule_version_id)):
+        if fd.key in (v.required_facts or []):
+            needing[v.obligation_definition_id].append(v)
     scopes = {(s.subject_id, od.obligation_definition_id) for s, od in plan if needing[od.obligation_definition_id]} | {
         k for k in evaluations if k[1] in odefs}
+    scope_odefs = sorted({od_id for _, od_id in scopes}) or ["-"]
+
+    def per_scope(rows) -> dict[tuple[str, str], list]:
+        grouped: dict[tuple[str, str], list] = {}
+        for r in rows:
+            k = (r.subject_id, r.obligation_definition_id)
+            if k in scopes:
+                grouped.setdefault(k, []).append(r)
+        return grouped
+    D, O, S = ApplicabilityDetermination, ObligationInstance, AssuranceSnapshot
+    dets, obls, lineage_scope, snapshots = {}, {}, {}, {}
+    if scopes:
+        dets = per_scope(db.execute(visible_at(select(D).where(
+            D.tenant_id == tenant_id, of_subjects(D.subject_id), D.obligation_definition_id.in_(scope_odefs)), D,
+            known_seq)).scalars())
+        obls = per_scope(db.execute(visible_at(select(O).where(
+            O.tenant_id == tenant_id, of_subjects(O.subject_id), O.obligation_definition_id.in_(scope_odefs)), O,
+            known_seq)).scalars())
+        # The lineages known at K of each scope: every revision recorded by K names its lineage.
+        lineage_filter = [O.tenant_id == tenant_id, of_subjects(O.subject_id),
+                          O.obligation_definition_id.in_(scope_odefs), O.record_from_seq <= known_seq]
+        for r in db.execute(select(O.lineage_id, O.subject_id, O.obligation_definition_id).where(*lineage_filter)):
+            k = (r.subject_id, r.obligation_definition_id)
+            if k in scopes:
+                lineage_scope[r.lineage_id] = k
+        # Their snapshots, with the period overlap in SQL as a prefilter (overlaps() decides), in the order each scope's
+        # own read used (record cutoff, creation, ID); each kept only once recorded by K.
+        few = IN_LIST_LIMIT
+        in_period = [S.period_to > valid_from] + ([S.period_from < valid_to] if valid_to is not None else [])
+        snap_filter = [S.tenant_id == tenant_id, (S.obligation_lineage_id.in_(sorted(lineage_scope) or ["-"])
+                                                  if len(lineage_scope) <= few else
+                                                  S.obligation_lineage_id.in_(select(O.lineage_id).where(*lineage_filter))),
+                       *in_period]
+        candidates = [x for x in db.execute(select(S.snapshot_id, S.obligation_lineage_id, S.period_from, S.period_to,
+                                                   S.record_cutoff_seq, S.state).where(*snap_filter)
+                                            .order_by(S.record_cutoff_seq, S.created_at, S.snapshot_id))
+                      if x.obligation_lineage_id in lineage_scope
+                      and overlaps(x.period_from, x.period_to, valid_from, valid_to)]
+        ids = [x.snapshot_id for x in candidates]
+        recorded = _snapshot_record_seqs(db, tenant_id, ids if len(ids) <= few else
+                                         select(S.snapshot_id).where(*snap_filter)) if candidates else {}
+        for x in candidates:
+            if recorded.get(x.snapshot_id, known_seq + 1) <= known_seq:
+                snapshots.setdefault(lineage_scope[x.obligation_lineage_id], []).append(x)
     out = []
     for subject_id, od_id in sorted(scopes, key=lambda k: (k[0], odefs[k[1]].key, k[1])):
         s, od = subjects[subject_id], odefs[od_id]
         evs = evaluations.get((subject_id, od_id), [])
-        listed = {e.evaluation_id for e in evs}
-        det = _one_current_determination(db.execute(visible_at(select(ApplicabilityDetermination).where(
-            ApplicabilityDetermination.tenant_id == tenant_id, ApplicabilityDetermination.subject_id == subject_id,
-            ApplicabilityDetermination.obligation_definition_id == od_id), ApplicabilityDetermination, known_seq))
-            .scalars())
-        obl = selection.one_or_none(db.execute(visible_at(select(ObligationInstance).where(
-            ObligationInstance.tenant_id == tenant_id, ObligationInstance.subject_id == subject_id,
-            ObligationInstance.obligation_definition_id == od_id), ObligationInstance, known_seq)).scalars(),
-            record_type="ObligationInstance", selection="obligation_as_of", id_attr="revision_id")
-        lineages = sorted(set(db.execute(select(ObligationInstance.lineage_id).where(
-            ObligationInstance.tenant_id == tenant_id, ObligationInstance.subject_id == subject_id,
-            ObligationInstance.obligation_definition_id == od_id,
-            ObligationInstance.record_from_seq <= known_seq)).scalars()))
-        candidates = [x for x in db.execute(select(AssuranceSnapshot).where(
-            AssuranceSnapshot.tenant_id == tenant_id, AssuranceSnapshot.obligation_lineage_id.in_(lineages or ["-"]))
-            .order_by(AssuranceSnapshot.record_cutoff_seq, AssuranceSnapshot.created_at, AssuranceSnapshot.snapshot_id))
-            .scalars() if overlaps(x.period_from, x.period_to, valid_from, valid_to)]
-        recorded = _snapshot_record_seqs(db, tenant_id, [x.snapshot_id for x in candidates])
-        snapshots = [x for x in candidates if recorded.get(x.snapshot_id, known_seq + 1) <= known_seq]
+        listed = {e.evaluation_id for e, _ in evs}
+        det = _one_current_determination(dets.get((subject_id, od_id), []))
+        obl = selection.one_or_none(obls.get((subject_id, od_id), []), record_type="ObligationInstance",
+                                    selection="obligation_as_of", id_attr="revision_id")
         versions = needing[od_id]
         out.append({
             "subject": {"subject_id": s.subject_id, "display_name": s.display_name, "subject_type": s.subject_type},
@@ -993,8 +1087,8 @@ def fact_change_dependents(db: Session, *, tenant_id: str, holder: Subject, fd: 
             "evaluations": [{"evaluation_id": e.evaluation_id, "effective_at": e.effective_at,
                              "record_cutoff_seq": e.record_cutoff_seq, "record_seq": e.record_seq,
                              "rule_version_id": e.rule_version_id, "evaluator_build": e.evaluator_build,
-                             "trigger": e.trigger, "recorded_outcome": e.outcome, "fact_input": _consumed(e, fd.key)}
-                            for e in evs],
+                             "trigger": e.trigger, "recorded_outcome": e.outcome, "fact_input": consumed}
+                            for e, consumed in evs],
             "determination": None if det is None else {
                 "revision_id": det.revision_id, "lineage_id": det.lineage_id, "state": det.state,
                 "recorded_outcome": det.outcome, "evaluation_id": det.evaluation_id, "valid_from": det.valid_from,
@@ -1008,7 +1102,8 @@ def fact_change_dependents(db: Session, *, tenant_id: str, holder: Subject, fd: 
                 "valid_period_overlaps_change": overlaps(obl.valid_from, obl.valid_to, valid_from, valid_to)},
             "assurance_snapshots": [{"snapshot_id": x.snapshot_id, "obligation_lineage_id": x.obligation_lineage_id,
                                      "period_from": x.period_from, "period_to": x.period_to,
-                                     "record_cutoff_seq": x.record_cutoff_seq, "state": x.state} for x in snapshots]})
+                                     "record_cutoff_seq": x.record_cutoff_seq, "state": x.state}
+                                    for x in snapshots.get((subject_id, od_id), [])]})
     return out
 
 

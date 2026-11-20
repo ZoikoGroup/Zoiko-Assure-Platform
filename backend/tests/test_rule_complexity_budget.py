@@ -199,7 +199,8 @@ def test_runtime_table_limits_match_the_compiler(monkeypatch, limit):
 
 def test_golden_vectors_report_the_limit_as_an_error_never_an_outcome():
     from app.engines import rules
-    rep = rules.run_golden_vectors(_depth(33), [{"vector_id": "v", "facts": {"f.b": True}, "expected_outcome": "APPLIES"}],
+    rep = rules.run_golden_vectors(_depth(33), [{"vector_id": "v", "facts": {"f.b": True}, "expected_outcome": "APPLIES",
+                                                 "effective_at": "2027-12-02"}],  # explicit (RUL §13)
                                    FACT_DEFS, {})
     assert rep["all_passed"] is False and rep["results"][0]["error"] == "RUL_RESOURCE_LIMIT"
     assert "actual" not in rep["results"][0]

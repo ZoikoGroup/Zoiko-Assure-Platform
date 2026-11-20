@@ -179,9 +179,14 @@ def overlapping_current_revisions(db: Session, *, tenant_id: str, subject: Subje
     (assert_fact, the same overlap predicate; the "old revision refs" of fact.changed, ZA-TIM-001 §17). Read-only.
     Ordered by valid time, then revision ID."""
     valid_from, valid_to = ensure_utc(valid_from), ensure_utc(valid_to)
+    # The overlap is also stated in SQL, so revisions wholly before or after the interval are not fetched; the exact
+    # check below still decides (the same predicate, overlaps(): a NULL valid_to is open-ended).
+    in_range = [or_(FactAssertion.valid_to.is_(None), FactAssertion.valid_to > valid_from)]
+    if valid_to is not None:
+        in_range.append(FactAssertion.valid_from < valid_to)
     rows = db.execute(visible_at(select(FactAssertion).where(
         FactAssertion.tenant_id == tenant_id, FactAssertion.subject_id == subject.subject_id,
-        FactAssertion.fact_definition_id == fd.fact_definition_id), FactAssertion, known_seq)).scalars().all()
+        FactAssertion.fact_definition_id == fd.fact_definition_id, *in_range), FactAssertion, known_seq)).scalars().all()
     hit = [a for a in rows if overlaps(a.valid_from, a.valid_to, valid_from, valid_to)]
     return sorted(hit, key=lambda a: (ensure_utc(a.valid_from), a.revision_id))
 

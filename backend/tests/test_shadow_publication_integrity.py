@@ -187,12 +187,24 @@ def test_a_change_class_that_needs_a_shadow_impact_is_refused_without_one(client
     assert db_fingerprint() == before
 
 
-@pytest.mark.parametrize("change_class", SHADOW_OPTIONAL)
+@pytest.mark.parametrize("change_class", [c for c in SHADOW_OPTIONAL if c != "EDITORIAL_METADATA"])
 def test_a_change_class_the_gate_exempts_still_publishes_without_a_shadow_impact(client, world, change_class):
+    # Unchanged pending owner decisions: SOURCE_MAPPING's waiver rests on an undefined "result hash" (RUL §14), and
+    # EXECUTABLE_NON_OUTCOME's "shadow policy based on risk" (RUL §14) is in tension with APP-REQ-013.
     did = _reviewed(client, _body(change_class), shadow=False)
     r = _publish(client, did, change_class)
     assert r.status_code == 200, r.text
     assert r.json()["content_release"]["shadow_summary"] is None
+
+
+def test_an_editorial_release_that_changes_the_executable_is_not_exempt(client, world):
+    """RUL §14: EDITORIAL_METADATA holds "only if executable artifact/hash unaffected"; this draft's AST is new, so it
+    needs its shadow impact like any executable change (tests/test_editorial_change_shadow_gate.py has the full rule)."""
+    did = _reviewed(client, _body("EDITORIAL_METADATA"), shadow=False)
+    before = db_fingerprint()
+    r = _publish(client, did, "EDITORIAL_METADATA")
+    assert r.status_code == 409 and "Shadow impact required" in r.text, r.text
+    assert db_fingerprint() == before
 
 
 def test_another_drafts_shadow_impact_never_authorises_publication(client, world):

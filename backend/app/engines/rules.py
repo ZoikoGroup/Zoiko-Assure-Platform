@@ -1000,6 +1000,33 @@ def _collect_unknown_facts(trace: dict, material: bool, mat: set, nonmat: set):
         _collect_unknown_facts(c, child_material, mat, nonmat)
 
 
+# The recorded fields a rule-branch step shows: never a fact or constant value (display_value), which stays in the trace.
+_BRANCH_STEP_FIELDS = ("node_id", "node_type", "result", "operator", "row_id", "reason_code", "fact", "source_mappings")
+
+
+def fact_ref_paths(trace: Any, fact_key: str) -> list[dict]:
+    """Every path in a recorded evaluation trace from the root to a FACT_REF node of ``fact_key``, in trace order: the
+    nodes on it with their recorded result, operator, row, unknown reason and own source mappings (no value), and
+    whether the fact is material on it. Material is _collect_unknown_facts' rule, the one ``evaluate`` used to list the
+    evaluation's missing_facts: an UNKNOWN fact node whose ancestors, root included, are all UNKNOWN. A node the
+    evaluator short-circuited has no children in the trace, so a fact it did not need has no path. Read-only."""
+    out: list[dict] = []
+
+    def walk(node, path: list, material: bool) -> None:
+        if not isinstance(node, dict):
+            return
+        here = [*path, {k: node[k] for k in _BRANCH_STEP_FIELDS if k in node}]
+        if node.get("node_type") == "FACT_REF":
+            if node.get("fact") == fact_key:
+                out.append({"path": here, "material": material and node.get("result") == UNKNOWN})
+            return
+        for c in node.get("children") or []:
+            walk(c, here, material and node.get("result") == UNKNOWN)
+    if isinstance(trace, dict):
+        walk(trace, [], trace.get("result") == UNKNOWN)
+    return out
+
+
 def evaluate(ast: dict, facts: dict, fact_types: dict, sets: dict, context: dict) -> dict:
     """Pure deterministic evaluation. ``facts``: key -> {known, value, revision_id} | {known: False, reason}.
     Raises RuleResourceLimitError, before any node executes, when the AST exceeds a complexity limit (RUL-REQ-029)."""
@@ -1057,10 +1084,14 @@ def vector_input_problems(vec: Any, fact_defs: dict) -> list[dict]:
     ta = vec.get("trace_assertions")
     if ta is not None and not (isinstance(ta, dict) and all(isinstance(k, str) for k in ta)):
         out.append(p("RUL_SCHEMA_INVALID", "trace_assertions", "trace_assertions must map node IDs to expected states."))
-    if "effective_at" in vec:
-        ea = vec["effective_at"]
-        if not _effective_at_ok(ea):
-            out.append(p("RUL_SCHEMA_INVALID", "effective_at", f"effective_at {ea!r} is not an ISO date."))
+    # RUL §13 "effective_at / record_cutoff: Explicit time perspective" (WF-RUL-04 "Time controls: effective_at ...
+    # explicit"): a vector or fixture without one is refused like a malformed one, never run at an assumed date.
+    if "effective_at" not in vec:
+        out.append(p("RUL_SCHEMA_INVALID", "effective_at",
+                     "effective_at is required: the time perspective is stated explicitly (ZA-RUL-001 §13); no date "
+                     "is assumed."))
+    elif not _effective_at_ok(vec["effective_at"]):
+        out.append(p("RUL_SCHEMA_INVALID", "effective_at", f"effective_at {vec['effective_at']!r} is not an ISO date."))
     return out + fact_input_problems(vec.get("facts"), fact_defs)
 
 
@@ -1136,7 +1167,8 @@ def run_golden_vectors(ast: dict, vectors: list[dict], fact_defs: dict, sets: di
             else:
                 facts[k] = {"known": True, "value": val, "revision_id": "golden"}
         try:
-            out = evaluate(ast, facts, ftypes, sets, {"effective_at": vec.get("effective_at", "2027-12-02")})
+            # The vector's own time perspective, present and well formed (vector_input_problems above); none is assumed.
+            out = evaluate(ast, facts, ftypes, sets, {"effective_at": vec["effective_at"]})
             ok = out["outcome"] == vec["expected_outcome"]
             mism = []
             for node_id, exp in (vec.get("trace_assertions") or {}).items():

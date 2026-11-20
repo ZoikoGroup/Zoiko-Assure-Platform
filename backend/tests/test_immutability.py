@@ -307,61 +307,116 @@ def test_guarded_rows_change_only_in_their_completion_columns(engines):
                 tx.rollback()
 
 
-# The rules app/seed.py releases for the synthetic Customer Zero fixture (the client fixture seeds it): content no other
-# module authors, over seeded facts and subjects only, with no DECIMAL literal.
-SEEDED_RULES = {"EUAIA_DEPLOYER_HR_OVERSIGHT", "EUAIA_TRANSPARENCY_INTERACTION", "DORA_ICT_RISK_FRAMEWORK",
-                "DORA_ICT_INCIDENT_PROCESS"}
+CONTENT = {"author": "actor-content-analyst", "peer": "actor-encoder", "legal": "actor-content-legal",
+           "release": "actor-release"}
 
 
-def _verified_draft(client) -> tuple[dict, str]:
-    """A republication draft of a current rule version, taken through every gate before release (author, peer, legal,
-    shadow). Returns the rule version it supersedes and the draft ID.
+@pytest.fixture(scope="module")
+def controlled_rule(client, engines) -> str:
+    """This module's own rule to republish, published once through every gate (author, peer, legal, shadow, release):
+    a single BOOLEAN predicate over a fact only this module defines, grounded in its own verified requirement, with
+    golden vectors that state their time. Returns its obligation definition ID.
 
-    The base is a seeded rule. Other modules release rules into the same session database that cannot be republished
-    unchanged, by design, and /rules/versions puts them first at random: test_decimal_canonicalization_guard and
-    test_decimal_fact_integrity release the threshold "50000000.00", stored canonicalized as "5E+7" (canonicalize keeps
-    the value but may use exponent form, outside the DECIMAL owner decision), which review rightly refuses to take back
-    as an authored literal (RUL_TYPE_MISMATCH: not a canonical decimal string, RUL §05); and test_decimal_fact_integrity
-    keeps subjects with non-finite stored DECIMAL facts, so a republication of its rules records shadow execution
-    errors and publication rightly refuses it (SHADOW_IMPACT_INCOMPLETE). Neither is what these tests are about."""
+    The publication tests used to republish "the first current version" of the shared catalogue, ordered by obligation
+    definition ID (a random UUID), so the base was whatever another module or the seed happened to leave first. Two kinds
+    of rule there cannot be republished unchanged, and the tests then failed for reasons unrelated to immutability: a
+    released canonical AST that is not a valid draft input (a DECIMAL literal released in exponent form, "50000000.00" ->
+    "5E+7", refused RUL_TYPE_MISMATCH), and a rule whose shadow impact records execution errors (a SINGLE_MATCH rule with
+    subjects meeting both branches: SHADOW_IMPACT_INCOMPLETE). This base is the same on every run and in every test
+    order: no other module asserts its fact, so its shadow impact cannot record an execution error."""
     from conftest import H
     from app.db import AdminSession
-    from app.engines.catalog import RELEASABLE
-    from app.models import ObligationDefinition, Provision, RequirementVersion
+    from app.models import FactDefinition, Instrument, ObligationDefinition
+    tag = secrets.token_hex(4)
+    fact, instrument = f"immut{tag}.flag", f"IMMUT-{tag.upper()}"
+    with AdminSession() as db:
+        db.add(FactDefinition(key=fact, label=fact, data_type="BOOLEAN", subject_type="LEGAL_ENTITY",
+                              sensitivity="CUSTOMER_INTERNAL", manual_attestation_policy="ALLOWED"))
+        db.add(Instrument(identifier=instrument, title="Immutability probe instrument", jurisdiction="EU",
+                          authority="Authority", coverage_mode="ENCODED", regime_owner="immutability probe"))
+        db.commit()
+    src = client.post("/api/catalog/sources", headers=H(CONTENT["author"]), json={
+        "authority": "Authority", "jurisdiction": "EU", "source_type": "PRIMARY_LEGISLATION", "title": "Probe Act",
+        "locator": f"OJ L {tag}/immutability", "instrument_identifier": instrument,
+        "raw_text": "Entities shall keep a register."})
+    assert src.status_code == 200, src.text
+    rv = client.post("/api/catalog/requirements", headers=H(CONTENT["author"]), json={
+        "source_id": src.json()["source_id"], "instrument_identifier": instrument, "requirement_key": f"IMMUT-{tag}",
+        "title": "Register requirement", "locator": "Art. 1", "valid_from": "2024-01-01", "provisions": [
+            {"locator": "Art. 1(1)", "duty_bearer": "FINANCIAL_ENTITY", "modality": "MUST", "action": "keep register",
+             "regulated_object": "register", "timing": "continuous", "normalized_meaning": "Keep a register.",
+             "evidence_expectation": "Register"}]})
+    assert rv.status_code in (200, 201), rv.text
+    assert client.post(f"/api/catalog/requirements/{rv.json()['requirement_version_id']}/verify",
+                       headers=H(CONTENT["legal"])).status_code == 200
+    provision = rv.json()["provisions"][0]
+    with AdminSession() as db:
+        inst = db.execute(select(Instrument).where(Instrument.identifier == instrument)).scalars().one()
+        odef = ObligationDefinition(key=f"IMMUT_{tag.upper()}", title="Immutability probe", instrument_id=inst.instrument_id,
+                                    provision_ids=[provision["provision_id"]], subject_type="LEGAL_ENTITY",
+                                    coverage_mode="ENCODED", schedule_kind="CONTINUOUS", material=True)
+        db.add(odef)
+        db.commit()
+        odef_id = odef.obligation_definition_id
+    mapping = {"source_mapping_id": f"sm_immut_{tag}", "requirement_version_id": rv.json()["requirement_version_id"],
+               "provision_id": provision["provision_id"], "authoritative_reference": provision["locator"],
+               "source_fingerprint": src.json()["fingerprint"], "mapping_type": "DIRECT_TEXT",
+               "reviewer": CONTENT["legal"]}
 
-    def republishable(odef_id: str) -> bool:
-        """Its linked provisions are all still releasable. /rules/versions is ordered by definition ID, which is random,
-        and other modules leave definitions whose requirement versions a later release SUPERSEDED (by design); the
-        verified-content gate rightly refuses to republish those, so they cannot be this test's base."""
-        with AdminSession() as db:
-            ids = db.get(ObligationDefinition, odef_id).provision_ids or []
-            provs = db.execute(select(Provision).where(Provision.provision_id.in_(ids or ["-"]))).scalars().all()
-            return bool(provs) and len(provs) == len(ids) and all(
-                p.lifecycle in RELEASABLE and db.get(RequirementVersion, p.requirement_version_id).lifecycle in RELEASABLE
-                for p in provs)
-    base = next(v for v in client.get("/api/rules/versions", headers=H("actor-content-analyst")).json()
-                if v["obligation_definition"] in SEEDED_RULES and v["superseded_by"] is None
-                and republishable(v["obligation_definition_id"]))
+    def vec(vid, cls, value, expected):
+        return {"vector_id": vid, "vector_class": cls, "description": vid, "effective_at": "2026-06-01",
+                "facts": {fact: value}, "expected_outcome": expected}
+    draft = client.post("/api/rules/drafts", headers=H(CONTENT["author"]), json={
+        "obligation_definition_id": odef_id, "authoring_mode": "AST", "valid_from": "2024-01-01",
+        "change_class": "EXECUTABLE_OUTCOME", "source_mappings": [mapping],
+        "ast": {"node_type": "PREDICATE", "node_id": f"immut_{tag}_p", "operator": "EQ",
+                "source_mappings": [mapping["source_mapping_id"]],
+                "args": [{"node_type": "FACT_REF", "node_id": f"immut_{tag}_pf", "fact": fact},
+                         {"node_type": "CONST", "node_id": f"immut_{tag}_pc", "type": "BOOLEAN", "value": True}]},
+        "golden_vectors": [vec("P", "POSITIVE", True, "APPLIES"), vec("N", "NEGATIVE", False, "DOES_NOT_APPLY"),
+                           vec("U", "UNKNOWN", {"unknown": "MISSING_REQUIRED_FACT"}, "UNCERTAIN")]})
+    assert draft.status_code == 200, draft.text
+    _through_every_gate(client, draft.json()["draft_id"])
+    pub = client.post(f"/api/rules/drafts/{draft.json()['draft_id']}/publish", headers=H(CONTENT["release"]),
+                      json={"label": f"immut-base-{tag}", "changelog": "Immutability probe base rule"})
+    assert pub.status_code == 200, pub.text
+    return odef_id
+
+
+def _through_every_gate(client, did: str) -> None:
+    from conftest import H
+    for actor, step in ((CONTENT["author"], "submit-review"), (CONTENT["peer"], "peer-approve"),
+                        (CONTENT["legal"], "legal-approve"), (CONTENT["release"], "shadow")):
+        r = client.post(f"/api/rules/drafts/{did}/{step}", headers=H(actor))
+        assert r.status_code == 200, (step, r.text)
+
+
+def _verified_draft(client, odef_id: str) -> tuple[dict, str]:
+    """A republication draft of the current version of this module's own rule (controlled_rule), taken through every
+    gate before release (author, peer, legal, shadow). Returns the rule version it supersedes and the draft ID. The base
+    is that definition's one current version, never a version chosen by catalogue order."""
+    from conftest import H
+    current = [v for v in client.get("/api/rules/versions", headers=H(CONTENT["author"])).json()
+               if v["obligation_definition_id"] == odef_id and v["superseded_by"] is None]
+    assert len(current) == 1, current
+    base = current[0]
     draft = client.post("/api/rules/drafts", headers=H("actor-content-analyst"), json={
         "obligation_definition_id": base["obligation_definition_id"], "authoring_mode": "AST",
         "ast": base["canonical_ast"], "golden_vectors": base["golden_vectors"], "source_mappings": base["source_mappings"],
         "valid_from": base["valid_from"], "change_class": "EXECUTABLE_OUTCOME"})
     assert draft.status_code == 200, draft.text
     did = draft.json()["draft_id"]
-    for actor, step in (("actor-content-analyst", "submit-review"), ("actor-encoder", "peer-approve"),
-                        ("actor-content-legal", "legal-approve"), ("actor-release", "shadow")):
-        r = client.post(f"/api/rules/drafts/{did}/{step}", headers=H(actor))
-        assert r.status_code == 200, (step, r.text)
+    _through_every_gate(client, did)
     return base, did
 
 
-def test_rule_publication_writes_each_catalogue_row_once(client, engines):
+def test_rule_publication_writes_each_catalogue_row_once(client, engines, controlled_rule):
     """The real publication path, through every gate (author, peer, legal, shadow, a distinct release manager), works
     against the guard: the RuleVersion and its signed ContentRelease are inserted with final values, the manifest binds
     exactly that RuleVersion and AST hash (RUL-REQ-027), and the published rows cannot be rewritten afterwards."""
     from conftest import H
     owner, _ = engines
-    base, did = _verified_draft(client)
+    base, did = _verified_draft(client, controlled_rule)
     pub = client.post(f"/api/rules/drafts/{did}/publish", headers=H("actor-release"),
                       json={"label": "catalogue-immutability-probe", "changelog": "Republication of an unchanged AST"})
     assert pub.status_code == 200, pub.text
@@ -381,14 +436,14 @@ def test_rule_publication_writes_each_catalogue_row_once(client, engines):
             tx.rollback()
 
 
-def test_failed_publication_leaves_no_catalogue_rows(client, engines, monkeypatch):
+def test_failed_publication_leaves_no_catalogue_rows(client, engines, controlled_rule, monkeypatch):
     """Publication fails closed and atomically (RUL-REQ-020, DAT-REQ-014): when signing fails after the RuleVersion is
     already flushed, nothing of the attempt survives (rule version, release, audit record) and the draft stays VERIFIED.
     A retry then publishes normally, with no version gap left by the failed attempt."""
     from conftest import H
     from app.engines import keys
     owner, _ = engines
-    base, did = _verified_draft(client)
+    base, did = _verified_draft(client, controlled_rule)
     label = f"failed-publication-{secrets.token_hex(4)}"
 
     def fail(_payload):

@@ -383,7 +383,9 @@ def record_issue_created(
     issue: Issue,
     actor_id: str = "system",
     reason: str | None = None,
+    actor: Any = None,
 ) -> IssueEvent:
+    """``actor``: the principal, when a person raised the issue, so the audit record also carries its actor type."""
     seq = next_record_seq(db)
     ev = IssueEvent(
         issue_id=issue.issue_id,
@@ -398,7 +400,8 @@ def record_issue_created(
     )
     db.add(ev)
     audit(db, action="issue.create", object_type="Issue", object_id=issue.issue_id,
-          actor=actor_id, tenant_id=issue.tenant_id, new=issue.state, reason=reason or issue.title, record_seq=seq)
+          actor=actor if actor is not None else actor_id, tenant_id=issue.tenant_id, new=issue.state,
+          reason=reason or issue.title, record_seq=seq)
     emit(db, event_type="assurance.issue_created", aggregate_type="Issue", aggregate_id=issue.issue_id,
          tenant_id=issue.tenant_id, payload={"title": issue.title, "severity": issue.severity})
     return ev
@@ -698,6 +701,106 @@ def raise_control_issue(db: Session, *, ci, evaluation) -> Issue | None:
     return iss
 
 
+# Idempotency-Key operation class of raise_obligation_issue (engines/idempotency.py; platform_idempotency_record).
+RAISE_ISSUE_OPERATION = "issue.raise_from_snapshot"
+
+
+def raise_obligation_issue(db: Session, *, tenant_id: str, actor: Any, obligation_lineage_id: str,
+                           obligation_revision_id: str, snapshot_id: str, reason: str,
+                           idempotency_key: str | None = None, actor_ref: dict | None = None) -> tuple[Issue, bool]:
+    """A person raises the obligation-level issue for a persisted assurance result: ZA-PRD-001 §13 WF-03 Obligation
+    Dossier "request remediation" and WF-05 Assurance Period View "create issue". Returns (issue, created).
+
+    The controlled documents give the two actions no separate fields or rules, so both use this one rule, the one
+    persisted snapshots already apply (engines/assurance.py _issue_hooks):
+      * the condition is the snapshot's result (ZA-EVT-001 issue.created "created from control/assurance condition");
+        ZA-STA-001 §17 names issue triggers for FAILING, NOT_PROVEN and REQUIRES_REVIEW only, so any other result is
+        refused (409 ISSUE_NOT_ELIGIBLE);
+      * issue type, severity and priority come from that result (OBLIGATION_ISSUE_RULES) and are never taken from the
+        caller; no owner, due date or state is set (assignment is POST /issues/{id}/assign; ZA-WRK-001 §06 deadline
+        policy does not exist);
+      * STA §17 / WRK §17 "create/link issue unless an existing open issue already covers" the condition: identity is
+        issue type + obligation lineage. An active issue (not CLOSED / CANCELLED) is linked, not duplicated: an
+        ``issue.snapshot_linked`` audit record names the requester, the snapshot and the reason. Otherwise a new OPEN
+        issue references the snapshot (so verified closure works as for every snapshot-raised issue) and is recorded
+        with its CREATED event, audit record and the catalogued ``issue.created`` outbox event, all in the caller's
+        transaction;
+      * the snapshot must be the obligation's and must have been computed for ``obligation_revision_id``, the revision
+        the caller reviewed: an issue is never attached to another revision of the obligation (409
+        OBLIGATION_REVISION_MISMATCH);
+      * serialised with automatic raising, closure and cancellation by the organisation's issue-raising lock, taken
+        before the first record sequence (one lock order), so concurrent requests never create two active issues;
+      * ``idempotency_key`` (optional, ZA-API-001 §08): the same key and request return the original outcome and write
+        nothing; the key with another request is 409 idempotency_conflict."""
+    from ..models import AssuranceSnapshot, ObligationDefinition, ObligationInstance
+    from . import idempotency
+    from .assurance import OBLIGATION_ISSUE_RULES
+    request = {"obligation_lineage_id": obligation_lineage_id, "obligation_revision_id": obligation_revision_id,
+               "assurance_snapshot_id": snapshot_id, "reason": reason}
+    done = idempotency.replay(db, tenant_id=tenant_id, operation=RAISE_ISSUE_OPERATION, key=idempotency_key,
+                              request=request)
+    if done is not None:
+        outcome, _, issue_id = done.partition(":")
+        prior = db.get(Issue, issue_id)
+        if prior is not None and prior.tenant_id == tenant_id:
+            return prior, outcome == "CREATED"
+    # Another organisation's records are answered exactly like unknown ones.
+    if db.execute(select(ObligationInstance.revision_id).where(
+            ObligationInstance.tenant_id == tenant_id,
+            ObligationInstance.lineage_id == obligation_lineage_id).limit(1)).first() is None:
+        raise HTTPException(404, "obligation not found")
+    revision = db.get(ObligationInstance, obligation_revision_id)
+    if revision is None or revision.tenant_id != tenant_id:
+        raise HTTPException(404, {"error": "OBLIGATION_REVISION_NOT_FOUND", "message": "Obligation revision not found."})
+    if revision.lineage_id != obligation_lineage_id:
+        raise HTTPException(422, {"error": "OBLIGATION_REVISION_SCOPE_MISMATCH",
+                                  "message": "The obligation revision belongs to a different obligation."})
+    snap = db.get(AssuranceSnapshot, snapshot_id)
+    if snap is None or snap.tenant_id != tenant_id:
+        raise HTTPException(404, {"error": "SNAPSHOT_NOT_FOUND", "message": "Assurance snapshot not found."})
+    if snap.obligation_lineage_id != obligation_lineage_id:
+        raise HTTPException(422, {"error": "SNAPSHOT_SCOPE_MISMATCH",
+                                  "message": "The assurance snapshot is for a different obligation."})
+    if snap.obligation_revision_id != obligation_revision_id:
+        raise HTTPException(409, {"error": "OBLIGATION_REVISION_MISMATCH",
+                                  "message": f"The assurance snapshot was computed for obligation revision "
+                                             f"{snap.obligation_revision_id}, not {obligation_revision_id}; nothing "
+                                             f"was raised."})
+    rule = OBLIGATION_ISSUE_RULES.get(snap.state)
+    if rule is None:
+        raise HTTPException(409, {"error": "ISSUE_NOT_ELIGIBLE",
+                                  "message": f"A {snap.state} assurance result raises no issue (ZA-STA-001 §17 defines "
+                                             f"issues for {', '.join(OBLIGATION_ISSUE_RULES)} results)."})
+    title, itype, severity, priority = rule
+    key = f"{itype}:{obligation_lineage_id}"
+    lock_issue_raising(db, tenant_id)
+    active = db.execute(select(Issue).where(Issue.tenant_id == tenant_id, Issue.dedupe_key == key,
+                                            Issue.state.notin_(sorted(TERMINAL_ISSUE_STATES)))
+                        .order_by(Issue.created_at, Issue.issue_id)).scalars().first()
+    if active is not None:
+        audit(db, action="issue.snapshot_linked", object_type="Issue", object_id=active.issue_id, actor=actor,
+              tenant_id=tenant_id, new=active.state, record_seq=next_record_seq(db),
+              reason=f"Raised from AssuranceSnapshot {snap.snapshot_id} ({snap.state}); covered by this open issue: "
+                     f"{reason}")
+        idempotency.remember(db, tenant_id=tenant_id, operation=RAISE_ISSUE_OPERATION, key=idempotency_key,
+                             request=request, result_ref=f"LINKED:{active.issue_id}")
+        return active, False
+    odef = db.get(ObligationDefinition, revision.obligation_definition_id)
+    iss = Issue(tenant_id=tenant_id, title=f"{title}: {odef.title if odef else revision.obligation_definition_id}"[:300],
+                issue_type=itype, severity=severity, priority=priority, source_ref_type="AssuranceSnapshot",
+                source_ref_id=snap.snapshot_id, dedupe_key=key)
+    db.add(iss)
+    db.flush()
+    ev = record_issue_created(db, issue=iss, actor_id=getattr(actor, "actor_id", actor), reason=reason, actor=actor)
+    emit(db, event_type="issue.created", aggregate_type="Issue", aggregate_id=iss.issue_id, tenant_id=tenant_id,
+         entity_id=snap.entity_id, actor=actor_ref, record_seq=ev.record_seq,
+         payload={"issue_id": iss.issue_id, "issue_type": itype, "obligation_lineage_id": obligation_lineage_id,
+                  "obligation_revision_id": obligation_revision_id, "assurance_snapshot_id": snap.snapshot_id})
+    idempotency.remember(db, tenant_id=tenant_id, operation=RAISE_ISSUE_OPERATION, key=idempotency_key,
+                         request=request, result_ref=f"CREATED:{iss.issue_id}")
+    return iss, True
+
+
 def close_issue(db: Session, *, tenant_id: str, actor: Any, issue_id: str, verification_snapshot_id: str | None = None,
                 reason: str, verification_control_evaluation_id: str | None = None) -> tuple[Issue, IssueEvent]:
     """PENDING_VERIFICATION -> CLOSED, verified by the result STA §17 names for the issue's level: a new
@@ -987,7 +1090,9 @@ def open_evidence_conflict(
     actor_id: str,
     member_evidence_ids: list[str],
     description: str,
+    actor: Any = None,
 ) -> tuple[EvidenceConflict, EvidenceConflictEvent]:
+    """``actor``: the principal who opened it, so the audit record carries its principal type as the resolution's does."""
     seq = next_record_seq(db)
     c = EvidenceConflict(
         tenant_id=tenant_id,
@@ -1009,7 +1114,8 @@ def open_evidence_conflict(
     )
     db.add(ev)
     audit(db, action="evidence_conflict.opened", object_type="EvidenceConflict", object_id=c.conflict_id,
-          actor=actor_id, tenant_id=tenant_id, new="OPEN", reason=description, record_seq=seq)
+          actor=actor if actor is not None else actor_id, tenant_id=tenant_id, new="OPEN", reason=description,
+          record_seq=seq)
     emit(db, event_type="evidence.conflict_opened", aggregate_type="EvidenceConflict", aggregate_id=c.conflict_id,
          tenant_id=tenant_id, payload={"member_evidence_ids": member_evidence_ids})
     return c, ev
@@ -1023,7 +1129,11 @@ def resolve_evidence_conflict(
     conflict_id: str,
     reason: str,
 ) -> tuple[EvidenceConflict, EvidenceConflictEvent]:
-    c = db.get(EvidenceConflict, conflict_id)
+    """Append the disposition of an OPEN conflict. The row is locked and re-read before its status is checked, as an
+    issue is (_lock_issue): a concurrent resolution waits for the first to commit and then finds it RESOLVED (409),
+    instead of acting on a stale OPEN read (which migration 0010's finality trigger only stops as a database error)."""
+    c = db.execute(select(EvidenceConflict).where(EvidenceConflict.conflict_id == conflict_id).with_for_update()
+                   .execution_options(populate_existing=True)).scalars().first()
     if not c or c.tenant_id != tenant_id:
         raise HTTPException(404, "Conflict not found")
     if c.status != "OPEN":
