@@ -11,8 +11,9 @@ import { PANEL } from "./types";
    permissions, and the sections are the organisation sidebar's entries (components/nav.ts orgNav), limited by the same
    generated permissions, so nothing is duplicated, invented or refused on arrival. */
 
-/** The actions this person's roles allow, as shortcuts to the screens that perform them. */
-export function YourActions() {
+/** The actions this person's roles allow, as shortcuts to the screens that perform them. `className` places the panel
+ *  in the page's layout (e.g. growing to end level with the column beside it). */
+export function YourActions({ className = "" }: { className?: string }) {
   const { can } = useCan();
   const shortcuts = [
     { perm: "submit_evidence", label: "Upload evidence", href: "/evidence" },
@@ -26,15 +27,15 @@ export function YourActions() {
   ].filter((s) => can(s.perm));
 
   return (
-    <section aria-labelledby="actions-h" className={`${PANEL} px-6 pb-3 pt-5`}>
+    <section aria-labelledby="actions-h" className={`${PANEL} px-6 pb-3 pt-5 ${className}`}>
       <h2 id="actions-h" className="text-[18px] font-semibold leading-6 text-slate-900">Your actions</h2>
       {shortcuts.length ? (
         <ul className="mt-1 divide-y divide-slate-100">
           {shortcuts.map((q) => (
             <li key={q.label}>
               <Link href={q.href}
-                className="group flex items-center justify-between gap-3 rounded py-3 text-[14px] text-slate-700 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
-                {q.label}<ChevronRight size={16} aria-hidden className="shrink-0 text-slate-400 group-hover:text-teal-700" />
+                className="group flex items-center justify-between gap-3 rounded py-3 text-[14px] text-slate-700 transition-colors duration-150 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-600">
+                {q.label}<ChevronRight size={16} aria-hidden className="shrink-0 text-slate-400 transition-[color,transform] duration-150 group-hover:translate-x-0.5 group-hover:text-teal-700" />
               </Link>
             </li>
           ))}
@@ -62,8 +63,8 @@ export function WorkspaceSections({ className = "" }: { className?: string }) {
               {g.items.map(({ href, label, icon: Icon }) => (
                 <li key={href}>
                   <Link href={href}
-                    className="group flex items-center gap-2 rounded py-1.5 text-[14px] text-slate-700 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600">
-                    <Icon size={15} aria-hidden className="shrink-0 text-slate-400 group-hover:text-teal-700" />
+                    className="group flex items-center gap-2 rounded py-1.5 text-[14px] text-slate-700 transition-colors duration-150 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600">
+                    <Icon size={15} aria-hidden className="shrink-0 text-slate-400 transition-colors duration-150 group-hover:text-teal-700" />
                     <span className="min-w-0 truncate">{label}</span>
                   </Link>
                 </li>
