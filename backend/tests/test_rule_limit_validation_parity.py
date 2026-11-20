@@ -233,7 +233,8 @@ def _state(draft_id):
 
 
 def _sandbox(client, draft_id):
-    return client.post(f"/api/rules/drafts/{draft_id}/sandbox", headers=H(AUTHOR), json={"facts": {FACT: True}})
+    return client.post(f"/api/rules/drafts/{draft_id}/sandbox", headers=H(AUTHOR),
+                       json={"facts": {FACT: True}, "effective_at": "2027-12-02"})  # explicit (RUL §13)
 
 
 @pytest.mark.parametrize("where", ["top", "nested"])

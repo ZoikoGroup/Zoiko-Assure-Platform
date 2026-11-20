@@ -196,7 +196,9 @@ def test_vectors(draft_id: str, ctx: Ctx = Depends(authorize("content_author", p
 class SandboxIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     facts: dict
-    effective_at: str = "2027-12-02"
+    # No default (RUL §13 / WF-RUL-04: the time perspective is explicit): an omitted one is refused by the fixture check
+    # in sandbox() exactly as a golden vector without one is, never replaced by an assumed date.
+    effective_at: str | None = None
 
 
 @router.post("/drafts/{draft_id}/sandbox")
@@ -215,8 +217,9 @@ def sandbox(draft_id: str, body: SandboxIn, ctx: Ctx = Depends(authorize(*CONTEN
         raise appl.draft_resource_limit_refusal(d.draft_id, d.revision, over)
     # The fixture is checked as a golden vector's input is (RUL §13 "Typed inputs or deliberate UNKNOWN reason"): a
     # malformed one is refused before it is evaluated, never run with an implicit coercion or a 500.
-    problems = rules.vector_input_problems({"facts": body.facts, "effective_at": body.effective_at,
-                                            "expected_outcome": "APPLIES"}, appl.load_fact_defs(ctx.db))
+    fixture = {"facts": body.facts, "expected_outcome": "APPLIES",
+               **({"effective_at": body.effective_at} if body.effective_at is not None else {})}
+    problems = rules.vector_input_problems(fixture, appl.load_fact_defs(ctx.db))
     if problems:
         raise HTTPException(422, {"error": problems[0]["code"], "message": "Malformed sandbox fixture",
                                   "validation": {"ok": False, "issues": problems, "error_count": len(problems)}})
@@ -326,6 +329,19 @@ def legal_approve(draft_id: str, ctx: Ctx = Depends(authorize("content_legal_rev
     return to_dict(d)
 
 
+def _superseded_version(db, odef_id: str) -> RuleVersion | None:
+    """The version a release of this definition supersedes (manifest "supersedes"): its highest version. Two rows sharing
+    the highest number are refused, never one named by row order (selection.highest_version; DAT-REQ-010)."""
+    return selection.highest_version(db.execute(select(RuleVersion).where(
+        RuleVersion.obligation_definition_id == odef_id)).scalars(), selection="rule_version_latest")
+
+
+def _executable_hash(rep: dict, sets: dict) -> str:
+    """The executable artifact hash a release stores and signs (ZA-RUL-001 §12 hash input, rules.ast_hash) for a
+    validation report's compiled AST: canonical AST, schema and operator-set versions, referenced set hashes."""
+    return rules.ast_hash(rules.canonicalize(rep["compiled_ast"]), {s: sets[s]["hash"] for s in rep["set_refs"]})
+
+
 @router.post("/drafts/{draft_id}/shadow")
 def shadow(draft_id: str, ctx: Ctx = Depends(authorize("content_author", "content_release", "content_legal_review",
                                                         platform=True))):
@@ -347,6 +363,13 @@ def shadow(draft_id: str, ctx: Ctx = Depends(authorize("content_author", "conten
                                                  candidate_required=rep["required_facts"]) | {"completed_at": utcnow().isoformat()}
     except rules.RuleResourceLimitError as e:  # refused before any subject's facts are read (RUL-REQ-029)
         raise appl.draft_resource_limit_refusal(d.draft_id, d.revision, e.violations) from None
+    # What this comparison was of (ZA-APP-001 §10 step 3 "Compare current released outcome vs candidate outcome"): the
+    # executable evaluated and the version then latest released, which a release of this draft would supersede.
+    # Publication accepts the report only while both still hold (see publish).
+    prev = _superseded_version(ctx.db, d.obligation_definition_id)
+    d.shadow_report = {**d.shadow_report, "basis": {
+        "executable_ast_hash": _executable_hash(rep, appl.load_sets(ctx.db)),
+        "superseded_rule_version_id": prev.rule_version_id if prev else None}}
     emit(ctx.db, event_type="rule.shadow_completed", aggregate_type="RuleDraft", aggregate_id=draft_id, payload=d.shadow_report)
     ctx.db.commit()
     return d.shadow_report
@@ -435,15 +458,34 @@ def publish(draft_id: str, body: PublishIn, ctx: Ctx = Depends(authorize("conten
     binding = catalog.release_binding(ctx.db, odef_locked)
     set_hashes = {s: sets[s]["hash"] for s in rep["set_refs"]}
     catalog.validate_draft_source_mappings(ctx.db, d, canon)
-    h = rules.ast_hash(canon, set_hashes)
-    # The version this release supersedes (manifest "supersedes"/"rollback_parent") and numbers after. Two rows sharing
-    # the highest number are refused, never one named by row order (selection.highest_version; DAT-REQ-010).
-    prev = selection.highest_version(ctx.db.execute(select(RuleVersion).where(
-        RuleVersion.obligation_definition_id == d.obligation_definition_id)).scalars(), selection="rule_version_latest")
+    h = _executable_hash(rep, sets)  # rules.ast_hash(canon, set_hashes): the hash stored and signed below
+    # The version this release supersedes (manifest "supersedes"/"rollback_parent") and numbers after (read under the
+    # definition lock taken above).
+    prev = _superseded_version(ctx.db, d.obligation_definition_id)
     if is_correction and (prev is None or prev.content_release_id is None):
         raise HTTPException(409, {"error": "CORRECTION_TARGET_MISSING",
                                   "message": "A CORRECTION must correct a published release of this obligation "
                                              "definition; none exists."})
+    # ZA-RUL-001 §14: EDITORIAL_METADATA is a "Label/help text typo with no executable/source interpretation change",
+    # treated as one "only if executable artifact/hash unaffected". Its shadow exemption above therefore holds only when
+    # this release's executable artifact hash (h: the hash stored and signed below) equals that of the version it
+    # supersedes. A release that changes it, or that supersedes nothing, is an executable change whatever its declared
+    # class and needs its shadow impact like any other (RUL-REQ-019; RUL-REQ-020 fail closed). Nothing is written yet.
+    # ZA-APP-001 §10: a shadow impact compares "current released outcome vs candidate outcome", and the "signed content
+    # release records shadow summary" (step 7). A recorded report is therefore accepted only for the executable it
+    # evaluated (h) against the version this release supersedes: after another release of this definition, or for any
+    # other executable, it describes a different change (APP-REQ-013) and is run again before publication. A report
+    # without that basis (recorded before it was kept) proves neither, so it is refused too (RUL-REQ-020 fail closed).
+    basis = (d.shadow_report or {}).get("basis")
+    if d.shadow_report and not (isinstance(basis, dict) and basis.get("executable_ast_hash") == h
+                                and basis.get("superseded_rule_version_id") == (prev.rule_version_id if prev else None)):
+        raise HTTPException(409, "Shadow impact required before publication: the recorded shadow impact is not for "
+                                 "this executable against the version this release supersedes (ZA-APP-001 §10); run "
+                                 "it again.")
+    if d.change_class == "EDITORIAL_METADATA" and not d.shadow_report and (prev is None or prev.ast_hash != h):
+        raise HTTPException(409, "Shadow impact required before publication: an EDITORIAL_METADATA release must leave "
+                                 "the executable artifact of the version it supersedes unchanged (ZA-RUL-001 §14), "
+                                 "and this one does not.")
     # Impact targets, read and locked BEFORE the record sequence is taken (lock order: engines/applicability.
     # lock_decisions). The rule scope is held exclusively first, so an evaluation of this definition in progress
     # commits before the targets are read (and is re-evaluated), and none can start until this release commits.
@@ -675,9 +717,20 @@ def diff(a: str, b: str, ctx: Ctx = Depends(authorize(*READ, *CONTENT_READERS)))
             if n.get("child"):
                 s |= _req(n["child"])
         return s
+    def executable(node):
+        """The node as a release carries it: the unchanged canonicalizer the executable hash applies (§11 stage 7,
+        §12). A draft holds the authored spelling and a RuleVersion the canonical one ("50000000.00" / "5E+7"), so
+        comparing them as stored reported a change the hash does not see; RUL §12: "Pretty-printed authoring JSON is
+        not the signed authority", §14: EDITORIAL_METADATA only "if executable artifact/hash unaffected". A node the
+        canonicalizer cannot read (an invalid draft literal) is compared as written. Output stays as stored."""
+        try:
+            return rules.canonicalize(node)
+        except (ArithmeticError, ValueError, TypeError, KeyError):
+            return node
     (aa, asm, areq), (ba, bsm, breq) = load(a), load(b)
     ia, ib = _index(aa, {}), _index(ba, {})
-    changed = [{"node_id": k, "before": ia[k], "after": ib[k]} for k in ia.keys() & ib.keys() if ia[k] != ib[k]]
+    changed = [{"node_id": k, "before": ia[k], "after": ib[k]} for k in ia.keys() & ib.keys()
+               if executable(ia[k]) != executable(ib[k])]
     return {"added": [ib[k] for k in ib.keys() - ia.keys()], "removed": [ia[k] for k in ia.keys() - ib.keys()],
             "changed": changed, "facts_added": sorted(set(breq) - set(areq)), "facts_removed": sorted(set(areq) - set(breq)),
             "source_mappings_changed": asm != bsm}

@@ -6,8 +6,10 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
+from .. import pagination
+from ..db import CELL_ID
 from ..engines import applicability as appl
 from ..engines import catalog, idempotency, rules
 from ..engines.facts import (assert_fact, assertion_view, display_value, input_bundle_view,
@@ -142,6 +144,144 @@ def fact_change_impact(subject_id: str, fact_key: str | None = None, valid_from:
                        "assurance_snapshots": sum(len(d["assurance_snapshots"]) for d in dependents)},
             "note": "Dependencies only: nothing was evaluated or written and no outcome is predicted (ZA-APP-001 "
                     "WF-APP-02: no predicted legal result unless a shadow evaluation is explicitly run)."}
+
+
+# ------------------------------------------------------------------ subject applicability history
+SUBJECT_APPLICABILITY_PAGE_DEFAULT, SUBJECT_APPLICABILITY_PAGE_MAX = 50, 200
+# Position of each record kind among the records of one record sequence, so the merged order is total: an evaluation
+# and the determination revision it produced share the sequence of the transaction that recorded both, and the
+# evaluation comes first because the revision rests on it.
+_HISTORY_KIND_RANK = {"EVALUATION": 0, "DETERMINATION": 1}
+# The stored fields each summary shows. Not listed on purpose: an evaluation's trace, input bundle, input_bundle_hash
+# and evaluation_key (opened by ID from GET /applicability/evaluations/{id}, which applies the fact-value redaction).
+_EVALUATION_SUMMARY_FIELDS = ("effective_at", "record_cutoff_seq", "outcome", "evaluator_build", "trigger",
+                              "missing_facts", "non_material_unknowns", "requested_by")
+_DETERMINATION_SUMMARY_FIELDS = ("revision_id", "lineage_id", "evaluation_id", "outcome", "state", "basis",
+                                 "needs_review", "review_reason", "valid_from", "valid_to", "record_from_seq",
+                                 "recorded_at", "actor_id")
+
+
+def _after_position(seq_col, id_col, rank: int, position: tuple[int, int, str]):
+    """The rows of one record kind that come after ``position`` (record_seq, kind rank, id) in the merged order."""
+    seq, pos_rank, last_id = position
+    if rank > pos_rank:
+        return seq_col >= seq
+    if rank < pos_rank:
+        return seq_col > seq
+    return or_(seq_col > seq, and_(seq_col == seq, id_col > last_id))
+
+
+@router.get("/subjects/{subject_id}/applicability")
+def subject_applicability(subject_id: str,
+                          obligation_definition_id: str | None = Query(None, min_length=1, max_length=36),
+                          as_of_record_seq: int | None = Query(None, ge=0),
+                          limit: int = Query(SUBJECT_APPLICABILITY_PAGE_DEFAULT, ge=1,
+                                             le=SUBJECT_APPLICABILITY_PAGE_MAX),
+                          cursor: str | None = Query(None, min_length=1, max_length=2048),
+                          ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=SUBJECT))):
+    """One subject's applicability history: its recorded evaluations and determination revisions, current or as known at
+    a past record sequence, cursor-paginated (ZA-API-001 §14 "GET /v1/subjects/{type}/{id}/applicability: List
+    current/historical evaluations and determinations. Cursor + temporal perspective"; ZA-TIM-001 §16 "Returns
+    lineage/revisions with valid and record intervals"; the WF-APP-01 History region). Read-only.
+
+    Record time: without ``as_of_record_seq`` the current watermark is pinned on the first page (CURRENT); with it, that
+    sequence (AS_OF_RECORD_SEQ; one beyond the watermark is 422 RECORD_SEQ_IN_FUTURE, TIM-REQ-019). Either way the
+    pinned watermark and perspective are echoed in ``page.watermark`` (TIM-REQ-017) and carried in the signed cursor, so
+    a later page never reads newer knowledge (API-REQ-012). Only records recorded by the pinned sequence are listed; a
+    determination revision closed after it is shown open (its later ``record_to_seq`` was not yet known), and
+    ``current_at_watermark`` says whether it was the lineage's current revision then. Determination revisions change
+    only by being closed (every other change is a new revision), so this is exactly the record as then known.
+
+    Valid time: each record carries its own (an evaluation's ``effective_at``, a revision's [valid_from, valid_to)); the
+    listing resolves no state at a valid point (TIM §16: that is a point query with both coordinates).
+
+    Order: (record sequence, evaluation before determination, ID), oldest first, a total order (API §11); filtered by an
+    exact ``obligation_definition_id`` (API-REQ-023). Items are summaries: the trace, input bundle, input-bundle hash
+    and evaluation key stay on GET /applicability/evaluations/{id}, so this list adds no new route to fact values or
+    their hashes. Definition key and title are display labels read as stored (catalogue rows carry no record time).
+    Scoped to the caller's organisation in every query, not only by row-level security; the subject's legal entity
+    decides entity-scoped access."""
+    s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
+    now_seq = current_watermark(ctx.db)["record_seq"]
+    if as_of_record_seq is not None and as_of_record_seq > now_seq:
+        raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                  "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
+    filters = {"subject_id": s.subject_id, "obligation_definition_id": obligation_definition_id,
+               "as_of_record_seq": as_of_record_seq, "limit": limit, "sort": "record_seq,kind,id"}
+    fp, scope = pagination.query_fingerprint(filters), f"subject-applicability:{ctx.tenant}"
+    position = None
+    if cursor:
+        c = pagination.decode_cursor(cursor, scope=scope, query=fp)
+        pinned = c["watermark"]
+        try:
+            position = (int(c["position"][0]), int(c["position"][1]), str(c["position"][2]))
+        except (TypeError, ValueError, IndexError):
+            raise HTTPException(400, {"error": "invalid_cursor", "message": "The cursor is not valid."}) from None
+        if position[1] not in _HISTORY_KIND_RANK.values():
+            raise HTTPException(400, {"error": "invalid_cursor", "message": "The cursor is not valid."})
+    else:
+        pinned = as_of_record_seq if as_of_record_seq is not None else now_seq
+
+    E, D = ApplicabilityEvaluation, ApplicabilityDetermination
+    ev_q = select(E).where(E.tenant_id == ctx.tenant, E.subject_id == s.subject_id, E.record_seq <= pinned)
+    det_q = select(D).where(D.tenant_id == ctx.tenant, D.subject_id == s.subject_id, D.record_from_seq <= pinned)
+    if obligation_definition_id:
+        ev_q = ev_q.where(E.obligation_definition_id == obligation_definition_id)
+        det_q = det_q.where(D.obligation_definition_id == obligation_definition_id)
+    if position is not None:
+        ev_q = ev_q.where(_after_position(E.record_seq, E.evaluation_id, _HISTORY_KIND_RANK["EVALUATION"], position))
+        det_q = det_q.where(_after_position(D.record_from_seq, D.revision_id, _HISTORY_KIND_RANK["DETERMINATION"],
+                                            position))
+    # The first limit+1 of each kind in its own order contain the first limit+1 of the merged order. The merge sorts on
+    # (record sequence, kind) only and is stable, so records of one kind keep the database's ID order: the same order
+    # the cursor predicate above compares IDs in.
+    evs = ctx.db.execute(ev_q.order_by(E.record_seq, E.evaluation_id).limit(limit + 1)).scalars().all()
+    dets = ctx.db.execute(det_q.order_by(D.record_from_seq, D.revision_id).limit(limit + 1)).scalars().all()
+    merged = sorted([(e.record_seq, _HISTORY_KIND_RANK["EVALUATION"], e.evaluation_id, e) for e in evs]
+                    + [(d.record_from_seq, _HISTORY_KIND_RANK["DETERMINATION"], d.revision_id, d) for d in dets],
+                    key=lambda t: (t[0], t[1]))
+    more = len(merged) > limit
+    merged = merged[:limit]
+
+    # What the page's records refer to, read once for the page (a fixed number of statements per page).
+    odef_ids = sorted({row.obligation_definition_id for *_, row in merged})
+    defs = {o.obligation_definition_id: o for o in ctx.db.execute(select(ObligationDefinition).where(
+        ObligationDefinition.obligation_definition_id.in_(odef_ids or ["-"]))).scalars()}
+    rv_ids = sorted({row.rule_version_id for *_, row in merged if isinstance(row, E)})
+    rvs = {r.rule_version_id: r for r in ctx.db.execute(select(RuleVersion).where(
+        RuleVersion.rule_version_id.in_(rv_ids or ["-"]))).scalars()}
+
+    def definition(odef_id: str) -> dict:
+        od = defs.get(odef_id)
+        return ({"obligation_definition_id": odef_id, "key": od.key, "title": od.title} if od else
+                missing_ref("obligation_definition_id", odef_id, "key", "title"))
+
+    items = []
+    for seq, _, _, row in merged:
+        d = to_dict(row)  # the same serialisation (UTC instants) as the evaluation and determination views
+        if isinstance(row, E):
+            rv = rvs.get(row.rule_version_id)
+            items.append({
+                "kind": "EVALUATION", "record_seq": seq, "evaluation_id": d["evaluation_id"],
+                "obligation_definition": definition(row.obligation_definition_id),
+                "rule_version": ({"rule_version_id": rv.rule_version_id, "version": rv.version,
+                                  "content_release_id": rv.content_release_id} if rv else
+                                 {"rule_version_id": row.rule_version_id, "missing": True}),
+                **{k: d[k] for k in _EVALUATION_SUMMARY_FIELDS}, "recorded_at": d["created_at"]})
+        else:
+            closed_by_then = row.record_to_seq is not None and row.record_to_seq <= pinned
+            items.append({
+                "kind": "DETERMINATION", "record_seq": seq,
+                "obligation_definition": definition(row.obligation_definition_id),
+                **{k: d[k] for k in _DETERMINATION_SUMMARY_FIELDS},
+                "record_to_seq": d["record_to_seq"] if closed_by_then else None,
+                "current_at_watermark": not closed_by_then})
+    last = merged[-1] if merged else None
+    nxt = (pagination.encode_cursor(scope=scope, query=fp, position=[last[0], last[1], last[2]], watermark=pinned)
+           if more else None)
+    return pagination.page(items, next_cursor=nxt, limit=limit, watermark={
+        "cell_id": CELL_ID, "record_seq": pinned,
+        "perspective": "AS_OF_RECORD_SEQ" if as_of_record_seq is not None else "CURRENT"})
 
 
 class FactIn(BaseModel):
@@ -600,6 +740,136 @@ def fact_requests(ctx: Ctx = Depends(authorize(*READ))):
         d["subject"] = ctx.db.get(Subject, fr.subject_id).display_name
         out.append(d)
     return out
+
+
+def _fact_request_entity(db, fr: FactRequest) -> str | None:
+    # A fact request belongs to the legal entity of the subject that holds the fact (one of this organisation's).
+    s = db.get(Subject, fr.subject_id)
+    return s.entity_id if s is not None and s.tenant_id == fr.tenant_id else None
+
+
+FACT_REQUEST = entity_of(FactRequest, "request_id", "fact request", entity=_fact_request_entity)
+_SOURCE_MAPPING_FIELDS = ("source_mapping_id", "requirement_version_id", "provision_id", "authoritative_reference")
+
+
+@router.get("/fact-requests/{request_id}")
+def fact_request_view(request_id: str, ctx: Ctx = Depends(authorize(*READ, entity=FACT_REQUEST))):
+    """One missing-fact request with why Assure needs the fact (ZA-APP-001 §08 resolution wireframe: "Why Assure needs
+    this fact: Requirement/provision, rule branch, effective date, current result = UNCERTAIN"; "Fact definition:
+    Canonical name, expected type/domain, acceptable sources, sensitivity and why it is material"; "Current candidates:
+    Existing assertions, provenance, validity, conflicts, expiry; sensitive values masked by role"; WF-APP-02 "Missing
+    facts: Open FactRequests with why-needed explanation"). Read-only: nothing is evaluated, resolved or written.
+
+    ``needed_by``: each evaluation the request links (this organisation's, in record order; a linked ID that cannot be
+    found is listed as missing, never dropped), with what it recorded: outcome, effective date, record cutoff, the
+    obligation definition and exact rule version, whether the fact is material to it (its stored missing_facts), how
+    its frozen input bundle recorded the fact (the unknown reason; never a value or value hash), every rule branch from
+    the root of its stored trace to the fact (rules.fact_ref_paths: recorded node results, no values) and the source
+    mappings on those branches resolved against the rule version's own mapping records (requirement version and
+    provision).
+
+    ``current_resolution``: the fact as the deterministic resolution algorithm (APP §04 steps 1-6, facts.resolve_fact)
+    resolves it today for that evaluation's subject at that evaluation's effective date: the record watermark read
+    once for the whole response, the valid instant explicit (TIM-REQ-006/017). It lists the resolved assertion, or the
+    reason it is unknown with every admissible candidate when they disagree (FACT_CONFLICT: the engine applies no
+    precedence, "latest record wins" being prohibited) and every assertion the policy filter or expiry rejected, each
+    with its reason. Assertions are shown as every other fact read shows them (facts.assertion_view: a redacted
+    sensitivity has no value). It does not predict an outcome; which evaluations a new assertion re-runs is the fact
+    impact preview (GET /subjects/{id}/facts/impact).
+
+    The request row itself (status, owner role, due date, links) is shown as stored: it keeps no record time or state
+    history, so it has no historical perspective. Authorization is the fact-request register's and the fact profile's
+    (READ); the holding subject's legal entity decides entity-scoped access; another organisation's request is 404."""
+    db = ctx.db
+    fr = ctx.scoped(db.get(FactRequest, request_id), "fact request")
+    # Read after the request row: every evaluation the row links was recorded by this watermark.
+    wm = current_watermark(db)
+    known = wm["record_seq"]
+    fd = db.get(FactDefinition, fr.fact_definition_id)
+    holder = db.get(Subject, fr.subject_id)
+    holder = holder if holder is not None and holder.tenant_id == ctx.tenant else None
+    linked = [str(i) for i in (fr.linked_evaluation_ids or [])]
+    E = ApplicabilityEvaluation
+    evs = db.execute(select(E).where(E.tenant_id == ctx.tenant, E.evaluation_id.in_(linked or ["-"]))
+                     .order_by(E.record_seq, E.evaluation_id)).scalars().all()
+    odefs = {o.obligation_definition_id: o for o in db.execute(select(ObligationDefinition).where(
+        ObligationDefinition.obligation_definition_id.in_(sorted({e.obligation_definition_id for e in evs}) or ["-"])))
+        .scalars()}
+    rvs = {r.rule_version_id: r for r in db.execute(select(RuleVersion).where(
+        RuleVersion.rule_version_id.in_(sorted({e.rule_version_id for e in evs}) or ["-"]))).scalars()}
+    subjects = {s.subject_id: s for s in db.execute(select(Subject).where(
+        Subject.tenant_id == ctx.tenant, Subject.subject_id.in_(sorted({e.subject_id for e in evs}) or ["-"])))
+        .scalars()}
+
+    # One resolution per (subject, valid instant) the linked evaluations need, all at the one watermark.
+    resolutions: dict[tuple, dict] = {}
+    for e in evs:
+        point = (e.subject_id, ensure_utc(e.effective_at))
+        if fd is not None and e.subject_id in subjects and point not in resolutions:
+            resolutions[point] = resolve_fact(db, tenant_id=ctx.tenant, subject=subjects[e.subject_id], fd=fd,
+                                              effective_at=e.effective_at, known_seq=known, create_conflicts=False)
+    shown = sorted({rid for r in resolutions.values() for rid in (
+        *([r["revision_id"]] if r.get("known") else []), *(r.get("candidates") or []),
+        *(x["revision_id"] for x in r.get("rejected") or []))})
+    assertions = {a.revision_id: a for a in db.execute(select(FactAssertion).where(
+        FactAssertion.tenant_id == ctx.tenant, FactAssertion.revision_id.in_(shown or ["-"]))).scalars()}
+
+    def assertion(rid: str) -> dict:
+        a = assertions.get(rid)
+        if a is None:
+            return missing_ref("revision_id", rid)
+        row = _fact_row(db, a, fd)
+        # Known at the watermark: a closure recorded after it is not shown (as the impact preview reads it).
+        return {**row, "record_to_seq": None} if a.record_to_seq is not None and a.record_to_seq > known else row
+
+    def resolution_view(e: ApplicabilityEvaluation, valid_at: str) -> dict | None:
+        r = resolutions.get((e.subject_id, ensure_utc(e.effective_at)))
+        if r is None:
+            return None
+        return {"valid_at": valid_at, "known_seq": known, "known": r["known"],
+                "reason": None if r["known"] else r.get("reason"),
+                "assertion": assertion(r["revision_id"]) if r["known"] else None,
+                "candidates": [assertion(rid) for rid in r.get("candidates") or []],
+                "rejected": [{"reason": x["reason"], "assertion": assertion(x["revision_id"])}
+                             for x in r.get("rejected") or []]}
+
+    def needed_by(e: ApplicabilityEvaluation) -> dict:
+        effective_at = ensure_utc(e.effective_at).isoformat().replace("+00:00", "Z")  # as to_dict serialises it
+        od, rv = odefs.get(e.obligation_definition_id), rvs.get(e.rule_version_id)
+        branches = rules.fact_ref_paths(e.trace, fd.key) if fd is not None else []
+        records = {m.get("source_mapping_id"): m for m in (rv.source_mappings or []) if isinstance(m, dict)} if rv else {}
+        mapping_ids = list(dict.fromkeys(m for b in branches for step in b["path"]
+                                         for m in step.get("source_mappings") or []))
+        return {
+            "evaluation_id": e.evaluation_id, "record_seq": e.record_seq, "subject_id": e.subject_id,
+            "effective_at": effective_at, "record_cutoff_seq": e.record_cutoff_seq, "outcome": e.outcome,
+            "obligation_definition": ({"obligation_definition_id": od.obligation_definition_id, "key": od.key,
+                                       "title": od.title, "material": od.material} if od else
+                                      missing_ref("obligation_definition_id", e.obligation_definition_id, "key",
+                                                  "title", "material")),
+            "rule_version": ({"rule_version_id": rv.rule_version_id, "version": rv.version,
+                              "content_release_id": rv.content_release_id} if rv else
+                             {"rule_version_id": e.rule_version_id, "missing": True}),
+            "material": fd is not None and fd.key in (e.missing_facts or []),
+            "consumed": appl._consumed(e, fd.key) if fd is not None else None,
+            "rule_branches": branches,
+            "source_mappings": [{k: records[m].get(k) for k in _SOURCE_MAPPING_FIELDS} if m in records else
+                                {"source_mapping_id": m, "missing": True} for m in mapping_ids],
+            "current_resolution": resolution_view(e, effective_at)}
+
+    found = {e.evaluation_id for e in evs}
+    return {
+        "fact_request": to_dict(fr),
+        "subject": ({"subject_id": holder.subject_id, "display_name": holder.display_name,
+                     "subject_type": holder.subject_type, "entity_id": holder.entity_id} if holder else
+                    missing_ref("subject_id", fr.subject_id, "display_name", "subject_type", "entity_id")),
+        "fact_definition": ({k: getattr(fd, k) for k in (
+            "fact_definition_id", "key", "label", "data_type", "enum_domain", "subject_type", "sensitivity",
+            "allowed_provenance", "manual_attestation_policy", "expiry_days", "conflict_policy", "owner_role")}
+            if fd is not None else missing_ref("fact_definition_id", fr.fact_definition_id, "key", "label")),
+        "needed_by": [needed_by(e) for e in evs]
+                     + [{"evaluation_id": i, "missing": True} for i in dict.fromkeys(linked) if i not in found],
+        "record_watermark": {"cell_id": wm["cell_id"], "record_seq": known, "perspective": "CURRENT"}}
 
 
 @router.get("/history/compare")

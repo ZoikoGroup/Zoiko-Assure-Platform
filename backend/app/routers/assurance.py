@@ -5,7 +5,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from sqlalchemy import func, or_, select
 
@@ -18,8 +18,9 @@ from ..models import (AdoptionAttestation, ApplicabilityDetermination, Applicabi
                       EvidenceArtifact, ExceptionEvent, ExceptionRecord, Issue, IssueEvent, ObligationDefinition,
                       ObligationInstance, ObligationOccurrence, ObligationOccurrenceEvent, RiskAcceptance,
                       SatisfactionExpressionVersion, SourceRun, Subject, TestDefinition, TestRun)
-from ..platform import audit, current_watermark, digest, emit, ensure_utc, next_record_seq, to_dict
+from ..platform import audit, current_watermark, digest, ensure_utc, next_record_seq, to_dict
 from ..security import DOSSIER_READ, Ctx, EntityOf, authorize, entity_of
+from .applicability import Instant
 
 router = APIRouter()
 
@@ -74,6 +75,16 @@ def _exception_entity(db, x: ExceptionRecord) -> str | None:
 OBLIGATION = EntityOf("obligation", lambda db, tenant, p: _find_obl(db, tenant, p["lineage"]) if p.get("lineage") else None)
 SNAPSHOT = entity_of(AssuranceSnapshot, "snapshot_id", "snapshot")
 CONTROL = entity_of(ControlImplementation, "ci_id", "control")
+
+
+def _evaluation_entity(db, e: ControlEvaluation) -> str | None:
+    # A control evaluation belongs to the legal entity of the control implementation it evaluated (this organisation's).
+    ci = db.get(ControlImplementation, e.control_implementation_id)
+    return ci.entity_id if ci is not None and ci.tenant_id == e.tenant_id else None
+
+
+CONTROL_EVALUATION = entity_of(ControlEvaluation, "control_evaluation_id", "control evaluation",
+                               entity=_evaluation_entity)
 OCCURRENCE = entity_of(ObligationOccurrence, "occurrence_id", "occurrence",
                        entity=lambda db, o: _lineage_entity(db, o.tenant_id, o.obligation_lineage_id))
 COMPENSATION = entity_of(Compensation, "comp_id", "compensation",
@@ -463,6 +474,62 @@ def preview(lineage: str, body: PeriodIn, ctx: Ctx = Depends(authorize(*DOSSIER_
     return r
 
 
+class ComparisonSideIn(BaseModel):
+    """One knowledge state (ZA-TIM-001 WF-TIM-02 "Two explicit record watermarks / snapshot IDs"): a frozen snapshot of
+    this obligation and period, or an explicit record cutoff to reconstruct at (named as PeriodIn names it). Exactly
+    one."""
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=36)
+    record_cutoff_seq: StrictInt | None = Field(default=None, ge=0)  # strict: "5", 5.0 or true are refused
+
+    @model_validator(mode="after")
+    def _exactly_one(self):
+        if (self.snapshot_id is None) == (self.record_cutoff_seq is None):
+            raise ValueError("A comparison side is exactly one of snapshot_id or record_cutoff_seq")
+        return self
+
+    def spec(self) -> dict:
+        """The side as engines/assurance_comparison.compare takes it."""
+        return {"snapshot_id": self.snapshot_id} if self.snapshot_id is not None else {"record_seq": self.record_cutoff_seq}
+
+
+class ComparisonIn(BaseModel):
+    """The same valid period on both sides (TIM §12), as the obligation's other assurance requests take it (PeriodIn)."""
+    model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
+    period_from: datetime
+    period_to: datetime
+    left: ComparisonSideIn
+    right: ComparisonSideIn
+
+
+@router.post("/obligations/{lineage}/historical-comparisons")
+def historical_comparison(lineage: str, body: ComparisonIn,
+                          ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=OBLIGATION))):
+    """Compare this obligation's assurance over one valid period between two knowledge states (ZA-TIM-001 §16 "POST
+    /historical-comparisons: Compares same valid period across two record cutoffs/snapshots"; WF-STA-01 History
+    "compare-current-reconstruction action"; WF-STA-05 "Audit compare: Compare AS_KNOWN_THEN vs RECONSTRUCTED_NOW for
+    same period"; WF-TIM-02). Each side is a frozen snapshot, read as stored, or a reconstruction at an explicit record
+    cutoff; the answer is engines/assurance_comparison.compare's, unchanged: each side's known_at and perspective, the
+    outcome difference (state, reason codes, roll-up version, aligned segment timeline) and the exact dependency
+    references added or removed with the cutoff that first recorded each, plus what changed between the cutoffs for
+    records both sides share. Reconstructions decide occurrence due times at one instant, the request instant, which is
+    echoed as evaluation_instant.
+
+    The ZA-TIM-001 §12 difference classes are not assigned: ``differences`` is null with ``differences_note`` (no
+    controlled document maps assurance dependency changes onto them; owners ZA-TIM-001 Data Architect and Head of
+    Assurance). Read-only, like POST /obligations/{lineage}/preview and under its authorization: nothing is stored, no
+    snapshot is persisted, no issue is raised, and the transaction is rolled back. Refusals are the engine's: 422 for an
+    empty period, a snapshot of another obligation or period, a record cutoff beyond the watermark
+    (RECORD_SEQ_IN_FUTURE); 404 for an obligation or snapshot that is not this organisation's."""
+    from ..engines import assurance_comparison
+    try:
+        return assurance_comparison.compare(
+            ctx.db, tenant_id=ctx.tenant, obligation_lineage_id=lineage, period_from=body.period_from,
+            period_to=body.period_to, left=body.left.spec(), right=body.right.spec(), actor_id=ctx.actor.actor_id)
+    finally:
+        ctx.db.rollback()  # read-only: nothing the reconstruction derived is kept
+
+
 @router.get("/snapshots/{snapshot_id}")
 def get_snapshot(snapshot_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=SNAPSHOT))):
     return to_dict(ctx.scoped(ctx.db.get(AssuranceSnapshot, snapshot_id), "snapshot"))
@@ -574,8 +641,12 @@ def control_detail(ci_id: str, days: int = 30, ctx: Ctx = Depends(authorize(*DOS
     """WF-STA-02 Control Evaluation."""
     ci = ctx.scoped(ctx.db.get(ControlImplementation, ci_id), "control")
     now = datetime.now(timezone.utc)
-    try:
-        ce = asr.evaluate_control(ctx.db, ci, now - timedelta(days=days), now, 10**15, persist=False)
+    try:  # a day count beyond the calendar is invalid input, never an unhandled OverflowError (HTTP 500)
+        window_from = now - timedelta(days=days)
+    except OverflowError:
+        raise HTTPException(422, "days is out of range for a control window") from None
+    try:  # days <= 0 is an empty or inverted window: the engine refuses it (422) before any state is derived
+        ce = asr.evaluate_control(ctx.db, ci, window_from, now, 10**15, persist=False)
     except asr.AssuranceConfigurationError as e:  # an error object, never a control state (STA §16)
         ce = {"state": None, "configuration_error": e.detail}
     # Every read is scoped to the caller's organisation in the query itself, not only by row-level security (which the
@@ -601,6 +672,71 @@ def control_detail(ci_id: str, days: int = 30, ctx: Ctx = Depends(authorize(*DOS
                 .order_by(ControlEvaluation.created_at.desc(), ControlEvaluation.evaluation_id.desc()).limit(20)).scalars()]}
 
 
+@router.get("/controls/{ci_id}/state")
+def control_state(ci_id: str, window_from: Instant | None = None, window_to: Instant | None = None,
+                  as_of_record_seq: int | None = Query(default=None, ge=0),
+                  ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=CONTROL))):
+    """WF-STA-02 Control Evaluation for an explicit valid window, current or as known at a past record sequence
+    (ZA-STA-001 §18 "GET /controls/{id}/state: Current/historical control state. Never accepts manual state mutation";
+    FR-CTL-005). Read-only: derived exactly as POST /controls/{id}/evaluate derives it, with nothing stored and no issue
+    raised. The window is required (ZA-TIM-001 §16: no ambiguous historical query); without ``as_of_record_seq`` the
+    current watermark is used. Either way the resolved watermark and perspective are echoed (TIM-REQ-017,
+    STA-REQ-030), with the stored evaluation that has exactly these inputs and this result (STA-REQ-028)."""
+    ci = ctx.scoped(ctx.db.get(ControlImplementation, ci_id), "control")
+    # Checked here, after the control is resolved: another organisation's control answers 404 whatever is sent.
+    missing = [n for n, v in (("window_from", window_from), ("window_to", window_to)) if v is None]
+    if missing:
+        raise HTTPException(422, f"Required: {', '.join(missing)} (a control state is for an explicit valid window; "
+                                 "ZA-TIM-001 §16)")
+    a, b = ensure_utc(window_from), ensure_utc(window_to)
+    if b <= a:
+        raise HTTPException(422, "The control window must be a non-empty half-open interval")
+    now_seq = current_watermark(ctx.db)["record_seq"]
+    if as_of_record_seq is not None and as_of_record_seq > now_seq:
+        raise HTTPException(422, {"error": "RECORD_SEQ_IN_FUTURE",
+                                  "message": f"as_of_record_seq is beyond the current record sequence {now_seq}"})
+    cutoff = as_of_record_seq if as_of_record_seq is not None else now_seq
+    if ci.record_seq > cutoff:
+        raise HTTPException(404, "control not found as of requested record sequence")
+    from .. import codes
+    out = {"control_implementation_id": ci.control_implementation_id, "window": [a, b],
+           **asr.control_state_at(ctx.db, ci, a, b, cutoff), "evaluator_version": codes.CONTROL_EVALUATOR_VERSION,
+           "record_watermark": {"cell_id": CELL_ID, "record_seq": cutoff,
+                                "perspective": "AS_OF_RECORD_SEQ" if as_of_record_seq is not None else "CURRENT"}}
+    ctx.db.rollback()  # read-only: nothing this request derived is kept
+    return out
+
+
+@router.get("/control-evaluations/{control_evaluation_id}")
+def control_evaluation(control_evaluation_id: str,
+                       ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=CONTROL_EVALUATION))):
+    """One stored, immutable ControlEvaluation with what it was derived under (ZA-STA-001 §18 "GET
+    /control-evaluations/{id}: Retrieve immutable evaluation and authorized explanation. Includes exact
+    tests/evidence/policy version"; STA-REQ-019/020): its state, reason codes, precedence rule, window, record cutoff,
+    evaluator version and exact test-run/evidence inputs as recorded, the control implementation, definition and
+    subject, and the exact test policy version with its test definitions. What a snapshot leaf's control_evaluation_id
+    opens (WF-STA-03 evidence trace). Nothing is recomputed."""
+    e = ctx.scoped(ctx.db.get(ControlEvaluation, control_evaluation_id), "control evaluation")
+    ci = ctx.db.get(ControlImplementation, e.control_implementation_id)
+    ci = ci if ci is not None and ci.tenant_id == ctx.tenant else None
+    cd = ctx.db.get(ControlDefinition, ci.control_definition_id) if ci is not None else None
+    subject = ctx.db.get(Subject, ci.subject_id) if ci is not None else None
+    subject = subject if subject is not None and subject.tenant_id == ctx.tenant else None
+    policy = ctx.db.get(ControlTestPolicy, e.policy_version_id)
+    policy = policy if policy is not None and policy.tenant_id == ctx.tenant else None
+    tds = ctx.db.execute(select(TestDefinition).where(TestDefinition.tenant_id == ctx.tenant,
+                                                      TestDefinition.policy_version_id == e.policy_version_id)
+                         .order_by(TestDefinition.test_definition_id)).scalars().all() if policy is not None else []
+    return {"evaluation": to_dict(e),
+            "implementation": to_dict(ci) if ci is not None else _missing(
+                "control_implementation_id", e.control_implementation_id, "control_definition_id", "subject_id"),
+            "definition": to_dict(cd) if cd is not None else None,
+            "subject": to_dict(subject) if subject is not None else None,
+            "policy": to_dict(policy) if policy is not None else _missing(
+                "policy_version_id", e.policy_version_id, "version", "aggregation_mode"),
+            "test_definitions": [to_dict(td) for td in tds]}
+
+
 class WindowIn(BaseModel):
     model_config = ConfigDict(extra="forbid")  # API-REQ-014: unknown fields are refused
     window_from: datetime
@@ -612,9 +748,11 @@ def evaluate_control(ci_id: str, body: WindowIn,
                      ctx: Ctx = Depends(authorize("manage_controls", "request_evaluation", "package"))):
     ci = ctx.scoped(ctx.db.get(ControlImplementation, ci_id), "control")
     from ..platform import current_watermark
-    r = asr.evaluate_control(ctx.db, ci, body.window_from, body.window_to, current_watermark(ctx.db)["record_seq"])
-    emit(ctx.db, event_type="control.evaluated", aggregate_type="ControlEvaluation", aggregate_id=r.get("evaluation_id") or ci_id,
-         tenant_id=ctx.tenant, payload={"state": r["state"], "reason_codes": r["reason_codes"]})
+    # control.evaluated is written by the engine with the evaluation it stores (ZA-EVT-001 §17), and only then: a window
+    # with no state derived stores no evaluation and publishes nothing (it used to name this implementation as a
+    # ControlEvaluation aggregate). An empty or inverted window is refused (422) before anything is derived.
+    r = asr.evaluate_control(ctx.db, ci, body.window_from, body.window_to, current_watermark(ctx.db)["record_seq"],
+                             emit_event=True)
     ctx.db.commit()
     return r
 
@@ -631,6 +769,15 @@ class TestDefIn(BaseModel):
     degrades_on_fail: bool = False
     ipe_required: bool = False
     criterion: dict | None = None
+
+    @model_validator(mode="after")
+    def _criterion(self):
+        # The grammar engines/ipe.evaluate_criterion implements; it refuses the same criteria if stored without this check.
+        from ..engines.ipe import criterion_problems
+        problems = criterion_problems(self.criterion) if self.criterion is not None else []
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
 
 
 class ControlIn(BaseModel):
@@ -720,6 +867,61 @@ def ingest_test_run(body: TestRunIn, ctx: Ctx = Depends(authorize("submit_eviden
                                           idempotency_key=idempotency_key)
     ctx.db.commit()
     return to_dict(run)
+
+
+def _test_run_chain(db, run: TestRun) -> tuple:
+    """The test definition, policy version and control implementation a run was recorded against, each only if it is
+    one of the run's organisation's rows (None from the first link that cannot be followed)."""
+    td = db.get(TestDefinition, run.test_definition_id)
+    td = td if td is not None and td.tenant_id == run.tenant_id else None
+    pol = db.get(ControlTestPolicy, td.policy_version_id) if td is not None else None
+    pol = pol if pol is not None and pol.tenant_id == run.tenant_id else None
+    ci = db.get(ControlImplementation, pol.control_implementation_id) if pol is not None else None
+    ci = ci if ci is not None and ci.tenant_id == run.tenant_id else None
+    return td, pol, ci
+
+
+def _test_run_entity(db, run: TestRun) -> str | None:
+    # A test run belongs to the legal entity of the control implementation it tests; a chain that cannot be followed
+    # resolves to no entity, so only organisation-wide roles reach that run (fail closed).
+    ci = _test_run_chain(db, run)[2]
+    return ci.entity_id if ci is not None else None
+
+
+TEST_RUN = entity_of(TestRun, "test_run_id", "test run", entity=_test_run_entity)
+
+
+@router.get("/test-runs/{test_run_id}")
+def get_test_run(test_run_id: str, ctx: Ctx = Depends(authorize(*DOSSIER_READ, entity=TEST_RUN))):
+    """One stored TestRun, exactly the record named (WF-STA-03 Evidence trace: "Leaf opens exact ControlEvaluation
+    TestRun Evidence references, without exposing unauthorized payload"; the run IDs are those a stored
+    ControlEvaluation's inputs and a snapshot's dependency manifest name). A TestRun is "One execution/imported result.
+    Immutable; source provenance and evaluated period required" (DOM §7.1): it is read by its ID and never replaced by
+    a later run, a retest or a correction of the same test, each of which is its own record. Nothing is recomputed.
+
+    Returned as stored, with the test definition (required/optional, primary, source class, IPE requirement), its
+    policy version and the control implementation, definition and subject it was recorded against: the fields
+    GET /controls/{id} and GET /control-evaluations/{id} already show the same readers. Evidence and the source run
+    are referenced by ID only (``evidence_ids``, ``source_run_id``), never their payload; they open through their own
+    reads and authorization (evidence, IPE source runs). A related record that cannot be found is reported as missing,
+    never substituted. Read like the control it tests (DOSSIER_READ, entity-scoped); another organisation's run is
+    404."""
+    db = ctx.db
+    run = ctx.scoped(db.get(TestRun, test_run_id), "test run")
+    td, pol, ci = _test_run_chain(db, run)
+    cd = db.get(ControlDefinition, ci.control_definition_id) if ci is not None else None
+    subject = db.get(Subject, ci.subject_id) if ci is not None else None
+    subject = subject if subject is not None and subject.tenant_id == ctx.tenant else None
+    return {"test_run": to_dict(run),
+            "test_definition": to_dict(td) if td is not None else _missing(
+                "test_definition_id", run.test_definition_id, "name", "required", "policy_version_id"),
+            "policy": to_dict(pol) if pol is not None else (_missing(
+                "policy_version_id", td.policy_version_id, "version", "aggregation_mode") if td is not None else None),
+            "implementation": to_dict(ci) if ci is not None else (_missing(
+                "control_implementation_id", pol.control_implementation_id, "control_definition_id", "subject_id")
+                if pol is not None else None),
+            "definition": to_dict(cd) if cd is not None else None,
+            "subject": to_dict(subject) if subject is not None else None}
 
 
 # ------------------------------------------------------------------ exceptions (separate governance treatment)
@@ -848,6 +1050,36 @@ def issues(ctx: Ctx = Depends(authorize(*DOSSIER_READ))):
     # PostgreSQL's physical row order, which an UPDATE (a transition, an assignment) changes.
     return [to_dict(i) for i in ctx.db.execute(select(Issue).where(Issue.tenant_id == ctx.tenant)
                                                .order_by(Issue.created_at.desc(), Issue.issue_id)).scalars()]
+
+
+class IssueRaiseIn(BaseModel):
+    """WF-03 "request remediation" / WF-05 "create issue": the persisted assurance result the issue is raised from, the
+    obligation revision the caller reviewed and why. Issue type, severity, priority, owner, due date and state are not
+    accepted (unknown fields are refused, API-REQ-014): they follow the result, as for issues snapshots raise."""
+    model_config = ConfigDict(extra="forbid")
+    assurance_snapshot_id: str = Field(min_length=1, max_length=36)
+    obligation_revision_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/obligations/{lineage}/issues", status_code=201)
+def raise_obligation_issue(lineage: str, body: IssueRaiseIn, response: Response,
+                           ctx: Ctx = Depends(authorize("manage_issues")),
+                           idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    """Raise the obligation-level issue for an assurance result (ZA-PRD-001 §13 WF-03 / WF-05; ZA-STA-001 §17). 201 with
+    the new issue, or 200 with the open issue that already covers the condition (linked, nothing duplicated). Rules:
+    engines/governance.py raise_obligation_issue. Never changes assurance, control or obligation state (STA-REQ-023)."""
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(422, {"error": "REASON_REQUIRED", "message": "A reason is required."})
+    i, created = governance.raise_obligation_issue(
+        ctx.db, tenant_id=ctx.tenant, actor=ctx.actor, obligation_lineage_id=lineage,
+        obligation_revision_id=body.obligation_revision_id, snapshot_id=body.assurance_snapshot_id, reason=reason,
+        idempotency_key=idempotency_key, actor_ref=ctx.actor_ref())
+    ctx.db.commit()
+    if not created:
+        response.status_code = 200
+    return to_dict(i)
 
 
 ISSUE_FLOW = {"OPEN": {"TRIAGED", "CANCELLED"}, "TRIAGED": {"IN_REMEDIATION", "CANCELLED"},

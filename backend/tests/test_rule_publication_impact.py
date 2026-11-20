@@ -562,8 +562,13 @@ def test_concurrent_publications_get_distinct_versions(client, world, pg, monkey
     d2, bad2 = _draft(client, "cp2")
     assert bad1 is None and bad2 is None
     out, waited = _race(monkeypatch, appl, "lock_decisions", lambda: _publish_direct(d1), lambda: _publish_direct(d2))
-    assert out["A"][0] == "ok" and out["B"][0] == "ok", out
-    assert waited and out["B"][1] == out["A"][1] + 1
+    # Both drafts were shadowed while the same version was released. B waits for A, then finds A released: its shadow
+    # impact compares against a version it no longer supersedes (ZA-APP-001 §10), so it is refused and run again, and
+    # the re-shadowed draft numbers after A (the rule itself: tests/test_shadow_report_binding.py).
+    assert out["A"][0] == "ok" and out["B"][0] == 409 and "Shadow impact required" in out["B"][1], out
+    assert waited
+    assert client.post(f"/api/rules/drafts/{d2}/shadow", headers=H(RELEASE)).status_code == 200
+    assert _publish_direct(d2) == out["A"][1] + 1
 
 
 def test_concurrent_publication_of_one_draft_publishes_once(client, world, pg, monkeypatch):

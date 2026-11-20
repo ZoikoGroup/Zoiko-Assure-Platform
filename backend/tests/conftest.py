@@ -61,6 +61,20 @@ def H(actor):
     return {"X-Actor-Id": actor}
 
 
+def shadow_report_for(db, draft) -> dict:
+    """The shadow report a shadow run records for `draft`, for tests that put a draft in a shadowed state below the API:
+    its basis is computed as routers/rules.py records it (the executable artifact hash of the draft's current content
+    and the version a release of it would supersede), so the publication gate accepts it exactly as it would a real one."""
+    from app.engines import applicability as appl
+    from app.routers.rules import _executable_hash, _superseded_version, _validate
+    from app.security import Ctx
+    rep = _validate(Ctx(db=db, actor=None), draft, mappings=False)
+    prev = _superseded_version(db, draft.obligation_definition_id)
+    return {"buckets": {}, "completed_at": "2026-11-07T00:00:00+00:00",
+            "basis": {"executable_ast_hash": _executable_hash(rep, appl.load_sets(db)) if rep["ok"] else None,
+                      "superseded_rule_version_id": prev.rule_version_id if prev else None}}
+
+
 def add_principal(db, **fields):
     """A test principal whose roles (fields["roles"]) are granted the way the application grants them since Stage 4b:
     recorded organisation-/platform-wide assignments in the role registry, not the org_actor.roles cache."""

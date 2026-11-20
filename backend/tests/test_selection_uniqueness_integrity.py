@@ -647,8 +647,13 @@ def test_concurrent_publications_of_one_definition_number_versions_uniquely(clie
     release.set()
     a.join(120)
     b.join(120)
-    assert waited and out["first"][0] == "ok" and out["second"][0] == "ok", out
-    assert out["second"][1] == out["first"][1] + 1, out
+    # Both drafts were shadowed while the same version was released: the second waits on the definition row lock, then
+    # finds the first released, so its shadow impact no longer compares against the version it would supersede
+    # (ZA-APP-001 §10; tests/test_shadow_report_binding.py). Re-shadowed, it numbers after the first.
+    assert waited and out["first"][0] == "ok" and out["second"][0] == 409, out
+    assert "Shadow impact required" in out["second"][1], out
+    assert client.post(f"/api/rules/drafts/{d2}/shadow", headers=H(RELEASE)).status_code == 200
+    assert do(d2)() == out["first"][1] + 1
     with AdminSession() as db:
         versions = [v.version for v in _rule_versions(db, S["odef_race"])]
         assert versions == sorted(set(versions)) == [1, 2, 3]

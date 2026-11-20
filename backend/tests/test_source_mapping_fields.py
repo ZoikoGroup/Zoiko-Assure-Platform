@@ -17,7 +17,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select, text
 
-from conftest import H
+from conftest import H, shadow_report_for
 from test_authorization import db_fingerprint
 
 TAG = secrets.token_hex(3).upper()
@@ -100,7 +100,7 @@ def _verified_below_the_api(did):
     with AdminSession() as db:
         d = db.get(RuleDraft, did)
         d.status, d.peer_reviewer_id, d.legal_reviewer_id = "VERIFIED", PEER, LEGAL
-        d.shadow_report = {"buckets": {}, "completed_at": "2026-11-07T00:00:00+00:00"}
+        d.shadow_report = shadow_report_for(db, d)
         db.commit()
 
 

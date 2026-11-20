@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import select
 
-from conftest import H, add_principal
+from conftest import H, add_principal, shadow_report_for
 
 TAG = secrets.token_hex(4).upper()
 AUTHOR = "actor-content-analyst"
@@ -62,7 +62,7 @@ def _reviewed_draft_with_mappings(client, odef_id, ast, mappings, tag="probe"):
         with AdminSession() as db:
             row = db.get(RuleDraft, did)
             row.status, row.peer_reviewer_id, row.legal_reviewer_id = "VERIFIED", PEER, LEGAL
-            row.shadow_report = {"buckets": {}, "completed_at": "2026-11-07T00:00:00+00:00"}
+            row.shadow_report = shadow_report_for(db, row)
             db.commit()
         return did
     assert r.status_code == 200, r.text

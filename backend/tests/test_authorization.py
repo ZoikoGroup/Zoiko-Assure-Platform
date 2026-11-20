@@ -108,7 +108,9 @@ def call(client, method, path, actor, json=None):
 
 
 # ------------------------------------------------------------------------------------------------ F2: the guard
-READ_ONLY_CHECKS = {("POST", "/api/obligations/{lineage}/preview"), ("POST", "/api/evidence/{evidence_id}/verify"),
+READ_ONLY_CHECKS = {("POST", "/api/obligations/{lineage}/preview"),
+                    ("POST", "/api/obligations/{lineage}/historical-comparisons"),  # read-only, under preview's guard
+                    ("POST", "/api/evidence/{evidence_id}/verify"),
                     ("POST", "/api/ledger/verify"), ("POST", "/api/packages/{package_id}/verify")}
 CONTENT_AUTHOR_ROUTES = {
     ("POST", "/api/catalog/sources"), ("POST", "/api/catalog/sources/{source_id}/extract"),

@@ -283,7 +283,8 @@ def test_golden_vector_workbench_runs_before_mappings_resolve(client, world):
     assert client.post(f"/api/rules/drafts/{did}/validate", headers=H(AUTHOR)).json()["ok"] is False
     r = client.post(f"/api/rules/drafts/{did}/test", headers=H(AUTHOR))
     assert r.status_code == 200 and r.json()["all_passed"] is True, r.text
-    r = client.post(f"/api/rules/drafts/{did}/sandbox", headers=H(AUTHOR), json={"facts": VECTORS[0]["facts"]})
+    r = client.post(f"/api/rules/drafts/{did}/sandbox", headers=H(AUTHOR),
+                    json={"facts": VECTORS[0]["facts"], "effective_at": "2027-12-02"})  # explicit (RUL §13)
     assert r.status_code == 200 and r.json()["outcome"] == "APPLIES", r.text
 
 

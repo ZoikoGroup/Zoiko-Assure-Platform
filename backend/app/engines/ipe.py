@@ -300,8 +300,42 @@ def execute_source_run(db: Session, *, tenant_id: str, installation: ConnectorIn
     return {"source_run": run, "population_manifest": pm, "ipe_evaluation": ev, "evidence": art, "test_run": test_run}
 
 
+# The test-criterion grammar evaluate_criterion implements, and nothing beyond it: no controlled document defines a
+# criterion grammar (ZA-STA-001 §03 names a TestDefinition's "expected condition" only), so a value outside these is
+# refused rather than given another meaning. Before, any op other than "EQ" was evaluated as inequality and any
+# quantifier other than "ALL" as ANY, so a misspelt criterion could turn a failing population into a PASS.
+CRITERION_QUANTIFIERS = ("ALL", "ANY")
+CRITERION_OPS = ("EQ",)
+CRITERION_KEYS = frozenset({"quantifier", "field", "op", "value"})
+
+
+def criterion_problems(crit) -> list[str]:
+    """Why a TestDefinition criterion cannot be evaluated (empty list: it can). Shared by the API boundary
+    (routers/assurance.py TestDefIn) and evaluate_criterion, so a criterion stored before the check is refused too."""
+    if not isinstance(crit, dict):
+        return ["a criterion must be an object"]
+    out = []
+    unknown = sorted(set(crit) - CRITERION_KEYS, key=str)
+    if unknown:
+        out.append(f"unknown criterion field(s) {unknown}; allowed {sorted(CRITERION_KEYS)}")
+    if not isinstance(crit.get("field"), str) or not crit["field"].strip():
+        out.append("criterion needs a non-empty string field")
+    if "value" not in crit:
+        out.append("criterion needs a value to compare with")
+    if crit.get("quantifier", "ALL") not in CRITERION_QUANTIFIERS:
+        out.append(f"criterion quantifier must be one of {list(CRITERION_QUANTIFIERS)}; got {crit.get('quantifier')!r}")
+    if crit.get("op", "EQ") not in CRITERION_OPS:
+        out.append(f"criterion op must be one of {list(CRITERION_OPS)}; got {crit.get('op')!r}")
+    return out
+
+
 def evaluate_criterion(crit: dict, records: list[dict]) -> tuple[str, str]:
-    """Deterministic test criterion over mapped relied-upon fields."""
+    """Deterministic test criterion over mapped relied-upon fields. A criterion outside the grammar above is an ERROR
+    result: the test could not be executed as defined, which proves neither pass nor fail (ZA-STA-001 §04: the control
+    is NOT_EVALUATED), never a PASS and never an unhandled exception."""
+    problems = criterion_problems(crit)
+    if problems:
+        return "ERROR", "test criterion invalid: " + "; ".join(problems)
     field, op, val = crit["field"], crit.get("op", "EQ"), crit.get("value")
     def ok(r):
         v = r.get(field)
