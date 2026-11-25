@@ -98,6 +98,12 @@ def ingest_source(body: SourceIn, ctx: Ctx = Depends(authorize("content_author",
     same source is not registered twice; a changed text of the same source is a new snapshot (see /versions)."""
     db = ctx.db
     fp = sha256_hex(body.raw_text)
+    # One registration of a snapshot at a time (DOM §4.1: a SourceSnapshot is identified by its content digest), taken
+    # before anything is read: the duplicate check below otherwise races a concurrent registration of the same snapshot
+    # (the instrument's row lock serialises only requests that name the same instrument). PostgreSQL advisory lock held
+    # to commit; no schema change.
+    from ..engines.locks import xact_lock
+    xact_lock(db, "source-snapshot", body.authority, body.jurisdiction, body.locator, fp)
     inst = cat.lock_instrument(db, body.instrument_identifier) if body.instrument_identifier else None
     dup = cat.find_duplicate_snapshot(db, authority=body.authority, jurisdiction=body.jurisdiction, locator=body.locator,
                                       fingerprint=fp)
@@ -247,7 +253,7 @@ class ExtractIn(BaseModel):
 def extract(source_id: str, body: ExtractIn, ctx: Ctx = Depends(authorize("content_author", platform=True))):
     """Governed extractor proposal (non-binding). Output is AI_EXTRACTED -> REVIEW_REQUIRED (INV-09)."""
     db = ctx.db
-    s = db.get(RegulatorySource, source_id)
+    s = cat.lock_source(db, source_id)  # source, then instrument (cat.lock_source)
     if not s:
         raise HTTPException(404, "source not found")
     inst = cat.lock_instrument(db, body.instrument_identifier)
@@ -301,7 +307,7 @@ def create_requirement(body: RequirementIn, ctx: Ctx = Depends(authorize("conten
     analyst"). A new version of an existing requirement uses the same requirement_key under the same instrument; earlier
     versions are never changed."""
     db = ctx.db
-    s = db.get(RegulatorySource, body.source_id)
+    s = cat.lock_source(db, body.source_id)  # source, then instrument (cat.lock_source)
     inst = cat.lock_instrument(db, body.instrument_identifier)
     rv, props = cat.create_version(ctx, source=s, instrument=inst, requirement_key=body.requirement_key, title=body.title,
                                    locator=body.locator, summary=body.summary, valid_from=body.valid_from,

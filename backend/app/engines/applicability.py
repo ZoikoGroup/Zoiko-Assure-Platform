@@ -729,6 +729,17 @@ def _close_obligation(db, tenant_id, subject_id, odef_id, seq, at, *, closing_de
     cur = current_obligation_for_scope(db, tenant_id, subject_id, odef_id)
     if not (cur and cur.lifecycle == "ADOPTED"):
         return None
+    if ensure_utc(at) <= ensure_utc(cur.valid_from):
+        # TIM-REQ-002: the CLOSED revision would be [start, at), empty or inverted. ZA-APP-001 §11 C step 6 does not yet
+        # specify the valid-time policy for a closure dated at or before the obligation's start, so it is refused and
+        # the caller's transaction writes nothing. A future valid-time policy may replace this refusal; no history is
+        # rewritten either way.
+        raise HTTPException(409, {
+            "error": "CLOSURE_PRECEDES_OBLIGATION_START", "obligation_revision_id": cur.revision_id,
+            "obligation_valid_from": ensure_utc(cur.valid_from).isoformat(),
+            "closing_valid_from": ensure_utc(at).isoformat(),
+            "message": "This determination would close the obligation at or before the date it starts. How such a "
+                       "closure is recorded is not yet decided (ZA-APP-001 §11 C step 6), so it was not recorded."})
     cur.record_to_seq = seq
     closed = ObligationInstance(lineage_id=cur.lineage_id, tenant_id=tenant_id, entity_id=cur.entity_id,
                                 subject_id=subject_id, obligation_definition_id=odef_id,
@@ -867,14 +878,45 @@ def reevaluate_for_fact(db: Session, *, tenant_id: str, holder: Subject, fd: Fac
             results.append({"subject": s.display_name, "obligation": od.key, "outcome": ev.outcome})
         except HTTPException as e:
             results.append({"subject": s.display_name, "obligation": od.key, "error": e.detail})
-    # resolve fact requests satisfied by new knowledge
+    # Resolve the fact requests this write satisfies (ZA-APP-001 §11 B step 6 "Resolve FactRequest if requirement
+    # satisfied"), and only those: a request another linked evaluation still needs stays actionable (APP-REQ-010).
+    from ..platform import current_watermark
+    known_seq = current_watermark(db)["record_seq"]  # this transaction's: the fact just written and the re-runs above
     for fr in db.execute(select(FactRequest).where(FactRequest.tenant_id == tenant_id,
                                                    FactRequest.subject_id == holder.subject_id,
                                                    FactRequest.fact_definition_id == fd.fact_definition_id,
                                                    FactRequest.status.in_(["OPEN", "IN_PROGRESS"]))).scalars():
-        fr.status = "RESOLVED"
-        fr.resolution = "Resolved by recorded FactAssertion; linked evaluations re-run."
+        if _request_satisfied(db, tenant_id, fr, fd, known_seq):
+            fr.status = "RESOLVED"
+            fr.resolution = "Resolved by recorded FactAssertion; linked evaluations re-run."
     return results
+
+
+def _request_satisfied(db: Session, tenant_id: str, fr: FactRequest, fd: FactDefinition, known_seq: int) -> bool:
+    """Whether `fr` is satisfied: the fact is known (facts.resolve_fact, ZA-APP-001 §04: one admissible, unexpired,
+    agreeing value) at `known_seq` for the subject and effective date of every evaluation the request links (§08: the
+    request serves their valid-time need). A link that cannot be found in the organisation cannot be shown satisfied,
+    and neither can a request with no links. No conflict record is created; nothing is written. This is the resolution
+    the fact-request view shows for each linked evaluation (GET /fact-requests/{id}, current_resolution).
+
+    This is the "known where needed" reading of §11 B step 6 ("Resolve FactRequest if requirement satisfied") adopted
+    for APP-REQ-010."""
+    linked = sorted({str(i) for i in (fr.linked_evaluation_ids or [])})
+    if not linked:
+        return False
+    E = ApplicabilityEvaluation
+    needs = db.execute(select(E.subject_id, E.effective_at).where(E.tenant_id == tenant_id,
+                                                                    E.evaluation_id.in_(linked))).all()
+    if len(needs) != len(linked):
+        return False
+    subjects = {s.subject_id: s for s in db.execute(select(Subject).where(
+        Subject.tenant_id == tenant_id, Subject.subject_id.in_(sorted({sid for sid, _ in needs})))).scalars()}
+    for sid, at in sorted({(sid, ensure_utc(at)) for sid, at in needs}):
+        subject = subjects.get(sid)
+        if subject is None or not resolve_fact(db, tenant_id=tenant_id, subject=subject, fd=fd, effective_at=at,
+                                               known_seq=known_seq, create_conflicts=False)["known"]:
+            return False
+    return True
 
 
 def _consumed(ev: ApplicabilityEvaluation, fact_key: str) -> dict | None:

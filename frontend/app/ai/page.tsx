@@ -1,113 +1,237 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { api, useApi } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { AI_ASSET_KINDS } from "@/lib/codes";
 import { useCan } from "@/lib/roles";
-import { A, Badge, Card, ConfirmDialog, ErrorBox, FieldError, Json, LiveRegion, LoadingSkeleton, Modal, Notice, PageHeader, PermissionNote, Table, useAction } from "@/components/ui";
+import { A, Badge, Card, ConfirmDialog, EmptyState, ErrorBox, FieldError, Hash, Json, KV, LiveRegion, LoadingSkeleton, Modal, Notice, PageHeader, PermissionNote, useAction } from "@/components/ui";
 
 const LEVELS = [["A0", "Observe"], ["A1", "Recommend"], ["A2", "Prepare"], ["A3", "Execute (reversible)"]];
+const LEVEL_NAME: Record<string, string> = { ...Object.fromEntries(LEVELS), A4: "Material (excluded)" };
 /* ZA-ARCH-001 §12.1 asset registry kinds (lib/codes). Stored kinds outside this list are shown as received and marked, never rewritten. */
 const kindLabel = (k: string) => (AI_ASSET_KINDS.includes(k) ? k : `${k} (non-canonical kind)`);
 /* Column sizes behind POST /ai/assets; longer values fail when stored. */
 const MAX_LEN = { display_name: 200, version_label: 48, provider: 120, model: 120, environment: 64 };
+const expired = (g: any) => new Date(g.expires_at) < new Date() && g.status === "ACTIVE";
+/* Compact tables. Below md the header hides and each row's cells flow and wrap as a stacked item (with M labels where a
+   value needs naming), so no column hides behind a sideways scroll on a phone. */
+const T = {
+  table: "w-full text-[13px] max-md:block",
+  thead: "text-left text-[11px] uppercase tracking-wide text-slate-500 max-md:hidden",
+  th: "border-b border-slate-200 pb-1.5 pr-3 font-semibold",
+  tbody: "divide-y divide-slate-100 align-top max-md:block",
+  tr: "max-md:flex max-md:flex-wrap max-md:items-center max-md:gap-x-2.5 max-md:gap-y-1.5 max-md:py-2.5",
+  td: "py-2 pr-3 max-md:p-0",
+};
+const M = ({ children }: { children: string }) => <span className="mr-1 text-[11px] text-slate-500 md:hidden">{children}</span>;
 
+/* WF-DOM-07 AI Asset Dossier. One card per asset: its current version, AgBOM, applicability with any resulting obligation,
+   authority grants and decision receipts. Every value comes from GET /ai/assets (and the subject's evaluations for the
+   determination state); nothing is summarised away: earlier evaluations, raw AgBOM fields and the raw signed policy
+   bundle stay one click away. */
 export default function AI() {
   const { data, error, reload } = useApi<any[]>("/ai/assets");
   const [reg, setReg] = useState(false);
   const [grant, setGrant] = useState<any>(null);
   const [ver, setVer] = useState<any>(null);
+  const [bundle, setBundle] = useState<any>(null);
   const { can, why } = useCan();
   return (
     <>
       <PageHeader spec="WF-DOM-07 · ZA-ARCH-001 §12 · FR-AI-001..006" title="Agent Governance"
         subtitle="Your AI assets, the obligations that apply to them, and the authority granted to agents."
-        help="Each asset carries an AgBOM (AI bill of materials). Agent actions are decided by a deterministic policy decision point using scoped authority grants; no model call sits on the decision path."
+        help={<>
+          <p>Each asset carries an AgBOM (AI bill of materials). Agent actions are decided by a deterministic policy decision point using scoped authority grants; no model call sits on the decision path.</p>
+          <p className="mt-2">Authority levels run A0 Observe → A1 Recommend → A2 Prepare → A3 Execute (reversible). A4 material autonomy is excluded from the initial production scope. Enforcement stays in the customer runtime; Assure returns a decision, its obligation context and a receipt.</p>
+        </>}
         actions={<button className="btn-primary" disabled={!can("manage_ai")} title={why("manage_ai")} onClick={() => setReg(true)}>Register asset</button>} />
       <PermissionNote perms={["manage_ai", "grant_authority"]} />
       <ErrorBox error={error} />
-      <Notice>Authority levels run A0 Observe → A1 Recommend → A2 Prepare → A3 Execute (reversible). A4 material autonomy is excluded from the initial production scope. Enforcement stays in the customer runtime; Assure returns a decision, its obligation context and a receipt.</Notice>
-      <div className="mt-4 space-y-4">
+      <div className="space-y-4">
         {!data && !error && <Card><LoadingSkeleton rows={4} /></Card>}
-        {data?.map((s) => {
-          const v = s.versions[0];
-          return (
-            <Card key={s.subject_id} title={s.display_name} subtitle={v ? `${kindLabel(v.asset_kind)} · ${v.version_label} · ${v.provider} / ${v.model} · ${v.environment}` : "No version"}
-              actions={<><button className="btn-ghost" disabled={!can("manage_ai")} title={why("manage_ai")} onClick={() => setVer(s)}>New version</button><button className="btn-ghost" disabled={!can("grant_authority")} title={why("grant_authority")} onClick={() => setGrant(s)}>Grant authority</button>
-                <A href={`/entities/${s.subject_id}`}>Facts →</A></>}>
-              {/* Tracks may shrink below their content (minmax(0, 1fr), min-w-0): long identifiers wrap and tables scroll
-                  inside their own box, so a phone never scrolls the page sideways. From xl the details and the grants
-                  share the width and the policy bundle takes the row below, so both tables have room for their columns. */}
-              <div className="grid grid-cols-1 gap-x-6 gap-y-5 xl:grid-cols-2 [&>*]:min-w-0">
-                <div>
-                  <div className="label">Purpose</div><p className="break-words text-sm">{v?.purpose ?? "—"}</p>
-                  <div className="label mt-3">AgBOM</div>
-                  {v?.agbom?.length ? <ul className="mt-1 space-y-0.5">{v.agbom.map((c: any, i: number) => <li key={i} className="mono break-all text-[11px]">{typeof c === "string" ? c : `${c.type ?? c.kind ?? "component"}: ${c.name ?? JSON.stringify(c)}${c.version ? `@${c.version}` : ""}`}</li>)}</ul> : <p className="text-xs text-slate-500">Empty</p>}
-                  <div className="label mt-3">Applicability</div>
-                  {s.evaluations.length > 0 && <AssetApplicability asset={s} />}
-                  {s.obligations.length > 0 && <div className="label mt-3">Obligations</div>}
-                  {s.obligations.map((o: any) => <div key={o.lineage_id} className="mt-1 flex items-center gap-2 text-xs"><A href={`/obligations/${o.lineage_id}`}>{o.definition}</A><Badge code={o.lifecycle} /></div>)}
-                </div>
-                <div>
-                  <div className="label">Authority grants</div>
-                  <Table head={["Action", "Level", "Scope", "Expires", "Status", ""]} empty={!s.grants.length}>
-                    {s.grants.map((g: any) => (
-                      <tr key={g.grant_id}><td className="td mono text-[11px]">{g.action_class}</td><td className="td"><Badge code="ACTIVE" tone="info" label={g.authority_level} /></td>
-                        <td className="td text-[11px]">{g.scope}<div className="text-slate-500">{g.reversibility} · {g.fail_mode}</div></td><td className="td text-[11px]">{fmtDate(g.expires_at)}</td>
-                        <td className="td"><Badge code={new Date(g.expires_at) < new Date() && g.status === "ACTIVE" ? "EXPIRED" : g.status} /></td>
-                        <td className="td">{g.status === "ACTIVE" && <RevokeBtn grant={g} asset={s.display_name} onDone={reload} />}</td></tr>
-                    ))}
-                  </Table>
-                </div>
-                <div className="xl:col-span-2"><PolicyBundle asset={s} /></div>
-              </div>
-              {s.receipts.length > 0 && (
-                <details className="mt-4"><summary className="cursor-pointer text-sm font-medium text-navy-700">Decision receipts ({s.receipts.length})</summary>
-                  <Table head={["Decided", "Action", "Scope", "Decision", "Rationale", "Policy"]}>
-                    {s.receipts.map((r: any) => (
-                      <tr key={r.receipt_id}><td className="td text-xs">{fmtDate(r.decided_at, true)}</td><td className="td mono text-[11px]">{r.action_class}</td><td className="td text-xs">{r.scope}</td>
-                        <td className="td"><Badge code={r.decision} /></td><td className="td text-xs">{r.rationale}</td><td className="td mono text-[11px]">{r.policy_version}</td></tr>
-                    ))}
-                  </Table>
-                </details>
-              )}
-            </Card>
-          );
-        })}
+        {data?.length === 0 && <Card><EmptyState title="No AI assets registered" description="An AI Governance Lead registers models, copilots and agents here, with their AgBOM." /></Card>}
+        {data?.map((s) => <AssetCard key={s.subject_id} asset={s} reload={reload} onVersion={() => setVer(s)} onGrant={() => setGrant(s)} onBundle={() => setBundle(s)} />)}
       </div>
       {reg && <Register onClose={() => setReg(false)} onDone={() => { setReg(false); reload(); }} />}
       {grant && <Grant asset={grant} onClose={() => setGrant(null)} onDone={() => { setGrant(null); reload(); }} />}
       {ver && <NewVersion asset={ver} onClose={() => setVer(null)} onDone={() => { setVer(null); reload(); }} />}
+      {bundle && <PolicyBundle asset={bundle} onClose={() => setBundle(null)} />}
     </>
+  );
+}
+
+function AssetCard({ asset: s, reload, onVersion, onGrant, onBundle }: {
+  asset: any; reload: () => void; onVersion: () => void; onGrant: () => void; onBundle: () => void;
+}) {
+  const { can, why } = useCan();
+  const v = s.versions[0];
+  const earlier = s.versions.length - 1;
+  return (
+    <Card title={s.display_name}
+      subtitle={v ? <>{kindLabel(v.asset_kind)} · {v.version_label} · {v.provider} / {v.model} · {v.environment}
+        {earlier > 0 && <span className="text-slate-400"> · {earlier} earlier version{earlier > 1 ? "s" : ""}</span>}</> : "No version"}
+      actions={<>
+        <button className="btn-ghost" onClick={onBundle}>Policy bundle</button>
+        <button className="btn-ghost" disabled={!can("manage_ai")} title={why("manage_ai")} onClick={onVersion}>New version</button>
+        <button className="btn-ghost" disabled={!can("grant_authority")} title={why("grant_authority")} onClick={onGrant}>Grant authority</button>
+        <A href={`/entities/${s.subject_id}`}>Facts →</A>
+      </>}>
+      <div className="space-y-5">
+        {/* One row on wide screens (Purpose | AgBOM), stacked below; minmax(0, …) lets long references wrap instead of widening the page. */}
+        <dl className="grid gap-x-6 gap-y-2.5 text-[13px] sm:grid-cols-[88px_minmax(0,1fr)] xl:grid-cols-[88px_minmax(0,1fr)_56px_minmax(0,1.3fr)]">
+          <dt className="text-[12px] font-medium text-slate-500">Purpose</dt>
+          <dd className="break-words text-slate-800">{v?.purpose || "—"}</dd>
+          <dt className="text-[12px] font-medium text-slate-500"><abbr title="AI bill of materials" className="no-underline">AgBOM</abbr></dt>
+          <dd><AgBom components={v?.agbom ?? []} /></dd>
+        </dl>
+        <Applicability asset={s} />
+        <Grants asset={s} reload={reload} />
+        {s.receipts.length > 0 && (
+          <details>
+            <summary className="cursor-pointer text-[13px] font-medium text-navy-700">Decision receipts ({s.receipts.length})</summary>
+            <table className={`${T.table} mt-2`}>
+              <thead className={T.thead}><tr>{["Decided", "Action", "Scope", "Decision", "Rationale", "Policy"].map((h) => <th key={h} className={T.th}>{h}</th>)}</tr></thead>
+              <tbody className={T.tbody}>
+                {s.receipts.map((r: any) => (
+                  <tr key={r.receipt_id} className={T.tr}>
+                    <td className={`${T.td} whitespace-nowrap max-md:w-full max-md:text-[12px] max-md:text-slate-500`}>{fmtDate(r.decided_at, true)}</td>
+                    <td className={T.td}>{r.action_class}</td><td className={T.td}>{r.scope}</td>
+                    <td className={T.td}><Badge code={r.decision} /></td>
+                    <td className={`${T.td} max-md:w-full`}>{r.rationale}</td>
+                    <td className={`${T.td} mono text-[11px]`}><M>Policy</M>{r.policy_version}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/* The AgBOM as labelled components instead of JSON. A component is {type|kind, ref|name|id, version?, …}; fields beyond
+   those are shown as key=value beside it, and a component with no recognisable field falls back to its JSON, so nothing
+   stored is hidden. */
+const BOM_KNOWN = ["type", "kind", "ref", "name", "id", "version"];
+function AgBom({ components }: { components: any[] }) {
+  if (!components.length) return <span className="text-slate-500">Empty</span>;
+  return (
+    <ul className="flex flex-wrap gap-1.5">
+      {components.map((c, i) => {
+        if (typeof c !== "object" || c === null) {
+          return <li key={i} className="mono rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-[12px] text-slate-800">{String(c)}</li>;
+        }
+        const kind = c.type ?? c.kind;
+        const ref = c.ref ?? c.name ?? c.id;
+        const extra = Object.entries(c).filter(([k]) => !BOM_KNOWN.includes(k));
+        return (
+          <li key={i} className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-[12px]">
+            {kind && <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-slate-500">{String(kind).replace(/_/g, " ")}</span>}
+            <span className="mono min-w-0 break-all text-slate-800">
+              {ref != null ? `${ref}${c.version ? `@${c.version}` : ""}` : extra.length ? "" : JSON.stringify(c)}
+              {extra.length > 0 && <span className="text-slate-500">{ref != null ? " " : ""}{extra.map(([k, x]) => `${k}=${typeof x === "string" ? x : JSON.stringify(x)}`).join(" ")}</span>}
+            </span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
 /* Applicability outcome and determination are separate (ZA-GLS-001 §11: never show Applies without determination status).
    /ai/assets returns outcomes only, so the determination comes from the subject's evaluations
-   (GET /applicability/evaluations?subject_id=…, as on the subject page), matched by evaluation ID and never inferred. */
-function AssetApplicability({ asset }: { asset: any }) {
+   (GET /applicability/evaluations?subject_id=…, as on the subject page), matched by evaluation ID and never inferred.
+   /ai/assets lists every evaluation, newest first: each requirement shows its latest one, with the obligation it led to;
+   earlier evaluations stay in the same table behind a toggle. */
+function Applicability({ asset }: { asset: any }) {
   const evals = useApi<any[]>(`/applicability/evaluations?subject_id=${asset.subject_id}`);
+  const [showOlder, setShowOlder] = useState(false);
   // undefined: not in the response (still loading, failed, or not returned); null: no determination recorded.
   const determinationOf = new Map<string, any>((evals.data ?? []).map((e) => [e.evaluation_id, e.current_determination]));
   const missing = evals.error ? "Unavailable" : evals.data ? "Not returned" : "Loading…";
+  const latest: any[] = [];
+  const older: any[] = [];
+  const seen = new Set<string>();
+  for (const e of asset.evaluations) {
+    (seen.has(e.obligation) ? older : latest).push(e);
+    seen.add(e.obligation);
+  }
+  const obligationsOf = (key: string) => asset.obligations.filter((o: any) => o.definition === key);
+  const unmatched = asset.obligations.filter((o: any) => !seen.has(o.definition));
+  const row = (e: any, older = false) => {
+    const det = determinationOf.get(e.evaluation_id);
+    return (
+      <tr key={e.evaluation_id} className={`${T.tr}${older ? " text-slate-500" : ""}`}>
+        <td className={`${T.td} max-md:w-full`}><A href={`/applicability/${e.evaluation_id}`}>{e.obligation}</A>
+          {older && <span className="ml-1.5 text-[11px] text-slate-500">earlier</span>}</td>
+        <td className={T.td}><Badge code={e.outcome} /></td>
+        <td className={T.td}><M>Determination</M>{det ? <><Badge code={det.state} />{det.evaluation_id !== e.evaluation_id && <div className="text-[11px] text-slate-500 max-md:ml-1.5 max-md:inline">based on another evaluation</div>}</>
+          : <span className="text-[12px] text-slate-500">{det === null ? "None recorded" : missing}</span>}</td>
+        <td className={T.td}>{older ? null : <ObligationLinks items={obligationsOf(e.obligation)} />}</td>
+      </tr>
+    );
+  };
   return (
-    <>
+    <section aria-label="Applicability">
+      <h3 className="mb-1.5 text-[12px] font-medium text-slate-500">Applicability</h3>
       <ErrorBox error={evals.error} />
-      <Table head={["Obligation", "Outcome", "Determination"]}>
-        {asset.evaluations.slice(0, 5).map((e: any) => {
-          const det = determinationOf.get(e.evaluation_id);
-          return (
-            <tr key={e.evaluation_id}>
-              <td className="td text-xs"><A href={`/applicability/${e.evaluation_id}`}>{e.obligation}</A></td>
-              <td className="td"><Badge code={e.outcome} /></td>
-              <td className="td">{det ? <><Badge code={det.state} />{det.evaluation_id !== e.evaluation_id && <div className="text-[11px] text-slate-500">based on another evaluation</div>}</>
-                : <span className="text-xs text-slate-500">{det === null ? "None recorded" : missing}</span>}</td>
-            </tr>
-          );
-        })}
-      </Table>
-    </>
+      {!latest.length && !unmatched.length ? <p className="text-[13px] text-slate-500">No applicability evaluation recorded.</p> : (
+        <table className={T.table}>
+          <thead className={T.thead}><tr>{["Requirement", "Outcome", "Determination", "Obligation"].map((h) => <th key={h} className={T.th}>{h}</th>)}</tr></thead>
+          <tbody className={T.tbody}>
+            {latest.map((e) => row(e))}
+            {unmatched.map((o: any) => (
+              <tr key={o.lineage_id} className={T.tr}>
+                <td className={`${T.td} max-md:w-full`}>{o.definition}</td>
+                <td className={`${T.td} text-[12px] text-slate-500`} colSpan={2}>No evaluation listed</td>
+                <td className={T.td}><ObligationLinks items={[o]} /></td>
+              </tr>
+            ))}
+            {showOlder && older.map((e) => row(e, true))}
+          </tbody>
+        </table>
+      )}
+      {older.length > 0 && (
+        <button type="button" className="mt-1.5 text-[12px] font-medium text-navy-700 hover:underline" aria-expanded={showOlder} onClick={() => setShowOlder(!showOlder)}>
+          {showOlder ? "Hide" : "Show"} {older.length} earlier evaluation{older.length > 1 ? "s" : ""}
+        </button>
+      )}
+    </section>
+  );
+}
+
+function ObligationLinks({ items }: { items: any[] }) {
+  if (!items.length) return <span className="text-[12px] text-slate-400 max-md:hidden">—</span>;
+  return <div className="flex flex-col gap-1">{items.map((o) => (
+    <span key={o.lineage_id} className="inline-flex items-center gap-1.5"><M>Obligation</M><Badge code={o.lifecycle} /><A href={`/obligations/${o.lineage_id}`}>Open</A></span>
+  ))}</div>;
+}
+
+function Grants({ asset: s, reload }: { asset: any; reload: () => void }) {
+  return (
+    <section aria-label="Authority grants">
+      <h3 className="mb-1.5 text-[12px] font-medium text-slate-500">Authority grants</h3>
+      {!s.grants.length ? <p className="text-[13px] text-slate-500">No authority granted to this asset.</p> : (
+        <table className={T.table}>
+          <thead className={T.thead}><tr>{["Action", "Level", "Scope", "Expires", "Status", ""].map((h, i) => <th key={i} className={T.th}>{h}</th>)}</tr></thead>
+          <tbody className={T.tbody}>
+            {s.grants.map((g: any) => (
+              <tr key={g.grant_id} className={T.tr}>
+                <td className={`${T.td} text-slate-800 max-md:w-full max-md:font-medium`}>{g.action_class}</td>
+                <td className={`${T.td} whitespace-nowrap`}><Badge code="ACTIVE" tone="info" label={g.authority_level} title={LEVEL_NAME[g.authority_level]} />
+                  {LEVEL_NAME[g.authority_level] && <span className="ml-1.5 text-[12px] text-slate-500">{LEVEL_NAME[g.authority_level]}</span>}</td>
+                <td className={`${T.td} max-md:w-full`}>{g.scope}<div className="text-[11px] text-slate-500">{g.reversibility} · {g.fail_mode}</div></td>
+                <td className={`${T.td} whitespace-nowrap`}><M>Expires</M>{fmtDate(g.expires_at)}</td>
+                <td className={T.td}><Badge code={expired(g) ? "EXPIRED" : g.status} /></td>
+                <td className={`${T.td} text-right max-md:ml-auto`}>{g.status === "ACTIVE" && <RevokeBtn grant={g} asset={s.display_name} onDone={reload} />}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }
 
@@ -128,15 +252,45 @@ function RevokeBtn({ grant, asset, onDone }: { grant: any; asset: string; onDone
   );
 }
 
-function PolicyBundle({ asset }: { asset: any }) {
+/* GET /ai/policy-bundle/{asset}: a freshly signed, short-validity bundle of the asset's ACTIVE grants, shown as its parts;
+   the signed JSON itself stays available below. Each opening signs a new bundle, as the former button did. */
+function PolicyBundle({ asset, onClose }: { asset: any; onClose: () => void }) {
   const b = useAction();
+  const sign = () => b.run(() => api(`/ai/policy-bundle/${asset.subject_id}`));
+  // Sign once per opening; the ref survives React Strict Mode's development re-run of effects.
+  const signed = useRef(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (!signed.current) { signed.current = true; sign(); } }, []);
+  const bundle = b.result?.bundle;
   return (
-    <div>
-      <div className="label">Signed policy bundle</div>
+    <Modal open onClose={onClose} title={`Signed policy bundle · ${asset.display_name}`}>
       <ErrorBox error={b.error} />
-      <button className="btn-ghost" disabled={b.busy} onClick={() => b.run(() => api(`/ai/policy-bundle/${asset.subject_id}`))}>Signed policy bundle</button>
-      {b.result && <div className="mt-2"><p className="mb-1 text-[11px] text-slate-500">Valid for 15 minutes, so an Assure outage never becomes an uncontrolled fail-open.</p><Json value={b.result} max={200} /></div>}
-    </div>
+      {!b.result && !b.error && <LoadingSkeleton rows={3} />}
+      {bundle && (
+        <div className="space-y-4">
+          <p className="text-[12px] text-slate-600">Valid for 15 minutes, so an Assure outage never becomes an uncontrolled fail-open.</p>
+          <KV items={[["Issued", fmtDate(bundle.issued_at, true)], ["Valid until", fmtDate(bundle.valid_until, true)],
+            ["Policy version", <span key="p" className="mono text-xs">{bundle.policy_version}</span>],
+            ["Signer key", <span key="k" className="mono text-xs">{b.result.signer_key_id}</span>],
+            ["Signature", <Hash key="s" value={b.result.signature} n={16} />], ["Grants included", String(bundle.grants?.length ?? 0)]]} />
+          {bundle.grants?.length > 0 && (
+            <ul className="divide-y divide-slate-100 rounded-md border border-slate-200 text-[13px]">
+              {bundle.grants.map((g: any) => (
+                <li key={g.grant_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+                  <span className="min-w-0">{g.action_class}<span className="text-slate-500"> · {g.scope}</span></span>
+                  <span className="flex items-center gap-2 text-[12px] text-slate-600"><Badge code="ACTIVE" tone="info" label={g.authority_level} />{g.fail_mode} · expires {fmtDate(g.expires_at)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <details><summary className="cursor-pointer text-[12px] text-navy-700">Signed bundle (JSON)</summary><div className="mt-2"><Json value={b.result} max={260} /></div></details>
+        </div>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <button className="btn-ghost" disabled={b.busy} onClick={sign}>{b.busy ? "Signing…" : "Sign again"}</button>
+        <button className="btn-primary" onClick={onClose}>Done</button>
+      </div>
+    </Modal>
   );
 }
 

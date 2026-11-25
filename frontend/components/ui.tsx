@@ -588,7 +588,7 @@ export function PermissionNote({ perms, actions, className = "mb-4" }:
             return (
               <li key={key}>
                 {actions?.[key] ? <span className="font-medium">{actions[key]}: </span> : null}
-                needs “{any.map(permissionText).join("” or “")}”{held ? <> — ask a {held}</> : <> — done by Zoiko&apos;s platform and content teams, not by an organisation role</>}.
+                needs “{any.map(permissionText).join("” or “")}”{held ? <> — ask {/^[AEIOU]/i.test(held) ? "an" : "a"} {held}</> : <> — done by Zoiko&apos;s platform and content teams, not by an organisation role</>}.
               </li>
             );
           })}

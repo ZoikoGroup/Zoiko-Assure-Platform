@@ -15,7 +15,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -530,12 +530,16 @@ def assign_issue(db: Session, *, tenant_id: str, actor: Any, issue_id: str, owne
 
 
 def _remediation_started_seq(db: Session, issue: Issue) -> int | None:
-    """record_seq of the event that opened the current remediation cycle: the latest event reaching IN_REMEDIATION.
-    A migration-0008 baseline event in IN_REMEDIATION counts too: it is the recorded start for an issue that was
-    already in remediation, so a verifying retest must still come after it."""
+    """record_seq of the event that opened the current remediation cycle: the latest event that entered IN_REMEDIATION
+    from another state (ZA-STA-001 §17: closure needs remediation plus a new test/evidence cycle). An event that stays
+    in IN_REMEDIATION, such as an owner reassignment (ASSIGNED, recorded IN_REMEDIATION -> IN_REMEDIATION), is not an
+    entry and starts no cycle. A migration-0008 baseline event in IN_REMEDIATION (from_state null) counts: it is the
+    recorded start for an issue that was already in remediation, so a verifying retest must still come after it.
+    The contract, shared with the frontend's remediationStartSeq: tests/remediation_cycle_vectors.json."""
     return db.execute(select(IssueEvent.record_seq).where(
         IssueEvent.tenant_id == issue.tenant_id, IssueEvent.issue_id == issue.issue_id,
-        IssueEvent.to_state == "IN_REMEDIATION")
+        IssueEvent.to_state == "IN_REMEDIATION",
+        or_(IssueEvent.from_state.is_(None), IssueEvent.from_state != "IN_REMEDIATION"))
         .order_by(IssueEvent.record_seq.desc()).limit(1)).scalar()
 
 

@@ -91,12 +91,17 @@ export function unavailableReason(issue: Pick<Issue, "state" | "issue_type" | "o
   return now.blocked ?? null;
 }
 
-/** governance._remediation_started_seq: the record sequence of the latest event whose to_state is IN_REMEDIATION (of any
- *  event type, a migration BASELINE included), or null when none is recorded (the server then answers
- *  REMEDIATION_NOT_RECORDED). A verifying result must have a record cutoff at or after it. */
-export function remediationStartSeq(events: readonly Pick<IssueEvent, "to_state" | "record_seq">[]): number | null {
+/** governance._remediation_started_seq: the record sequence of the latest event that entered IN_REMEDIATION from another
+ *  state (a migration BASELINE, whose from_state is null, included; an owner reassignment, recorded IN_REMEDIATION ->
+ *  IN_REMEDIATION, is not an entry and starts no cycle), or null when none is recorded (the server then answers
+ *  REMEDIATION_NOT_RECORDED). A verifying result must have a record cutoff at or after it. The shared contract is
+ *  backend/tests/remediation_cycle_vectors.json. */
+export function remediationStartSeq(events: readonly Pick<IssueEvent, "from_state" | "to_state" | "record_seq">[]): number | null {
   let start: number | null = null;
-  for (const e of events) if (e.to_state === "IN_REMEDIATION" && (start === null || e.record_seq > start)) start = e.record_seq;
+  for (const e of events) {
+    const entered = e.to_state === "IN_REMEDIATION" && e.from_state !== "IN_REMEDIATION";
+    if (entered && (start === null || e.record_seq > start)) start = e.record_seq;
+  }
   return start;
 }
 
