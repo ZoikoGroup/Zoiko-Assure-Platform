@@ -880,7 +880,14 @@ def compare(subject_id: str, obligation_definition_id: str, valid_at: Instant,
 
     Each side is answered as known at its record cutoff and echoes it (TIM-REQ-017), so a cutoff that has not been
     reached yet is refused (422 RECORD_SEQ_IN_FUTURE, as every other historical read): answering it with today's
-    records would label a later answer with a sequence nothing was recorded at. An unknown definition is 404."""
+    records would label a later answer with a sequence nothing was recorded at. An unknown definition is 404.
+
+    Differences use the TIM §12 classes, each of which says what a later record did, so they are assigned from the
+    earlier cutoff to the later one whichever side the caller put it on (the sides are returned as requested;
+    LEGAL_VERSION_CHANGED runs from the earlier answer's rule version to the later one's). A fact is compared by what was
+    known about it at each cutoff (its resolution there, as the evaluation freezes it: the assertion revision, or
+    UNKNOWN), for every fact either answer's trace consulted: a fact that one answer's rule path skipped is not a change
+    of knowledge. Read-only: no evaluation or fact conflict is recorded."""
     s = ctx.scoped(ctx.db.get(Subject, subject_id), "subject")
     od = ctx.db.get(ObligationDefinition, obligation_definition_id)
     if od is None:
@@ -900,17 +907,34 @@ def compare(subject_id: str, obligation_definition_id: str, valid_at: Instant,
                 sides[name] = {"known_seq": seq, "error": e.detail}
     diffs = []
     if "rule_version_id" in sides["left"] and "rule_version_id" in sides["right"]:
-        if sides["left"]["rule_version_id"] != sides["right"]["rule_version_id"]:
-            diffs.append({"type": "LEGAL_VERSION_CHANGED", "from": sides["left"]["rule_version_id"], "to": sides["right"]["rule_version_id"]})
-        lf = _fact_ids(sides["left"]["trace"])
-        rf = _fact_ids(sides["right"]["trace"])
-        for k in sorted(set(lf) | set(rf)):
-            if lf.get(k) != rf.get(k):
-                diffs.append({"type": "KNOWLEDGE_ADDED" if lf.get(k) in (None, "UNKNOWN") else "KNOWLEDGE_CORRECTED",
-                              "fact": k, "left": lf.get(k), "right": rf.get(k)})
+        # TIM §12: "A later record introduced ..." / "Later record corrected ..." / "Later ... rule release changed ...".
+        earlier, later = ("left", "right") if left_seq <= right_seq else ("right", "left")
+        if sides[earlier]["rule_version_id"] != sides[later]["rule_version_id"]:
+            diffs.append({"type": "LEGAL_VERSION_CHANGED", "from": sides[earlier]["rule_version_id"],
+                          "to": sides[later]["rule_version_id"]})
+        consulted = sorted(set(_fact_ids(sides["left"]["trace"])) | set(_fact_ids(sides["right"]["trace"])))
+        known = {name: _known_facts(ctx.db, ctx.tenant, s, consulted, valid_at, seq)
+                 for name, seq in (("left", left_seq), ("right", right_seq))}
+        for k in consulted:
+            if known["left"][k] != known["right"][k]:
+                diffs.append({"type": "KNOWLEDGE_ADDED" if known[earlier][k] == "UNKNOWN" else "KNOWLEDGE_CORRECTED",
+                              "fact": k, "left": known["left"][k], "right": known["right"][k]})
         if not diffs:
             diffs.append({"type": "NO_SEMANTIC_CHANGE"})
     return {"valid_at": valid_at, "left": sides["left"], "right": sides["right"], "differences": diffs}
+
+
+def _known_facts(db, tenant_id: str, subject: Subject, keys: list[str], valid_at: datetime,
+                 known_seq: int) -> dict[str, str]:
+    """Fact key -> the assertion revision known for it at ``known_seq`` for ``valid_at``, or "UNKNOWN": the resolution
+    an evaluation at that cutoff freezes (appl.evaluate fact_inputs / unknown_facts), never recording a conflict."""
+    fds = {f.key: f for f in db.execute(select(FactDefinition).where(FactDefinition.key.in_(keys or ["-"]))).scalars()}
+    out = {}
+    for k in keys:
+        r = resolve_fact(db, tenant_id=tenant_id, subject=subject, fd=fds[k], effective_at=valid_at,
+                         known_seq=known_seq, create_conflicts=False) if k in fds else {"known": False}
+        out[k] = r["revision_id"] if r["known"] else "UNKNOWN"
+    return out
 
 
 def _fact_ids(trace, out=None):

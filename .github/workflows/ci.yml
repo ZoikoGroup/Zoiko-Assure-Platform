@@ -438,9 +438,15 @@ jobs:
           --require test_editorial_change_shadow_gate=5
           --require test_shadow_report_binding=6
           --require test_rule_diff_executable_consistency=12
-          --require test_control_evaluation_integrity=54
+          --require test_control_evaluation_integrity=62
           --require test_issue_creation_events=11
           --require test_evidence_conflict_integrity=16
+          --require test_historical_knowledge_comparison=8
+          --require test_requirement_lifecycle_integrity=9
+          --require test_source_lifecycle_concurrency=8
+          --require test_remediation_cycle=16
+          --require test_fact_request_resolution_integrity=14
+          --require test_obligation_closure_valid_time=6
           --redact-env ZA_TEST_DATABASE_URL
           --redact-env ZA_TEST_DATABASE_ADMIN_URL
           --summary-json "$RUNNER_TEMP/reports/backend-postgres-summary.json"

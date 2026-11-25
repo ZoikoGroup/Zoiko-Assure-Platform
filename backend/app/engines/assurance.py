@@ -377,7 +377,7 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
                           .order_by(TestRun.record_seq, TestRun.test_run_id)).scalars().all()
         runs = [r for r in runs if _overlap(r.window_from, r.window_to, a, b)]
         deps["runs"] += [r.test_run_id for r in runs]
-        status, reasons, ev_rows, covered = None, [], [], []
+        status, reasons, ev_rows, covered, claimed = None, [], [], [], []
         fails = [r for r in runs if r.result == "FAIL"]
         if fails:
             status = "FAIL"
@@ -390,7 +390,14 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
                     ev_rows += rows
                     deps["evidence"] += [x["evidence_id"] for x in rows]
                     if st == "OK":
-                        covered.append((ensure_utc(r.window_from), ensure_utc(r.window_to)))
+                        # STA §05 STALE: "No for current/period slice outside validity. NOT_EVALUATED for uncovered
+                        # slice" (STA-REQ-006). A run's evidence proves its window only up to the earliest valid_until
+                        # (exclusive) of that evidence; the days after it are uncovered. Snapshot segments already end
+                        # at every valid_until (TIM §09 expiry boundary), so no segment result changes; a window that
+                        # straddles an expiry is no longer OPERATING for days the evidence does not cover.
+                        end = min([ensure_utc(r.window_to)] + [ensure_utc(x["valid_until"]) for x in rows])
+                        covered.append((ensure_utc(r.window_from), end))
+                        claimed.append((ensure_utc(r.window_from), ensure_utc(r.window_to)))
                     elif st == "CONFLICT":
                         conflict = True
                         reasons += rs
@@ -411,6 +418,8 @@ def evaluate_control(db: Session, ci: ControlImplementation, a: datetime, b: dat
                     reasons.append("COVERAGE_GAP")
                 if not reasons:
                     reasons.append("COVERAGE_GAP")
+                if _covers(claimed, a, b):  # the PASS runs claim the whole window; their evidence expires inside it
+                    reasons.append("STALE_EVIDENCE")
         test_rows.append({"test_definition_id": td.test_definition_id, "name": td.name, "required": td.required,
                           "primary": td.primary, "ipe_required": td.ipe_required, "status": status,
                           "reason_codes": sorted(set(reasons)), "runs": [{"test_run_id": r.test_run_id, "result": r.result,
@@ -882,7 +891,11 @@ def compute_snapshot(db: Session, *, tenant_id: str, obligation_lineage_id: str,
                 return UNK, info
             ce = evaluate_control(db, ci, a, b, cutoff, persist=persist)
             deps["control_implementations"].add(ci.control_implementation_id)
-            deps["control_evaluation_digests"].add(ce["dependency_digest"])
+            # Where the implementation is not in force for the segment (or has no test policy at the cutoff),
+            # evaluate_control derives no state: NOT_EVALUATED, no stored evaluation, no digest. The leaf is then
+            # UNKNOWN, as for a segment with no implementation at all, with no digest to pin (this used to KeyError).
+            if ce.get("dependency_digest") is not None:
+                deps["control_evaluation_digests"].add(ce["dependency_digest"])
             for t in ce["tests"]:
                 deps["test_runs"] |= {r["test_run_id"] for r in t["runs"]}
                 deps["evidence"] |= {e["evidence_id"] for e in t["evidence"]}

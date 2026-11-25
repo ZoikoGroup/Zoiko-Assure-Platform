@@ -2,7 +2,8 @@
 // built-in runner, which strips the TypeScript types (Node 22.18 or later). From frontend/:
 //     node --test lib/issues.test.mjs
 // The backend source is only read: the mirrored transition map, closure rules and request bodies are compared with
-// backend/app/engines/governance.py and backend/app/routers/assurance.py, so a change there fails here.
+// backend/app/engines/governance.py and backend/app/routers/assurance.py, so a change there fails here; the
+// remediation-cycle rule is compared through the vectors in backend/tests/remediation_cycle_vectors.json.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -138,15 +139,22 @@ test("an action re-checked against the re-read issue is withdrawn when the issue
   assert.match(unavailableReason(issue("OPEN"), { kind: "move", to: "TRIAGED" }), /ISSUE_OWNER_REQUIRED/);
 });
 
-test("remediation start is the latest event reaching IN_REMEDIATION (governance._remediation_started_seq)", () => {
-  assert.equal(remediationStartSeq([]), null);
-  assert.equal(remediationStartSeq([{ to_state: "OPEN", record_seq: 1 }, { to_state: "TRIAGED", record_seq: 2 }]), null);
+// The remediation-cycle contract shared with the backend: backend/tests/test_remediation_cycle.py runs the same vectors
+// against governance._remediation_started_seq, so the two sides are compared by behaviour, not by the query's text.
+const CYCLE = JSON.parse(readFileSync(new URL("../../backend/tests/remediation_cycle_vectors.json", import.meta.url), "utf8"));
+const cycleEvents = (rows) => rows.map(([event_type, from_state, to_state, record_seq]) => ({ event_type, from_state, to_state, record_seq }));
+
+test("remediation start is the latest entry into IN_REMEDIATION (shared vectors with governance._remediation_started_seq)", () => {
+  assert.ok(CYCLE.vectors.length >= 5, "the shared remediation-cycle vectors are missing");
+  for (const v of CYCLE.vectors) {
+    assert.equal(remediationStartSeq(cycleEvents(v.events)), v.expected, v.name);
+    assert.equal(remediationStartSeq(cycleEvents(v.events).reverse()), v.expected, `${v.name} (any listing order)`);
+  }
+  // An owner handover during remediation (ASSIGNED, IN_REMEDIATION -> IN_REMEDIATION) keeps the cycle that was entered.
   assert.equal(remediationStartSeq([
-    { to_state: "OPEN", record_seq: 1 }, { to_state: "IN_REMEDIATION", record_seq: 5 },
-    { to_state: "PENDING_VERIFICATION", record_seq: 7 }, { to_state: "IN_REMEDIATION", record_seq: 9 },
-    { to_state: "PENDING_VERIFICATION", record_seq: 12 },
-  ]), 9);
-  assert.match(GOV, /IssueEvent\.to_state == "IN_REMEDIATION"\)\s*\n?\s*\.order_by\(IssueEvent\.record_seq\.desc\(\)\)/);
+    { from_state: "TRIAGED", to_state: "IN_REMEDIATION", record_seq: 5 },
+    { from_state: "IN_REMEDIATION", to_state: "IN_REMEDIATION", record_seq: 8 },
+  ]), 5);
 });
 
 test("verification candidates: right result, recorded remediation, cutoff at or after its start", () => {

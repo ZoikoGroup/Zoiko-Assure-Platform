@@ -12,14 +12,21 @@ Requirements exercised (ZA-STA-001 unless stated):
                       evaluator faults are errors, never states; one configuration-error representation everywhere;
   ZA-EVT-001 §17/§20  control.evaluated means "Immutable ControlEvaluation completed": it is written only with a stored
                       evaluation, names it, and carries the IMMUTABLE_RESULT / STA §18 minimum payload;
-  §17                 no evaluation, issue or event is written from a refused or failed evaluation (one transaction).
+  §17                 no evaluation, issue or event is written from a refused or failed evaluation (one transaction);
+  §05 / STA-REQ-006   STALE evidence: "No for current/period slice outside validity. NOT_EVALUATED for uncovered slice".
+                      Evidence that expires inside the window proves only the days before its expiry, so a direct
+                      evaluation and the segmented snapshot evaluation (TIM §09 expiry boundary; STA §11 "If evidence
+                      expires at 14:03, that boundary creates a new segment") give the same answer for the same days, and
+                      a part-stale window can no longer verify an issue closure;
+  §11 / §12 / TIM §09 a period that starts before a control implementation is in force is evaluated segment by segment
+                      (the earlier segment's leaf is NOT_EVALUATED / CONTROL_NOT_IMPLEMENTED), never an unhandled crash.
 
 Every test builds its own organisation, subjects, controls and obligations; seeded data is only read.
 """
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -35,6 +42,7 @@ KEY_A, KEY_B, KEY_C = "C_ICT_INCIDENT_PROCESS", "C_HUMAN_OVERSIGHT", "C_AI_MONIT
 UNKNOWN_KEY = f"C_NOT_IN_CATALOGUE_{TAG.upper()}"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SEP, OCT, NOV = (datetime(2026, m, 1, tzinfo=timezone.utc) for m in (9, 10, 11))
+MID = datetime(2026, 10, 15, tzinfo=timezone.utc)  # valid_until of _expiring_evidence
 EMPTY_WINDOW = "The control window must be a non-empty half-open interval"
 
 
@@ -85,11 +93,12 @@ def _control(client, subject, key=KEY_A, **policy):
     return ci, tds
 
 
-def _evidence(client):
+def _evidence(client, coverage_to="2026-11-01T00:00:00Z", validity_days=120):
+    """A manual upload; the upload route sets valid_until = coverage_to + validity_days."""
     r = client.post("/api/evidence/upload", headers=H(OWNER),
                     files={"file": ("proof.txt", secrets.token_bytes(16), "text/plain")},
                     data={"entity_id": ENT, "title": "Probe record", "coverage_from": "2026-09-01T00:00:00Z",
-                          "coverage_to": "2026-11-01T00:00:00Z", "validity_days": "120"})
+                          "coverage_to": coverage_to, "validity_days": str(validity_days)})
     assert r.status_code == 200, r.text
     return r.json()["evidence_id"]
 
@@ -518,3 +527,223 @@ def test_a_configuration_error_has_one_representation_on_every_surface(client, o
     json.dumps(body)  # serialisable as stored and sent
     assert client.get(f"/api/controls/{ci}", headers=H(B_CCO)).status_code in (403, 404)
     assert _stored(ci) == ([], [], [])
+
+
+# ------------------------------------------------------------------------------------------------ evidence validity
+PART_STALE = ["COVERAGE_GAP", "STALE_EVIDENCE"]
+
+
+def _expiring_evidence(client):
+    """Evidence valid until MID (2026-10-15): coverage to 2026-10-10 plus 5 days."""
+    return _evidence(client, coverage_to="2026-10-10T00:00:00Z", validity_days=5)
+
+
+def _at(value) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _state(client, ci, start, end, as_of=None, actor=OWNER):
+    params = {"window_from": start.isoformat(), "window_to": end.isoformat()}
+    if as_of is not None:
+        params["as_of_record_seq"] = as_of
+    return client.get(f"/api/controls/{ci}/state", headers=H(actor), params=params)
+
+
+def test_evidence_that_expires_inside_the_window_cannot_prove_all_of_it(client, org):
+    """One PASS run over [Oct 1, Nov 1) whose only evidence is valid until Oct 15. The old code compared validity with
+    the window start only: the whole month was OPERATING, stored as an immutable evaluation and published, while the
+    same engine called [Oct 15, Nov 1) on its own NOT_EVALUATED / STALE_EVIDENCE. The days after expiry are an
+    uncovered slice (STA §05), so the window is NOT_EVALUATED; the response, the stored evaluation, its event and the
+    read path all say so."""
+    ci, (td,) = _control(client, _subject())
+    run_id = _run(client, td, "PASS", evidence=[_expiring_evidence(client)])
+    r = _evaluate(client, ci)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["state"], body["reason_codes"], body["precedence_rule"]) == ("NOT_EVALUATED", PART_STALE,
+                                                                              "3:NOT_EVALUATED")
+    [test] = body["tests"]
+    assert (test["status"], test["reason_codes"], [x["test_run_id"] for x in test["runs"]]) == \
+        ("UNKNOWN", PART_STALE, [run_id])
+    evals, events, issues = _stored(ci)
+    [ce] = evals
+    assert (ce.evaluation_id, ce.state, ce.reason_codes, ce.precedence_rule, ce.dependency_digest) == \
+        (body["evaluation_id"], "NOT_EVALUATED", PART_STALE, "3:NOT_EVALUATED", body["dependency_digest"])
+    assert [(t["status"], t["reason_codes"]) for t in ce.inputs["tests"]] == [("UNKNOWN", PART_STALE)]
+    assert ce.inputs["deps"]["runs"] == [run_id]
+    [event] = events
+    assert (event.aggregate_id, event.payload["state"], event.payload["reason_codes"]) == \
+        (ce.evaluation_id, "NOT_EVALUATED", PART_STALE)
+    assert issues == []  # NOT_EVALUATED raises no control issue (STA §17: no source/cadence policy exists)
+    read = _state(client, ci, OCT, NOV, as_of=ce.record_cutoff_seq)  # the same question at the same knowledge
+    assert read.status_code == 200, read.text
+    assert (read.json()["state"], read.json()["reason_codes"], read.json()["evaluation_id"]) == \
+        ("NOT_EVALUATED", PART_STALE, ce.evaluation_id)
+
+
+def test_evidence_proves_exactly_the_days_before_its_expiry(client, org):
+    """Boundary vectors around valid_until, which is exclusive (the engine's STALE rule and the snapshot's expiry
+    boundary both treat it so), read without storing anything. A retest with fresh evidence for the expired days then
+    proves every window: only the stale slice is refused, nothing more."""
+    ci, (td,) = _control(client, _subject())
+    _run(client, td, "PASS", evidence=[_expiring_evidence(client)])
+    vectors = [((OCT, MID), "OPERATING", []),
+               ((MID - timedelta(days=1), MID), "OPERATING", []),
+               ((MID - timedelta(days=1), MID + timedelta(seconds=1)), "NOT_EVALUATED", PART_STALE),
+               ((OCT, NOV), "NOT_EVALUATED", PART_STALE),
+               ((MID, NOV), "NOT_EVALUATED", ["STALE_EVIDENCE"])]
+    for (start, end), state, reasons in vectors:
+        r = _state(client, ci, start, end)
+        assert r.status_code == 200, r.text
+        assert (r.json()["state"], r.json()["reason_codes"]) == (state, reasons), (start, end)
+    assert _stored(ci) == ([], [], [])
+    _run(client, td, "PASS", start=MID - timedelta(days=5), evidence=[_evidence(client)])  # valid to 2027-03-01
+    for (start, end), _, _ in vectors:
+        r = _state(client, ci, start, end)
+        assert (r.json()["state"], r.json()["reason_codes"]) == ("OPERATING", []), (start, end)
+
+
+def test_a_run_proves_only_as_long_as_all_of_its_evidence_is_valid(client, org):
+    """A PASS run resting on two artifacts, one valid for months and one expiring on Oct 15. Once one is stale the run
+    is not admissible proof (the existing rule for a window that starts after an expiry: STALE_EVIDENCE), so the
+    earliest expiry bounds what the run proves; the fresh artifact does not carry the stale one past its expiry."""
+    ci, (td,) = _control(client, _subject())
+    _run(client, td, "PASS", evidence=[_evidence(client), _expiring_evidence(client)])
+    for (start, end), state, reasons in (((OCT, MID), "OPERATING", []),
+                                         ((MID, NOV), "NOT_EVALUATED", ["STALE_EVIDENCE"]),
+                                         ((OCT, NOV), "NOT_EVALUATED", PART_STALE)):
+        r = _state(client, ci, start, end)
+        assert (r.json()["state"], r.json()["reason_codes"]) == (state, reasons), (start, end)
+
+
+def test_a_direct_evaluation_and_the_snapshot_agree_on_the_same_days(client, org):
+    """The snapshot splits the period at the evidence expiry (TIM §09) and stores one control evaluation per atomic
+    segment. Read at the snapshot's record cutoff, a direct evaluation of the window of the evaluation each leaf names
+    has the same state and reasons and names the same stored evaluation (a coalesced segment names the evaluation of
+    its first atomic segment, so the evaluation's own window is used); a direct evaluation of the whole period is not
+    OPERATING while the period is not PROVEN (before, it was OPERATING)."""
+    from app.db import AdminSession
+    from app.models import ControlEvaluation
+    from app.platform import ensure_utc
+    s = _subject()
+    ci, (td,) = _control(client, s)
+    _run(client, td, "PASS", evidence=[_expiring_evidence(client)])
+    lineage = _obligation(s, {"node_type": "ALL", "node_id": "n0", "children": [C(KEY_A, "n1")]})
+    snap = _period(client, lineage, persist=True)
+    assert snap.status_code == 200, snap.text
+    j = snap.json()
+    assert j["state"] == "NOT_PROVEN"
+    got = [([_at(x) for x in sg["segment_range"]], sg["assurance_state"], sg["leaf_evaluations"][0]["control_state"],
+            sg["leaf_evaluations"][0]["reason_codes"]) for sg in j["segments"]]
+    assert got == [([OCT, MID], "PROVEN", "OPERATING", []),
+                   ([MID, NOV], "NOT_PROVEN", "NOT_EVALUATED", ["STALE_EVIDENCE"])]
+    cutoff = j["record_cutoff_seq"]
+    for sg in j["segments"]:
+        leaf = sg["leaf_evaluations"][0]
+        with AdminSession() as db:
+            named = db.get(ControlEvaluation, leaf["control_evaluation_id"])
+            start, end = ensure_utc(named.window_from), ensure_utc(named.window_to)
+        seg_from, seg_to = (_at(x) for x in sg["segment_range"])
+        assert seg_from == start < end <= seg_to and named.record_cutoff_seq == cutoff
+        direct = _state(client, ci, start, end, as_of=cutoff).json()
+        assert (direct["state"], direct["reason_codes"], direct["evaluation_id"]) == \
+            (leaf["control_state"], leaf["reason_codes"], leaf["control_evaluation_id"])
+    whole = _state(client, ci, OCT, NOV, as_of=cutoff).json()
+    assert (whole["state"], whole["reason_codes"]) == ("NOT_EVALUATED", PART_STALE)
+    rep = client.get(f"/api/snapshots/{j['snapshot_id']}/reproduce", headers=H(CCO)).json()
+    assert rep["status"] == "REPRODUCED", rep
+
+
+def test_a_part_stale_window_cannot_verify_an_issue_closure(client, org):
+    """STA §17 closure needs a new test/evidence cycle whose evaluation is OPERATING (STA §06). Before, a retest whose
+    evidence expired mid-window produced an OPERATING evaluation of the whole window, and that closed the issue on
+    proof that did not cover it. That evaluation is now NOT_EVALUATED and closure is refused; a retest with evidence
+    valid for the whole window closes the issue."""
+    ci, (td,) = _control(client, _subject())
+    _run(client, td, "FAIL", start=SEP, end=OCT)
+    assert _evaluate(client, ci, SEP, OCT).json()["state"] == "FAILING"
+    [issue] = _stored(ci)[2]
+    iid = issue.issue_id
+    for path, body in (("assign", {"owner_actor_id": OWNER, "reason": "Control owner"}),
+                       ("transition", {"state": "TRIAGED"}),
+                       ("transition", {"state": "IN_REMEDIATION", "reason": "Fixing the incident process"}),
+                       ("transition", {"state": "PENDING_VERIFICATION", "reason": "Fix deployed"})):
+        r = client.post(f"/api/issues/{iid}/{path}", headers=H(OWNER), json=body)
+        assert r.status_code == 200, r.text
+
+    def close(evaluation_id):
+        return client.post(f"/api/issues/{iid}/close", headers=H(OWNER),
+                           json={"reason": "Retest passed", "verification_control_evaluation_id": evaluation_id})
+    _run(client, td, "PASS", evidence=[_expiring_evidence(client)])
+    part = _evaluate(client, ci).json()
+    assert (part["state"], part["reason_codes"]) == ("NOT_EVALUATED", PART_STALE)
+    r = close(part["evaluation_id"])
+    assert r.status_code == 409, r.text
+    assert [p["code"] for p in r.json()["detail"]["problems"]] == ["VERIFICATION_NOT_OPERATING"]
+    _run(client, td, "PASS", evidence=[_evidence(client)])
+    whole = _evaluate(client, ci).json()
+    assert whole["state"] == "OPERATING"
+    r = close(whole["evaluation_id"])
+    assert r.status_code == 200 and r.json()["state"] == "CLOSED", r.text
+
+
+# ------------------------------------------------------------------------------------------------ control not yet in force
+@pytest.mark.parametrize("binding", ["selector", "exact"])
+def test_a_period_that_starts_before_the_control_is_in_force_is_evaluated(client, org, binding):
+    """An obligation in force from January over a control implemented from Oct 15. For [Oct 1, Oct 15) the leaf finds
+    the implementation, which is not yet in force there; the evaluator derives no state (NOT_EVALUATED /
+    CONTROL_NOT_IMPLEMENTED, no evaluation stored), and the snapshot then read a dependency digest that does not exist:
+    preview, snapshot and reproduction all failed with an unhandled KeyError (HTTP 500). The segment is now evaluated
+    as the engine defines it (an UNKNOWN leaf, so NOT_PROVEN), and the implementation stays in the manifest."""
+    from app.platform import ensure_utc
+    s = _subject()
+    ci, (td,) = _control(client, s, valid_from=MID.isoformat())
+    _run(client, td, "PASS", start=MID, evidence=[_evidence(client)])
+    leaf = C(KEY_A, "n1") if binding == "selector" else {**C(KEY_A, "n1"), "control_implementation_id": ci}
+    lineage = _obligation(s, {"node_type": "ALL", "node_id": "n0", "children": [leaf]})
+    preview = _period(client, lineage, persist=False)
+    assert preview.status_code == 200, preview.text
+    snap = _period(client, lineage, persist=True)
+    assert snap.status_code == 200, snap.text
+    for j in (preview.json(), snap.json()):
+        assert j["state"] == "NOT_PROVEN"
+        before, after = j["segments"]
+        assert ([_at(x) for x in before["segment_range"]], [_at(x) for x in after["segment_range"]]) == \
+            ([OCT, MID], [MID, NOV])
+        [l1], [l2] = before["leaf_evaluations"], after["leaf_evaluations"]
+        assert (before["assurance_state"], before["reason_codes"], l1["control_implementation_id"], l1["control_state"],
+                l1["reason_codes"], l1["control_evaluation_id"]) == \
+            ("NOT_PROVEN", ["CONTROL_NOT_IMPLEMENTED"], ci, "NOT_EVALUATED", ["CONTROL_NOT_IMPLEMENTED"], None)
+        assert (after["assurance_state"], l2["control_state"], l2["reason_codes"]) == ("PROVEN", "OPERATING", [])
+        assert (l1.get("binding"), l2.get("binding")) == ((None, None) if binding == "selector" else ("EXACT", "EXACT"))
+        assert ci in j["dependency_manifest"]["control_implementations"]
+    stored = _stored(ci)[0]
+    assert stored and all(ensure_utc(e.window_from) >= MID for e in stored)  # none where the control is not in force
+    named = next(e for e in stored if e.evaluation_id == snap.json()["segments"][1]["leaf_evaluations"][0][
+        "control_evaluation_id"])
+    assert (ensure_utc(named.window_from), named.state) == (MID, "OPERATING")
+    # The manifest pins exactly the evaluations that were derived: no substitute for the segment with none.
+    assert sorted(snap.json()["dependency_manifest"]["control_evaluation_digests"]) == \
+        sorted({e.dependency_digest for e in stored})
+    rep = client.get(f"/api/snapshots/{snap.json()['snapshot_id']}/reproduce", headers=H(CCO)).json()
+    assert rep["status"] == "REPRODUCED", rep
+
+
+def test_another_organisation_can_neither_read_nor_drive_these_results(client, org):
+    """Cross-tenant: another organisation's principal cannot evaluate, read or roll up this organisation's control and
+    obligation, nor record a test result against its test definition; nothing is written by the attempts."""
+    s = _subject()
+    ci, (td,) = _control(client, s)
+    _run(client, td, "PASS", evidence=[_expiring_evidence(client)])
+    lineage = _obligation(s, {"node_type": "ALL", "node_id": "n0", "children": [C(KEY_A, "n1")]})
+    window = {"window_from": OCT.isoformat(), "window_to": NOV.isoformat()}
+    assert client.post(f"/api/controls/{ci}/evaluate", headers=H(B_CCO), json=window).status_code == 404
+    assert client.get(f"/api/controls/{ci}/state", headers=H(B_CCO), params=window).status_code == 404
+    for path in ("preview", "snapshots"):
+        r = client.post(f"/api/obligations/{lineage}/{path}", headers=H(B_CCO),
+                        json={"period_from": OCT.isoformat(), "period_to": NOV.isoformat()})
+        assert r.status_code == 404, (path, r.text)
+    r = client.post("/api/test-runs", headers=H(B_CCO), json={
+        "test_definition_id": td, "occurred_at": OCT.isoformat(), **window, "result": "FAIL", "source_system": "probe"})
+    assert r.status_code in (403, 404), r.text
+    assert _stored(ci) == ([], [], []) and _snapshot_rows(lineage) == (0, 0)

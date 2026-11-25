@@ -165,6 +165,16 @@ def find_duplicate_snapshot(db, *, authority: str, jurisdiction: str, locator: s
         RegulatorySource.lifecycle != "WITHDRAWN")).scalars().first()
 
 
+def lock_source(db, source_id: str) -> RegulatorySource | None:
+    """The source snapshot row-locked and read fresh (None if there is none). Every path that changes a source's
+    lifecycle takes this lock before it reads the state it validates and before the instrument lock: source ->
+    instrument -> record sequence, the order POST /catalog/sources/{id}/classify takes them. Without it a concurrent
+    requirement creation validated and moved a stale copy (a second, false CLASSIFIED -> REVIEW_REQUIRED record) and
+    locked the two rows in the opposite order to classification (deadlock)."""
+    return db.execute(select(RegulatorySource).where(RegulatorySource.source_id == source_id).with_for_update()
+                      .execution_options(populate_existing=True)).scalars().first()
+
+
 def require_derivable(s: RegulatorySource | None) -> RegulatorySource:
     """A source new requirement content may be grounded in: classified, not withdrawn or superseded, derivation
     permitted by its rights record, fingerprint and reference present and intact."""
@@ -253,7 +263,8 @@ def create_version(ctx, *, source: RegulatorySource, instrument: Instrument, req
                    locator: str, summary: str | None, valid_from: date, valid_to: date | None, provisions: list[dict],
                    origin: str, provision_origin: str, provision_lifecycle: str) -> tuple[RequirementVersion, list[Provision]]:
     """A new RequirementVersion in REVIEW_REQUIRED with its provisions; earlier versions are never touched (DOM §1.1:
-    revisions are immutable once closed). Validation, lock, identity and duplicate checks first; one transaction."""
+    revisions are immutable once closed). Validation, lock, identity and duplicate checks first; one transaction.
+    ``source`` must have been read with lock_source before ``instrument`` was locked (lock_source: one lock order)."""
     db = ctx.db
     require_derivable(source)
     if valid_to is not None and valid_to <= valid_from:
@@ -639,10 +650,18 @@ def _cited_source_problems(db, mid: str, rv: RequirementVersion | None, cited_fi
     return []
 
 
+def replaces_for_valid_time(new: RequirementVersion, old: RequirementVersion) -> bool:
+    """Whether publishing ``new`` supersedes ``old`` (ZA-GLS-001 §04 "SUPERSEDED: A newer published version replaces this
+    version for future valid time"). A version whose half-open legal valid range ends at or before ``old`` begins
+    replaces it for no valid time (it encodes an earlier period of the law), so ``old`` stays PUBLISHED. Any other newer
+    version (one reaching into ``old``'s valid time, or following it) supersedes it, as before."""
+    return not (new.valid_to is not None and new.valid_to <= old.valid_from)
+
+
 def publish_bound(ctx, binding: list[dict], *, content_release_id: str, record_seq: int) -> dict:
     """With the release: each bound VERIFIED version and its provisions become PUBLISHED, and older PUBLISHED versions
-    of the same requirement become SUPERSEDED (GLS §04 "A newer published version replaces this version"). Their
-    content is not altered; the successor's valid_from marks the change."""
+    of the same requirement that it replaces for future valid time (replaces_for_valid_time) become SUPERSEDED (GLS §04).
+    Their content is not altered; the successor's valid_from marks the change."""
     db, published, superseded = ctx.db, [], []
     for b in binding:
         rv = lock_version(db, b["requirement_version_id"])
@@ -664,7 +683,8 @@ def publish_bound(ctx, binding: list[dict], *, content_release_id: str, record_s
              payload={"requirement_key": rv.requirement_key, "content_release_id": content_release_id,
                       "source_fingerprint": b["source_fingerprint"]})
         for old in versions_of(db, rv.requirement_key):
-            if old.requirement_version_id != rv.requirement_version_id and old.lifecycle == "PUBLISHED":
+            if old.requirement_version_id != rv.requirement_version_id and old.lifecycle == "PUBLISHED" \
+                    and replaces_for_valid_time(rv, old):
                 move(db, old, object_type="RequirementVersion", object_id=old.requirement_version_id, to="SUPERSEDED",
                      actor=ctx.actor, action="requirement.lifecycle", record_seq=record_seq,
                      reason=f"Superseded by {rv.requirement_version_id} in content release {content_release_id}")
